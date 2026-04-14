@@ -57,7 +57,15 @@ def mpi_reduce_array(array, op='sum'):
 
     """
     np_array = _get_npy_array(array)
-    from mpi4py import MPI
+    try:
+        from mpi4py import MPI
+    except Exception:
+        # Fall back to serial if MPI is unavailable.
+        return serial_reduce_array(np_array, op)
+    if not MPI.Is_initialized():
+        return serial_reduce_array(np_array, op)
+    if MPI.COMM_WORLD.Get_size() <= 1:
+        return serial_reduce_array(np_array, op)
     ops = {'sum': MPI.SUM, 'prod': MPI.PROD,
            'max': MPI.MAX, 'min': MPI.MIN}
     return MPI.COMM_WORLD.allreduce(np_array, op=ops[op])
