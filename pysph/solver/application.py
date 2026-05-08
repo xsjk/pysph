@@ -990,7 +990,7 @@ class Application(object):
                         domain=self.domain,
                         cache=True,
                         sort_gids=options.sort_gids,
-                        allow_sort=True,
+                        allow_sort=options.reorder_freq != 0,
                         leaf_size=leaf_size,
                         use_elementwise=options.octree_elementwise,
                     )
