@@ -38,7 +38,8 @@ cdef class OctreeGPUNNPS(GPUNNPS):
             self.octrees.append(PointTree(pa=self.pa_wrappers[i].pa,
                                           radius_scale=radius_scale,
                                           use_double=self.use_double,
-                                          leaf_size=leaf_size, dim=dim))
+                                          leaf_size=leaf_size, dim=dim,
+                                          backend=self.backend))
         self.use_elementwise = use_elementwise
         self.use_partitions = use_partitions
         self.allow_sort = allow_sort

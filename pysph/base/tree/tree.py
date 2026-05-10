@@ -2,14 +2,15 @@ import os
 import numpy as np
 from pytools import memoize
 
-import pyopencl as cl
-import pyopencl.cltypes
-from pyopencl.elementwise import ElementwiseKernel
-from pyopencl.scan import GenericScanKernel
-
-from compyle.opencl import get_context, get_queue, named_profile
+from compyle.array import get_backend
 from compyle.array import Array
-from pysph.base.tree.helpers import get_vector_dtype, get_helper
+from compyle.profile import profile_kernel
+from pysph.base.gpu_nnps_helper import (
+    get_context, get_elwise_kernel, get_queue, make_scan_kernel,
+)
+from pysph.base.tree.helpers import (
+    get_char_dtype, get_helper, get_vector_dtype, set_uint2,
+)
 
 NODE_KERNEL_TEMPLATE = r"""
 uint node_idx = i;
@@ -149,12 +150,33 @@ POINT_DFS_TEMPLATE = r"""
 """
 
 
+def _zero_uint_vector_expr(k, backend):
+    if backend == 'opencl':
+        return "0"
+    return "make_uint%(k)s(%(init_value)s)" % dict(
+        k=k, init_value=','.join(["0"] * k)
+    )
+
+
+def _cuda_uint_add_preamble(k):
+    fields = ["x", "y", "z", "w", "s4", "s5", "s6", "s7"][:k]
+    values = ", ".join("a.%s + b.%s" % (field, field) for field in fields)
+    return """
+    __device__ inline uint%(k)s add_uint%(k)s(uint%(k)s a, uint%(k)s b)
+    {
+        return make_uint%(k)s(%(values)s);
+    }
+    """ % dict(k=k, values=values)
+
+
 def get_M_array_initialization(k):
     result = "uint%(k)s constant M[%(k)s]  = {" % dict(k=k)
     for i in range(k):
         result += "(uint%(k)s)(%(init_value)s)," % dict(
-            k=k, init_value=','.join((np.arange(k) >= i).astype(
-                int).astype(str))
+            k=k,
+            init_value=','.join(
+                (np.arange(k) >= i).astype(int).astype(str)
+            )
         )
     result += "};"
     return result
@@ -176,33 +198,46 @@ def get_M_array_initialization(k):
 # The array of vectors M are just a math trick. M[j] gives a vector with j
 # zeros and k - j ones (With k = 4, M[1] = {0, 1, 1, 1}). Adding this up in
 # the prefix sum directly gives us the required result.
-@named_profile('particle_reordering', backend='opencl')
 @memoize
-def _get_particle_kernel(ctx, k, args, index_code):
-    return GenericScanKernel(
-        ctx, get_vector_dtype('uint', k), neutral="0",
-        arguments=r"""__global char *seg_flag,
+def _get_particle_kernel(ctx, k, args, index_code, backend='opencl'):
+    prefix_args = r"""__global char *seg_flag,
                     __global uint%(k)s *prefix_sum_vector,
-                    """ % dict(k=k) + args,
-        input_expr="M[%(index_code)s]" % dict(index_code=index_code),
-        scan_expr="(across_seg_boundary ? b : a + b)",
+                    """ % dict(k=k)
+    scan_expr = "(across_seg_boundary ? b : a + b)"
+    preamble = get_M_array_initialization(k)
+    input_expr = "M[%(index_code)s]" % dict(index_code=index_code)
+    if backend == 'cuda':
+        scan_expr = "(across_seg_boundary ? b : add_uint%d(a, b))" % k
+        idx = "(%(index_code)s)" % dict(index_code=index_code)
+        input_expr = "make_uint%(k)s(%(values)s)" % dict(
+            k=k,
+            values=",".join("(%s <= %d)" % (idx, i) for i in range(k))
+        )
+        preamble = _cuda_uint_add_preamble(k)
+    kernel = make_scan_kernel(
+        backend, ctx, get_vector_dtype('uint', k, backend),
+        neutral=_zero_uint_vector_expr(k, backend),
+        arguments=prefix_args + args,
+        input_expr=input_expr,
+        scan_expr=scan_expr,
         is_segment_start_expr="seg_flag[i]",
         output_statement=r"""prefix_sum_vector[i]=item;""",
-        preamble=get_M_array_initialization(k)
+        preamble=preamble
     )
+    return profile_kernel(kernel, 'particle_reordering', backend=backend)
 
 
 # The offset of a node's child is given by:
 # offset of first child in next layer + k * (number of non-leaf nodes before
 # given node).
 # If the node is a leaf, we set this value to be -1.
-@named_profile('set_offset', backend='opencl')
 @memoize
-def _get_set_offset_kernel(ctx, k, leaf_size):
-    return GenericScanKernel(
-        ctx, np.int32, neutral="0",
-        arguments=r"""__global uint2 *pbounds, __global uint *offsets,
-                      __global int *leaf_count, int csum_nodes_next""",
+def _get_set_offset_kernel(ctx, k, leaf_size, backend='opencl'):
+    arguments = r"""__global uint2 *pbounds, __global uint *offsets,
+                      __global int *leaf_count, int csum_nodes_next"""
+    kernel = make_scan_kernel(
+        backend, ctx, np.int32, neutral="0",
+        arguments=arguments,
         input_expr="(pbounds[i].s1 - pbounds[i].s0 > %(leaf_size)s)" % {
             'leaf_size': leaf_size},
         scan_expr="a + b",
@@ -212,6 +247,7 @@ def _get_set_offset_kernel(ctx, k, leaf_size):
             if (i == N - 1) { *leaf_count = (N - item); }
         }""" % {'leaf_size': leaf_size, 'k': k}
     )
+    return profile_kernel(kernel, 'set_offset', backend=backend)
 
 
 # Each particle belongs to a given leaf / last layer node and this cell is
@@ -224,11 +260,10 @@ def _get_set_offset_kernel(ctx, k, leaf_size):
 #
 # Note that unique_cids also gives us the list of leaves / last layer nodes
 # which are not empty.
-@named_profile('unique_cids', backend='opencl')
 @memoize
-def _get_unique_cids_kernel(ctx):
-    return GenericScanKernel(
-        ctx, np.int32, neutral="0",
+def _get_unique_cids_kernel(ctx, backend='opencl'):
+    kernel = make_scan_kernel(
+        backend, ctx, np.int32, neutral="0",
         arguments=r"""int *cids, int *unique_cids_map,
                 int *unique_cids, int *unique_cids_count""",
         input_expr="(i == 0 || cids[i] != cids[i-1])",
@@ -241,16 +276,16 @@ def _get_unique_cids_kernel(ctx):
             if (i == N - 1) *unique_cids_count = item;
         """
     )
+    return profile_kernel(kernel, 'unique_cids', backend=backend)
 
 
 # A lot of leaves are going to be empty. Not really sure if this guy is of
 # any use.
-@named_profile('leaves', backend='opencl')
 @memoize
-def _get_leaves_kernel(ctx, leaf_size):
-    return GenericScanKernel(
-        ctx, np.int32, neutral="0",
-        arguments="int *offsets, uint2 pbounds, int *leaf_cids, "
+def _get_leaves_kernel(ctx, leaf_size, backend='opencl'):
+    kernel = make_scan_kernel(
+        backend, ctx, np.int32, neutral="0",
+        arguments="int *offsets, uint2 *pbounds, int *leaf_cids, "
                   "int *num_leaves",
         input_expr="(pbounds[i].s1 - pbounds[i].s0 <= %(leaf_size)s)" % dict(
             leaf_size=leaf_size
@@ -263,13 +298,13 @@ def _get_leaves_kernel(ctx, leaf_size):
             if (i == N - 1) *num_leaves = item;
         """
     )
+    return profile_kernel(kernel, 'leaves', backend=backend)
 
 
-@named_profile("group_cids", backend='opencl')
 @memoize
-def _get_cid_groups_kernel(ctx):
-    return GenericScanKernel(
-        ctx, np.uint32, neutral="0",
+def _get_cid_groups_kernel(ctx, backend='opencl'):
+    kernel = make_scan_kernel(
+        backend, ctx, np.uint32, neutral="0",
         arguments="""int *unique_cids, uint2 *pbounds,
             int *group_cids, int *group_count, int gmin, int gmax""",
         input_expr="pass(pbounds[unique_cids[i]], gmin, gmax)",
@@ -287,11 +322,12 @@ def _get_cid_groups_kernel(ctx):
         }
         """
     )
+    return profile_kernel(kernel, 'group_cids', backend=backend)
 
 
 @memoize
 def tree_bottom_up(ctx, args, setup, leaf_operation, node_operation,
-                   output_expr, preamble=""):
+                   output_expr, preamble="", backend='opencl'):
     operation = NODE_KERNEL_TEMPLATE % dict(
         setup=setup,
         leaf_operation=leaf_operation,
@@ -301,8 +337,9 @@ def tree_bottom_up(ctx, args, setup, leaf_operation, node_operation,
 
     args = ', '.join(["int *offsets, uint2 *pbounds", args])
 
-    kernel = ElementwiseKernel(ctx, args, operation=operation,
-                               preamble=preamble)
+    kernel = get_elwise_kernel(
+        'tree_bottom_up', args, operation, preamble=preamble, backend=backend
+    )
 
     def callable(tree, *args):
         csum_nodes = tree.total_nodes
@@ -320,7 +357,8 @@ def tree_bottom_up(ctx, args, setup, leaf_operation, node_operation,
 
 @memoize
 def leaf_tree_traverse(ctx, k, args, setup, node_operation, leaf_operation,
-                       output_expr, common_operation, preamble=""):
+                       output_expr, common_operation, preamble="",
+                       backend='opencl'):
     # FIXME: variable max_depth
     operation = LEAF_DFS_TEMPLATE % dict(
         setup=setup,
@@ -334,8 +372,10 @@ def leaf_tree_traverse(ctx, k, args, setup, node_operation, leaf_operation,
 
     args = ', '.join(["int *unique_cids, int *cids, int *offsets", args])
 
-    kernel = ElementwiseKernel(
-        ctx, args, operation=operation, preamble=preamble)
+    kernel = get_elwise_kernel(
+        'leaf_tree_traverse', args, operation, preamble=preamble,
+        backend=backend
+    )
 
     def callable(tree_src, tree_dst, *args):
         return kernel(
@@ -348,7 +388,8 @@ def leaf_tree_traverse(ctx, k, args, setup, node_operation, leaf_operation,
 
 @memoize
 def point_tree_traverse(ctx, k, args, setup, node_operation, leaf_operation,
-                        output_expr, common_operation, preamble=""):
+                        output_expr, common_operation, preamble="",
+                        backend='opencl'):
     # FIXME: variable max_depth
     operation = POINT_DFS_TEMPLATE % dict(
         setup=setup,
@@ -362,8 +403,10 @@ def point_tree_traverse(ctx, k, args, setup, node_operation, leaf_operation,
 
     args = ', '.join(["int *cids, int *offsets", args])
 
-    kernel = ElementwiseKernel(
-        ctx, args, operation=operation, preamble=preamble)
+    kernel = get_elwise_kernel(
+        'point_tree_traverse', args, operation, preamble=preamble,
+        backend=backend
+    )
 
     def callable(tree_src, tree_dst, *args):
         return kernel(
@@ -377,11 +420,14 @@ class Tree(object):
     """k-ary Tree
     """
 
-    def __init__(self, n, k=8, leaf_size=32):
-        self.ctx = get_context()
-        self.queue = get_queue()
+    def __init__(self, n, k=8, leaf_size=32, backend=None):
+        self.backend = get_backend(backend or 'opencl')
+        self.ctx = get_context(self.backend)
+        self.queue = get_queue(self.backend)
         self.sorted = False
-        self.main_helper = get_helper(os.path.join('tree', 'tree.mako'))
+        self.main_helper = get_helper(
+            os.path.join('tree', 'tree.mako'), None, self.backend
+        )
 
         self.initialized = False
         self.preamble = ""
@@ -412,13 +458,14 @@ class Tree(object):
     def _initialize_data(self):
         self.sorted = False
         num_particles = self.n
-        self.pids = Array(np.uint32, n=num_particles, backend='opencl')
-        self.cids = Array(np.uint32, n=num_particles, backend='opencl')
+        self.pids = Array(np.uint32, n=num_particles, backend=self.backend)
+        self.cids = Array(np.uint32, n=num_particles, backend=self.backend)
         self.cids.fill(0)
 
         for var, dtype in zip(self.index_function_args,
                               self.index_function_arg_dtypes):
-            setattr(self, var, Array(dtype, n=num_particles, backend='opencl'))
+            setattr(self, var, Array(dtype, n=num_particles,
+                                     backend=self.backend))
 
         # Filled after tree built
         self.pbounds = None
@@ -460,11 +507,11 @@ class Tree(object):
     # a better approach to save on memory
     def _create_temp_vars(self, temp_vars):
         n = self.n
-        temp_vars['pids'] = Array(np.uint32, n=n, backend='opencl')
+        temp_vars['pids'] = Array(np.uint32, n=n, backend=self.backend)
         for var, dtype in zip(self.index_function_args,
                               self.index_function_arg_dtypes):
-            temp_vars[var] = Array(dtype, n=n, backend='opencl')
-        temp_vars['cids'] = Array(np.uint32, n=n, backend='opencl')
+            temp_vars[var] = Array(dtype, n=n, backend=self.backend)
+        temp_vars['cids'] = Array(np.uint32, n=n, backend=self.backend)
 
     def _exchange_temp_vars(self, temp_vars):
         for k in temp_vars.keys():
@@ -492,8 +539,9 @@ class Tree(object):
                      self.index_function_const_ctypes)]
         args = ', '.join(args)
 
-        particle_kernel = _get_particle_kernel(self.ctx, self.k,
-                                               args, self.index_code)
+        particle_kernel = _get_particle_kernel(
+            self.ctx, self.k, args, self.index_code, self.backend
+        )
         args = [seg_flag.dev, child_count_prefix_sum.dev]
         args += [x.dev for x in self.get_data_args()]
         args += self.get_index_constants(depth)
@@ -529,8 +577,9 @@ class Tree(object):
         for i in range(self.depth + 1):
             total_nodes += self.num_nodes[i]
 
-        self.offsets = Array(np.int32, n=total_nodes, backend='opencl')
-        self.pbounds = Array(cl.cltypes.uint2, n=total_nodes, backend='opencl')
+        self.offsets = Array(np.int32, n=total_nodes, backend=self.backend)
+        self.pbounds = Array(get_vector_dtype('uint', 2, self.backend),
+                             n=total_nodes, backend=self.backend)
 
         append_layer = self.main_helper.get_kernel('append_layer')
 
@@ -557,8 +606,10 @@ class Tree(object):
                       np.uint32(n))
 
         # Set children offsets
-        leaf_count = Array(np.uint32, n=1, backend='opencl')
-        set_offsets = _get_set_offset_kernel(self.ctx, self.k, self.leaf_size)
+        leaf_count = Array(np.uint32, n=1, backend=self.backend)
+        set_offsets = _get_set_offset_kernel(
+            self.ctx, self.k, self.leaf_size, self.backend
+        )
         set_offsets(pbounds.dev, offsets.dev, leaf_count.dev,
                     np.uint32(csum_nodes_next))
         return leaf_count.dev[0].get()
@@ -606,18 +657,22 @@ class Tree(object):
         # Initialize temporary data (but persistent across layers)
         self._create_temp_vars(temp_vars)
 
-        child_count_prefix_sum = Array(get_vector_dtype('uint', self.k),
-                                       n=n, backend='opencl')
+        child_count_prefix_sum = Array(
+            get_vector_dtype('uint', self.k, self.backend),
+            n=n, backend=self.backend
+        )
 
-        seg_flag = Array(cl.cltypes.char, n=n, backend='opencl')
+        seg_flag = Array(get_char_dtype(self.backend), n=n,
+                         backend=self.backend)
         seg_flag.fill(0)
         seg_flag.dev[0] = 1
 
-        offsets_temp = [Array(np.int32, n=1, backend='opencl')]
+        offsets_temp = [Array(np.int32, n=1, backend=self.backend)]
         offsets_temp[-1].fill(1)
 
-        pbounds_temp = [Array(cl.cltypes.uint2, n=1, backend='opencl')]
-        pbounds_temp[-1].dev[0].set(cl.cltypes.make_uint2(0, n))
+        pbounds_temp = [Array(get_vector_dtype('uint', 2, self.backend),
+                              n=1, backend=self.backend)]
+        set_uint2(pbounds_temp[-1], 0, n, self.backend)
 
         # FIXME: Depths above 20 possible and feasible for binary / quad trees
         loop_lim = min(fixed_depth, 20)
@@ -632,9 +687,11 @@ class Tree(object):
 
             # Allocate new layer
             offsets_temp.append(Array(np.int32, n=self.num_nodes[-1],
-                                      backend='opencl'))
-            pbounds_temp.append(Array(cl.cltypes.uint2,
-                                      n=self.num_nodes[-1], backend='opencl'))
+                                      backend=self.backend))
+            pbounds_temp.append(Array(
+                get_vector_dtype('uint', 2, self.backend),
+                n=self.num_nodes[-1], backend=self.backend
+            ))
 
             # Generate particle index and reorder the particles
             self._reorder_particles(depth, child_count_prefix_sum,
@@ -662,18 +719,20 @@ class Tree(object):
 
     def _get_unique_cids_and_count(self):
         n = self.n
-        self.unique_cids = Array(np.uint32, n=n, backend='opencl')
-        self.unique_cids_map = Array(np.uint32, n=n, backend='opencl')
-        uniq_count = Array(np.uint32, n=1, backend='opencl')
-        unique_cids_kernel = _get_unique_cids_kernel(self.ctx)
+        self.unique_cids = Array(np.uint32, n=n, backend=self.backend)
+        self.unique_cids_map = Array(np.uint32, n=n, backend=self.backend)
+        uniq_count = Array(np.uint32, n=1, backend=self.backend)
+        unique_cids_kernel = _get_unique_cids_kernel(self.ctx, self.backend)
         unique_cids_kernel(self.cids.dev, self.unique_cids_map.dev,
                            self.unique_cids.dev, uniq_count.dev)
         self.unique_cid_count = uniq_count.dev[0].get()
 
     def get_leaves(self):
-        leaves = Array(np.uint32, n=self.offsets.dev.shape[0], backend='opencl')
-        num_leaves = Array(np.uint32, n=1, backend='opencl')
-        leaves_kernel = _get_leaves_kernel(self.ctx, self.leaf_size)
+        leaves = Array(np.uint32, n=self.offsets.dev.shape[0],
+                       backend=self.backend)
+        num_leaves = Array(np.uint32, n=1, backend=self.backend)
+        leaves_kernel = _get_leaves_kernel(self.ctx, self.leaf_size,
+                                           self.backend)
         leaves_kernel(self.offsets.dev, self.pbounds.dev,
                       leaves.dev, num_leaves.dev)
 
@@ -692,10 +751,10 @@ class Tree(object):
     # Tree API
     ###########################################################################
     def allocate_node_prop(self, dtype):
-        return Array(dtype, n=self.total_nodes, backend='opencl')
+        return Array(dtype, n=self.total_nodes, backend=self.backend)
 
     def allocate_leaf_prop(self, dtype):
-        return Array(dtype, n=int(self.unique_cid_count), backend='opencl')
+        return Array(dtype, n=int(self.unique_cid_count), backend=self.backend)
 
     def get_preamble(self):
         if self.sorted:
@@ -722,10 +781,10 @@ class Tree(object):
             on the leaf size
         """
         groups = Array(np.uint32, n=int(self.unique_cid_count),
-                       backend='opencl')
-        group_count = Array(np.uint32, n=1, backend='opencl')
+                       backend=self.backend)
+        group_count = Array(np.uint32, n=1, backend=self.backend)
 
-        get_cid_groups = _get_cid_groups_kernel(self.ctx)
+        get_cid_groups = _get_cid_groups_kernel(self.ctx, self.backend)
         get_cid_groups(self.unique_cids.dev[:self.unique_cid_count],
                        self.pbounds.dev, groups.dev, group_count.dev,
                        np.int32(group_min), np.int32(group_max))
@@ -735,7 +794,8 @@ class Tree(object):
     def tree_bottom_up(self, args, setup, leaf_operation, node_operation,
                        output_expr, preamble=""):
         return tree_bottom_up(self.ctx, args, setup, leaf_operation,
-                              node_operation, output_expr, preamble)
+                              node_operation, output_expr, preamble,
+                              self.backend)
 
     def leaf_tree_traverse(self, args, setup, node_operation, leaf_operation,
                            output_expr, common_operation="", preamble=""):
@@ -746,7 +806,8 @@ class Tree(object):
 
         return leaf_tree_traverse(self.ctx, self.k, args, setup,
                                   node_operation, leaf_operation,
-                                  output_expr, common_operation, preamble)
+                                  output_expr, common_operation, preamble,
+                                  self.backend)
 
     def point_tree_traverse(self, args, setup, node_operation, leaf_operation,
                             output_expr, common_operation="", preamble=""):
@@ -757,4 +818,5 @@ class Tree(object):
 
         return point_tree_traverse(self.ctx, self.k, args, setup,
                                    node_operation, leaf_operation,
-                                   output_expr, common_operation, preamble)
+                                   output_expr, common_operation, preamble,
+                                   self.backend)

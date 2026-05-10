@@ -125,14 +125,17 @@ class CUDAIntegrator(GPUIntegrator):
         py_call_info = self.helper.py_calls['py_' + method]
         dtype = np.float64 if self._use_double else np.float32
         extra_args = [np.asarray(self.t, dtype=dtype),
-                      np.asarray(self.dt, dtype=dtype)]
+                      np.asarray(self.dt, dtype=dtype),
+                      np.asarray(0, dtype=np.uint32)]
         # Call the py_{method} for each destination.
         for name, (py_meth, dest) in py_call_info.items():
-            py_meth(dest, *extra_args)
+            py_meth(dest, *(extra_args[:-1]))
 
         # Call the stage* method for each destination.
         for name, (call, args, dest) in call_info.items():
             n = dest.get_number_of_particles(real=True)
+            # Argument for NP_MAX.
+            extra_args[-1][...] = n - 1
 
             gs, ls = splay(n)
             gs, ls = int(gs[0]), int(ls[0])
