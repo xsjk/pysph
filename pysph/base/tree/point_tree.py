@@ -1,16 +1,18 @@
 from pysph.base.tree.tree import Tree
 from pysph.base.tree.helpers import ParticleArrayWrapper, get_helper, \
-    make_vec_dict, ctype_to_dtype, get_vector_dtype
-from compyle.opencl import profile_kernel, DeviceWGSException, get_queue, \
-    named_profile, get_context
+    make_vec, ctype_to_dtype, get_vector_dtype
+from compyle.array import get_backend
+from compyle.opencl import DeviceWGSException
+from compyle.profile import profile_kernel
+from pysph.base.gpu_nnps_helper import (
+    get_queue, make_scan_kernel,
+)
 from compyle.array import Array
 from pytools import memoize
 
-import sys
 import numpy as np
 
 import pyopencl as cl
-from pyopencl.scan import GenericScanKernel
 import pyopencl.tools
 
 from mako.template import Template
@@ -20,14 +22,14 @@ class IncompatibleTreesException(Exception):
     pass
 
 
-@named_profile('neighbor_count_prefix_sum', backend='opencl')
 @memoize
-def _get_neighbor_count_prefix_sum_kernel(ctx):
-    return GenericScanKernel(ctx, np.int32,
-                             arguments="__global int *ary",
-                             input_expr="ary[i]",
-                             scan_expr="a+b", neutral="0",
-                             output_statement="ary[i] = prev_item")
+def _get_neighbor_count_prefix_sum_kernel(ctx, backend='opencl'):
+    kernel = make_scan_kernel(backend, ctx, np.int32,
+                              arguments="__global int *ary",
+                              input_expr="ary[i]",
+                              scan_expr="a+b", neutral="0",
+                              output_statement="ary[i] = prev_item")
+    return profile_kernel(kernel, 'neighbor_count_prefix_sum', backend=backend)
 
 
 @memoize
@@ -247,9 +249,10 @@ register_custom_pyopencl_ctypes()
 
 class PointTree(Tree):
     def __init__(self, pa, dim=2, leaf_size=32, radius_scale=2.0,
-                 use_double=False, c_type='float'):
+                 use_double=False, c_type='float', backend=None):
+        backend = get_backend(backend or 'opencl')
         super(PointTree, self).__init__(pa.get_number_of_particles(), 2 ** dim,
-                                        leaf_size)
+                                        leaf_size, backend=backend)
 
         assert (1 <= dim <= 3)
         self.max_depth = None
@@ -268,17 +271,19 @@ class PointTree(Tree):
         # This is because the NNPS implementation below assumes them to be
         # just set to 0.
         self.pa = ParticleArrayWrapper(pa, self.c_type_src,
-                                       self.c_type, ('x', 'y', 'z', 'h'))
+                                       self.c_type, ('x', 'y', 'z', 'h'),
+                                       backend=backend)
 
         self.radius_scale = radius_scale
         self.use_double = use_double
 
-        self.helper = get_helper('tree/point_tree.mako', self.c_type)
+        self.helper = get_helper('tree/point_tree.mako', self.c_type, backend)
         self.xmin = None
         self.xmax = None
         self.hmin = None
-        self.make_vec = make_vec_dict[c_type][self.dim]
-        self.ctx = get_context()
+        self.make_vec = lambda *values: make_vec(
+            backend, c_type, self.dim, *values
+        )
 
     def set_index_function_info(self):
         self.index_function_args = ["sfc"]
@@ -365,7 +370,7 @@ class PointTree(Tree):
     # General algorithms
     ###########################################################################
     def set_node_bounds(self):
-        vector_data_t = get_vector_dtype(self.c_type, self.dim)
+        vector_data_t = get_vector_dtype(self.c_type, self.dim, self.backend)
         dtype = ctype_to_dtype(self.c_type)
 
         self.node_xmin = self.allocate_node_prop(vector_data_t)
@@ -380,7 +385,7 @@ class PointTree(Tree):
             preamble=_get_macros_preamble(self.c_type, self.sorted, self.dim)
         )
         set_node_bounds = profile_kernel(set_node_bounds, 'set_node_bounds',
-                                         backend='opencl')
+                                         backend=self.backend)
 
         pa_gpu = self.pa.gpu
         dtype = ctype_to_dtype(self.c_type)
@@ -423,7 +428,7 @@ class PointTree(Tree):
 
     def find_neighbor_cids(self, tree_src):
         neighbor_cid_count = Array(np.uint32, n=self.unique_cid_count + 1,
-                                   backend='opencl')
+                                   backend=self.backend)
         find_neighbor_cid_counts = self._leaf_neighbor_operation(
             tree_src,
             args="uint2 *pbounds, int *cnt",
@@ -436,17 +441,19 @@ class PointTree(Tree):
         )
         find_neighbor_cid_counts = profile_kernel(
             find_neighbor_cid_counts, 'find_neighbor_cid_count',
-            backend='opencl'
+            backend=self.backend
         )
         find_neighbor_cid_counts(tree_src.pbounds.dev,
                                  neighbor_cid_count.dev)
 
-        neighbor_psum = _get_neighbor_count_prefix_sum_kernel(self.ctx)
+        neighbor_psum = _get_neighbor_count_prefix_sum_kernel(
+            self.ctx, self.backend
+        )
         neighbor_psum(neighbor_cid_count.dev)
 
         total_neighbors = int(neighbor_cid_count.dev[-1].get())
         neighbor_cids = Array(np.uint32, n=total_neighbors,
-                              backend='opencl')
+                              backend=self.backend)
 
         find_neighbor_cids = self._leaf_neighbor_operation(
             tree_src,
@@ -459,7 +466,7 @@ class PointTree(Tree):
             output_expr=""
         )
         find_neighbor_cids = profile_kernel(
-            find_neighbor_cids, 'find_neighbor_cids', backend='opencl')
+            find_neighbor_cids, 'find_neighbor_cids', backend=self.backend)
         find_neighbor_cids(tree_src.pbounds.dev,
                            neighbor_cid_count.dev, neighbor_cids.dev)
         return neighbor_cid_count, neighbor_cids
@@ -566,7 +573,7 @@ class PointTree(Tree):
                                  neighbor_count.dev,
                                  gs=(partition_wgs * partition_size,),
                                  ls=(partition_wgs,),
-                                 queue=(get_queue() if q is None else q))
+                                 queue=(get_queue(self.backend) if q is None else q))
 
         if use_partitions and wgs > 32:
             if wgs < 128:
@@ -613,7 +620,7 @@ class PointTree(Tree):
                            neighbors.dev,
                            gs=(partition_wgs * partition_size,),
                            ls=(partition_wgs,),
-                           queue=(get_queue() if q is None else q))
+                           queue=(get_queue(self.backend) if q is None else q))
 
         if use_partitions and wgs > 32:
             if wgs < 128:

@@ -768,6 +768,7 @@ cdef class ParticleArray:
         """Set the device helper to push/pull from a hardware accelerator.
         """
         self.gpu = gpu
+        self.backend = gpu.backend
 
     def set(self, **props):
         """ Set properties from numpy arrays like objects
