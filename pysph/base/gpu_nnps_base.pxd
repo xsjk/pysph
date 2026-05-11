@@ -9,9 +9,6 @@ cimport cython
 from libcpp.map cimport map
 from libcpp.vector cimport vector
 
-import pyopencl as cl
-import pyopencl.array
-
 # PyZoltan CArrays
 from cyarray.carray cimport UIntArray, IntArray, DoubleArray, LongArray
 

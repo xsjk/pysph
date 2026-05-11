@@ -2,7 +2,6 @@ from mako.template import Template
 import os
 import re
 
-from compyle.opencl import DeviceWGSException
 from compyle.profile import profile_kernel
 
 
@@ -41,40 +40,49 @@ def _convert_vector_fields(src):
 
 
 def convert_code_for_backend(src, backend):
-    if backend != "cuda":
+    if backend == "opencl":
         return src
-    result = _convert_vector_fields(src)
-    result = result.replace("__global ", "")
-    result = result.replace("global ", "")
-    result = result.replace("local ", "__shared__ ")
-    result = result.replace("constant ", "const ")
-    result = re.sub(r"(?<!__device__ )\binline\b", "__device__ inline", result)
-    result = result.replace("barrier(CLK_LOCAL_MEM_FENCE)", "__syncthreads()")
-    result = result.replace("PYOPENCL_ELWISE_CONTINUE", "continue")
-    for name in ("contains", "contains_search", "intersects", "pass"):
-        result = result.replace(
-            "char %s(" % name, "__device__ inline char %s(" % name
+    elif backend == "cuda":
+        result = _convert_vector_fields(src)
+        result = result.replace("__global ", "")
+        result = result.replace("global ", "")
+        result = result.replace("local ", "__shared__ ")
+        result = result.replace("constant ", "const ")
+        result = re.sub(
+            r"(?<!__device__ )\binline\b", "__device__ inline", result
         )
-    result = result.replace("(uint2)(", "make_uint2(")
-    result = result.replace("(uint4)(", "make_uint4(")
-    result = result.replace("(uint8)(", "make_uint8(")
-    result = re.sub(
-        r"typedef\s+struct\s*\{.*?\}\s*float1\s*;", "", result, flags=re.S
-    )
-    result = re.sub(
-        r"typedef\s+struct\s*\{.*?\}\s*double1\s*;", "", result, flags=re.S
-    )
-    return result
+        result = result.replace("barrier(CLK_LOCAL_MEM_FENCE)", "__syncthreads()")
+        result = result.replace("PYOPENCL_ELWISE_CONTINUE", "continue")
+        for name in ("contains", "contains_search", "intersects", "pass"):
+            result = result.replace(
+                "char %s(" % name, "__device__ inline char %s(" % name
+            )
+        result = result.replace("(uint2)(", "make_uint2(")
+        result = result.replace("(uint4)(", "make_uint4(")
+        result = result.replace("(uint8)(", "make_uint8(")
+        result = re.sub(
+            r"typedef\s+struct\s*\{.*?\}\s*float1\s*;", "", result, flags=re.S
+        )
+        result = re.sub(
+            r"typedef\s+struct\s*\{.*?\}\s*double1\s*;", "", result, flags=re.S
+        )
+        return result
+    else:
+        raise RuntimeError("Unsupported GPU backend %s" % backend)
 
 
 def convert_arguments_for_backend(args, backend):
-    result = convert_code_for_backend(args, backend)
-    if backend == "cuda":
+    if backend == "opencl":
+        return args
+    elif backend == "cuda":
+        result = convert_code_for_backend(args, backend)
         result = result.replace("uint *", "unsigned int *")
         result = result.replace("ulong *", "unsigned long *")
         result = result.replace("uint ", "unsigned int ")
         result = result.replace("ulong ", "unsigned long ")
-    return result
+        return result
+    else:
+        raise RuntimeError("Unsupported GPU backend %s" % backend)
 
 
 def get_context(backend='opencl'):
@@ -82,14 +90,15 @@ def get_context(backend='opencl'):
         from compyle.opencl import get_context as get_opencl_context
 
         return get_opencl_context()
-    if backend == "cuda":
+    elif backend == "cuda":
         from compyle.cuda import set_context
 
         set_context()
         from pycuda.autoinit import context
 
         return context
-    raise RuntimeError("Unsupported GPU backend %s" % backend)
+    else:
+        raise RuntimeError("Unsupported GPU backend %s" % backend)
 
 
 def get_queue(backend='opencl'):
@@ -97,9 +106,10 @@ def get_queue(backend='opencl'):
         from compyle.opencl import get_queue as get_opencl_queue
 
         return get_opencl_queue()
-    if backend == "cuda":
+    elif backend == "cuda":
         return None
-    raise RuntimeError("Unsupported GPU backend %s" % backend)
+    else:
+        raise RuntimeError("Unsupported GPU backend %s" % backend)
 
 
 def get_generic_scan_kernel(backend):
@@ -107,18 +117,22 @@ def get_generic_scan_kernel(backend):
         from pyopencl.scan import GenericScanKernel
 
         return GenericScanKernel
-    if backend == "cuda":
+    elif backend == "cuda":
         from compyle.cuda import GenericScanKernel
 
         return GenericScanKernel
-    raise RuntimeError("Unsupported GPU backend %s" % backend)
+    else:
+        raise RuntimeError("Unsupported GPU backend %s" % backend)
 
 
 def convert_kernel_kwargs_for_backend(kwargs, backend):
-    if backend != "cuda":
+    if backend == "opencl":
         return kwargs
+    elif backend == "cuda":
+        result = dict(kwargs)
+    else:
+        raise RuntimeError("Unsupported GPU backend %s" % backend)
 
-    result = dict(kwargs)
     if "arguments" in result:
         result["arguments"] = convert_arguments_for_backend(
             result["arguments"], backend
@@ -141,7 +155,7 @@ def make_scan_kernel(backend, ctx, dtype, **kwargs):
     scan_kernel = get_generic_scan_kernel(backend)
     if backend == "opencl":
         return scan_kernel(ctx, dtype, **kwargs)
-    if backend == "cuda":
+    elif backend == "cuda":
         kwargs = convert_kernel_kwargs_for_backend(kwargs, backend)
         source = "\n".join(
             v for v in kwargs.values() if isinstance(v, str)
@@ -150,21 +164,16 @@ def make_scan_kernel(backend, ctx, dtype, **kwargs):
             [_cuda_uint8_preamble(source), kwargs.get("preamble", "")]
         )
         return scan_kernel(dtype, **kwargs)
-    raise RuntimeError("Unsupported GPU backend %s" % backend)
+    else:
+        raise RuntimeError("Unsupported GPU backend %s" % backend)
 
 
 class CUDASimpleKernel(object):
     """CUDA equivalent of compyle.opencl.SimpleKernel used by GPU NNPS."""
 
     def __init__(self, args, operation, wgs, name="", preamble=""):
-        import pycuda.driver as drv
         from pycuda.compiler import SourceModule
 
-        max_threads = drv.Context.get_device().get_attribute(
-            drv.device_attribute.MAX_THREADS_PER_BLOCK
-        )
-        if wgs > max_threads:
-            raise DeviceWGSException("")
         source = r"""
         %(preamble)s
 

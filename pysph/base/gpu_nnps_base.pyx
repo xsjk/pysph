@@ -27,18 +27,12 @@ from cpython.list cimport PyList_GetItem, PyList_SetItem, PyList_GET_ITEM
 # Cython for compiler directives
 cimport cython
 
-import pyopencl as cl
-import pyopencl.array
-from pyopencl.elementwise import ElementwiseKernel
-
 from pysph.base.nnps_base cimport *
 from pysph.base.device_helper import DeviceHelper
 from compyle.config import get_config
 from compyle.array import get_backend, Array
 from compyle.parallel import Elementwise, Scan
 from compyle.types import annotate
-from compyle.opencl import (get_context, get_queue,
-                            set_context, set_queue)
 import compyle.array as array
 
 # Particle Tag information
@@ -334,6 +328,10 @@ cdef class BruteForceNNPS(GPUNNPS):
     def __init__(self, int dim, list particles, double radius_scale=2.0,
             int ghost_layers=1, domain=None, bint cache=True,
             bint sort_gids=False, backend='opencl'):
+        backend = get_backend(backend)
+        backend = 'opencl' if backend == 'cython' else backend
+        if backend != 'opencl':
+            raise RuntimeError("BruteForceNNPS only supports the OpenCL backend")
         GPUNNPS.__init__(self, dim, particles, radius_scale, ghost_layers,
                 domain, cache, sort_gids, backend)
 
@@ -370,6 +368,9 @@ cdef class BruteForceNNPS(GPUNNPS):
     cdef void find_neighbor_lengths(self, nbr_lengths):
         # IMPORTANT NOTE: pyopencl uses the length of the first argument
         # to determine the global work size
+        from pyopencl.elementwise import ElementwiseKernel
+        from compyle.opencl import get_context
+
         arguments = \
                 """%(data_t)s* d_x, %(data_t)s* d_y, %(data_t)s* d_z,
                 %(data_t)s* d_h, %(data_t)s* s_x, %(data_t)s* s_y,
@@ -406,6 +407,8 @@ cdef class BruteForceNNPS(GPUNNPS):
                 nbr_lengths.dev, self.radius_scale2)
 
     cdef void find_nearest_neighbors_gpu(self, nbrs, start_indices):
+        from pyopencl.elementwise import ElementwiseKernel
+        from compyle.opencl import get_context
 
         arguments = \
                 """%(data_t)s* d_x, %(data_t)s* d_y, %(data_t)s* d_z,
