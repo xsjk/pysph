@@ -2,18 +2,12 @@ from pysph.base.tree.tree import Tree
 from pysph.base.tree.helpers import ParticleArrayWrapper, get_helper, \
     make_vec, ctype_to_dtype, get_vector_dtype
 from compyle.array import get_backend
-from compyle.opencl import DeviceWGSException
 from compyle.profile import profile_kernel
-from pysph.base.gpu_nnps_helper import (
-    get_queue, make_scan_kernel,
-)
+from pysph.base.gpu_nnps_helper import get_queue, make_scan_kernel
 from compyle.array import Array
 from pytools import memoize
 
 import numpy as np
-
-import pyopencl as cl
-import pyopencl.tools
 
 from mako.template import Template
 
@@ -240,17 +234,19 @@ def _get_leaf_neighbor_kernel_parameters(data_t, dim, args, setup, operation,
 
 # Support for 1D
 def register_custom_pyopencl_ctypes():
+    import pyopencl as cl
+    import pyopencl.tools
+
     cl.tools.get_or_register_dtype('float1', np.dtype([('s0', np.float32)]))
     cl.tools.get_or_register_dtype('double1', np.dtype([('s0', np.float64)]))
-
-
-register_custom_pyopencl_ctypes()
 
 
 class PointTree(Tree):
     def __init__(self, pa, dim=2, leaf_size=32, radius_scale=2.0,
                  use_double=False, c_type='float', backend=None):
         backend = get_backend(backend or 'opencl')
+        if backend == 'opencl':
+            register_custom_pyopencl_ctypes()
         super(PointTree, self).__init__(pa.get_number_of_particles(), 2 ** dim,
                                         leaf_size, backend=backend)
 
@@ -529,7 +525,7 @@ class PointTree(Tree):
     def _is_valid_nnps_wgs(self):
         # Max work group size can only be found by building the
         # kernel.
-        try:
+        def build_kernels():
             find_neighbor_counts = self.helper.get_kernel(
                 'find_neighbor_counts', sorted=self.sorted, wgs=self.leaf_size
             )
@@ -537,10 +533,16 @@ class PointTree(Tree):
             find_neighbor = self.helper.get_kernel(
                 'find_neighbors', sorted=self.sorted, wgs=self.leaf_size
             )
-        except DeviceWGSException:
-            return False
+
+        if self.backend == 'opencl':
+            from compyle.opencl import DeviceWGSException
+            try:
+                build_kernels()
+            except DeviceWGSException:
+                return False
         else:
-            return True
+            build_kernels()
+        return True
 
     def find_neighbor_lengths(self, neighbor_cid_count, neighbor_cids,
                               tree_src, neighbor_count,

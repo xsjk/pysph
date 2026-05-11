@@ -1,12 +1,65 @@
 import numpy as np
-import pyopencl as cl
-import pyopencl.cltypes
 from pytools import memoize
 from compyle.array import Array
 from pysph.base.gpu_nnps_helper import GPUNNPSHelper, get_elwise_kernel
 
 
 _cuda_vector_dtypes = None
+_opencl_make_vec = None
+_opencl_vector_dtypes = None
+
+
+def _get_opencl_cltypes():
+    import pyopencl.cltypes
+
+    return pyopencl.cltypes
+
+
+def _get_opencl_make_vec():
+    global _opencl_make_vec
+    if _opencl_make_vec is not None:
+        return _opencl_make_vec
+
+    cltypes = _get_opencl_cltypes()
+    _opencl_make_vec = {
+        'float': {
+            1: np.float32,
+            2: cltypes.make_float2,
+            3: cltypes.make_float3
+        },
+        'double': {
+            1: np.float64,
+            2: cltypes.make_double2,
+            3: cltypes.make_double3
+        }
+    }
+    return _opencl_make_vec
+
+
+def _get_opencl_vector_dtypes():
+    global _opencl_vector_dtypes
+    if _opencl_vector_dtypes is not None:
+        return _opencl_vector_dtypes
+
+    cltypes = _get_opencl_cltypes()
+    _opencl_vector_dtypes = {
+        'uint': {
+            2: cltypes.uint2,
+            4: cltypes.uint4,
+            8: cltypes.uint8
+        },
+        'float': {
+            1: cltypes.float,
+            2: cltypes.float2,
+            3: cltypes.float3,
+        },
+        'double': {
+            1: cltypes.double,
+            2: cltypes.double2,
+            3: cltypes.double3
+        }
+    }
+    return _opencl_vector_dtypes
 
 
 def _get_cuda_vector_dtypes():
@@ -14,12 +67,9 @@ def _get_cuda_vector_dtypes():
     if _cuda_vector_dtypes is not None:
         return _cuda_vector_dtypes
 
-    try:
-        from pycuda.gpuarray import vec
-        from pycuda.tools import get_or_register_dtype
-        from compyle import types as compyle_types
-    except ImportError as exc:
-        raise RuntimeError("CUDA vector dtypes require PyCUDA") from exc
+    from pycuda.gpuarray import vec
+    from pycuda.tools import get_or_register_dtype
+    from compyle import types as compyle_types
 
     uint8 = np.dtype([
         ("x", np.uint32),
@@ -78,20 +128,6 @@ def _make_cuda_vec(dtype, *values):
     return ary[0]
 
 
-_opencl_make_vec = {
-    'float': {
-        1: np.float32,
-        2: cl.cltypes.make_float2,
-        3: cl.cltypes.make_float3
-    },
-    'double': {
-        1: np.float64,
-        2: cl.cltypes.make_double2,
-        3: cl.cltypes.make_double3
-    }
-}
-
-
 @memoize
 def get_helper(src_file, c_type=None, backend='opencl'):
     # ctx and c_type are the only parameters that
@@ -115,66 +151,52 @@ def get_copy_kernel(backend, dtype1, dtype2, varnames):
                              backend=backend)
 
 
-_opencl_vector_dtypes = {
-    'uint': {
-        2: cl.cltypes.uint2,
-        4: cl.cltypes.uint4,
-        8: cl.cltypes.uint8
-    },
-    'float': {
-        1: cl.cltypes.float,
-        2: cl.cltypes.float2,
-        3: cl.cltypes.float3,
-    },
-    'double': {
-        1: cl.cltypes.double,
-        2: cl.cltypes.double2,
-        3: cl.cltypes.double3
-    }
-}
-
-
 def make_vec(backend, ctype, dim, *values):
     if backend == 'opencl':
-        return _opencl_make_vec[ctype][dim](*values)
-    if backend == 'cuda':
+        return _get_opencl_make_vec()[ctype][dim](*values)
+    elif backend == 'cuda':
         if dim == 1:
             return ctype_to_dtype(ctype)(values[0])
         return _make_cuda_vec(get_vector_dtype(ctype, dim, backend), *values)
-    raise RuntimeError("Unsupported GPU backend %s" % backend)
+    else:
+        raise RuntimeError("Unsupported GPU backend %s" % backend)
 
 
 def get_vector_dtype(ctype, dim, backend='opencl'):
     try:
         if backend == 'opencl':
-            return _opencl_vector_dtypes[ctype][dim]
-        if backend == 'cuda':
+            return _get_opencl_vector_dtypes()[ctype][dim]
+        elif backend == 'cuda':
             dtype = _get_cuda_vector_dtypes()[ctype][dim]
             if dtype is None:
                 raise KeyError
             return dtype
+        else:
+            raise RuntimeError("Unsupported GPU backend %s" % backend)
     except KeyError:
         raise ValueError("Vector datatype of type %(ctype)s with %(dim)s items"
                          " is not supported" % dict(ctype=ctype, dim=dim))
-    raise RuntimeError("Unsupported GPU backend %s" % backend)
 
 
 def get_char_dtype(backend='opencl'):
     if backend == 'opencl':
-        return cl.cltypes.char
-    if backend == 'cuda':
+        return _get_opencl_cltypes().char
+    elif backend == 'cuda':
         return np.int8
-    raise RuntimeError("Unsupported GPU backend %s" % backend)
+    else:
+        raise RuntimeError("Unsupported GPU backend %s" % backend)
 
 
 def set_uint2(array, x, y, backend='opencl'):
     if backend == 'opencl':
-        array.dev[0].set(cl.cltypes.make_uint2(x, y))
-    else:
+        array.dev[0].set(_get_opencl_cltypes().make_uint2(x, y))
+    elif backend == 'cuda':
         value = np.zeros(1, dtype=get_vector_dtype('uint', 2, backend))
         value['x'][0] = x
         value['y'][0] = y
         array.dev.set(value)
+    else:
+        raise RuntimeError("Unsupported GPU backend %s" % backend)
 
 
 c2d = {

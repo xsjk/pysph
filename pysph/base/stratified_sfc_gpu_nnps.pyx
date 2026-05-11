@@ -12,15 +12,8 @@ from cython.operator cimport dereference as deref, preincrement as inc
 
 from .gpu_nnps_helper import GPUNNPSHelper
 
-import pyopencl as cl
-import pyopencl.array
-import pyopencl.algorithm
-from pyopencl.scan import GenericScanKernel
-from pyopencl.elementwise import ElementwiseKernel
-
-from compyle.array import Array
+from compyle.array import Array, get_backend
 import compyle.array as array
-from compyle.opencl import get_context
 
 # Cython for compiler directives
 cimport cython
@@ -44,6 +37,12 @@ cdef class StratifiedSFCGPUNNPS(GPUNNPS):
             int ghost_layers=1, domain=None, bint fixed_h=False,
             bint cache=True, bint sort_gids=False,
             int num_levels=2, backend='opencl'):
+        backend = get_backend(backend)
+        backend = 'opencl' if backend == 'cython' else backend
+        if backend != 'opencl':
+            raise RuntimeError(
+                "StratifiedSFCGPUNNPS only supports the OpenCL backend"
+            )
         GPUNNPS.__init__(
             self, dim, particles, radius_scale, ghost_layers, domain,
             cache, sort_gids, backend
@@ -103,6 +102,11 @@ cdef class StratifiedSFCGPUNNPS(GPUNNPS):
         pass
 
     cpdef _bin(self, int pa_index):
+        import pyopencl as cl
+        import pyopencl.algorithm
+        from pyopencl.scan import GenericScanKernel
+        from compyle.opencl import get_context
+
         cdef NNPSParticleArrayWrapper pa_wrapper = self.pa_wrappers[pa_index]
 
         fill_pids = self.helper.get_kernel("fill_pids")
@@ -158,11 +162,13 @@ cdef class StratifiedSFCGPUNNPS(GPUNNPS):
 
 
     cdef void find_neighbor_lengths(self, nbr_lengths):
+        from pyopencl import cltypes
+
         find_nbr_lengths = self.helper.get_kernel("find_nbr_lengths",
                 sorted=self._sorted)
 
-        make_vec = cl.cltypes.make_double3 if self.use_double \
-                else cl.cltypes.make_float3
+        make_vec = cltypes.make_double3 if self.use_double \
+                else cltypes.make_float3
 
         mask_lengths = array.zeros(self.dst.get_number_of_particles(),
                 dtype=np.int32, backend=self.backend)
@@ -182,11 +188,13 @@ cdef class StratifiedSFCGPUNNPS(GPUNNPS):
                 self.num_particles_levels[self.src_index].dev)
 
     cdef void find_nearest_neighbors_gpu(self, nbrs, start_indices):
+        from pyopencl import cltypes
+
         find_nbrs = self.helper.get_kernel("find_nbrs",
                 sorted=self._sorted)
 
-        make_vec = cl.cltypes.make_double3 if self.use_double \
-                else cl.cltypes.make_float3
+        make_vec = cltypes.make_double3 if self.use_double \
+                else cltypes.make_float3
 
         dst_gpu = self.dst.pa.gpu
         src_gpu = self.src.pa.gpu

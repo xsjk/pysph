@@ -13,12 +13,6 @@ from cython.operator cimport dereference as deref, preincrement as inc
 # Cython for compiler directives
 cimport cython
 
-import pyopencl as cl
-import pyopencl.array
-import pyopencl.algorithm
-from pyopencl.scan import GenericScanKernel
-from pyopencl.elementwise import ElementwiseKernel
-
 import numpy as np
 cimport numpy as np
 from mako.template import Template
@@ -26,7 +20,6 @@ from mako.template import Template
 from pysph.base.gpu_nnps_helper import GPUNNPSHelper
 from compyle.array import Array
 import compyle.array as array
-from compyle.opencl import get_context, get_config, profile_kernel
 from compyle.api import Elementwise
 
 from pysph.base.z_order_gpu_nnps_kernels import (ZOrderNbrsKernel,

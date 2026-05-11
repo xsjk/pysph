@@ -128,12 +128,11 @@ def handle_precomp_literals(code, use_double=False):
 
 def get_converter(backend):
     if backend == 'opencl':
-        Converter = OpenCLConverter
+        return OpenCLConverter
     elif backend == 'cuda':
-        Converter = CUDAConverter
+        return CUDAConverter
     else:
         raise RuntimeError('Invalid backend: %s' % backend)
-    return Converter
 
 
 def get_kernel_definition(kernel, arg_list):
@@ -171,30 +170,30 @@ class DummyQueue(object):
 
 
 def get_context(backend):
-    if backend == 'cuda':
+    if backend == 'opencl':
+        from compyle.opencl import get_context
+        return get_context()
+    elif backend == 'cuda':
         from compyle.cuda import set_context
         set_context()
         from pycuda.autoinit import context
         return context
-    elif backend == 'opencl':
-        from compyle.opencl import get_context
-        return get_context()
     else:
         raise RuntimeError('Unsupported GPU backend %s' % backend)
 
 
 def get_queue(backend):
-    if backend == 'cuda':
-        return DummyQueue()
-    elif backend == 'opencl':
+    if backend == 'opencl':
         from compyle.opencl import get_queue
         return get_queue()
+    elif backend == 'cuda':
+        return DummyQueue()
     else:
         raise RuntimeError('Unsupported GPU backend %s' % backend)
 
 
 def profile_kernel(knl, backend):
-    if backend == 'cuda' or backend == 'opencl':
+    if backend == 'opencl' or backend == 'cuda':
         from compyle.profile import profile_kernel
         return profile_kernel(knl, knl.function_name, backend=backend)
     else:
