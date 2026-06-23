@@ -123,7 +123,7 @@ cdef class StratifiedSFCGPUNNPS(GPUNNPS):
         radix_sort = cl.algorithm.RadixSort(get_context(),
                 "unsigned int* pids, unsigned long* keys",
                 scan_kernel=GenericScanKernel, key_expr="keys[i]",
-                sort_arg_names=["pids", "keys"])
+                sort_arg_names=["pids", "keys"], key_dtype=np.uint64)
 
         cdef int max_num_bits = <int> (self.max_num_bits + \
                 ceil(log2(self.num_levels)))

@@ -446,7 +446,7 @@ cdef class StratifiedSFCNNPS(NNPS):
         cdef uint64_t key_stripped, strip_mask, current_max_key
         cdef int mask_length = 0
 
-        strip_mask = (1 << self.max_num_bits) - 1
+        strip_mask = ((<uint64_t> 1) << self.max_num_bits) - 1
 
         for i in range(self.narrays):
             n = 0
@@ -710,7 +710,7 @@ cdef class StratifiedSFCNNPS(NNPS):
         for i in range(curr_num_particles):
             current_pids[i] = i
             level = self._get_level(h_ptr[i])
-            level_padded = level << self.max_num_bits
+            level_padded = (<uint64_t> level) << self.max_num_bits
             cell_size = self.radius_scale*current_cells[level]
             find_cell_id_raw(
                     x_ptr[i] - xmin[0],
@@ -763,7 +763,7 @@ cdef class StratifiedSFCNNPS(NNPS):
 
         cdef uint64_t key_stripped, strip_mask
 
-        strip_mask = (1 << self.max_num_bits) - 1
+        strip_mask = ((<uint64_t> 1) << self.max_num_bits) - 1
 
         key = current_keys[0]
         level = key >> self.max_num_bits

@@ -315,9 +315,9 @@ class PointTree(Tree):
         fill_particle_data(*args)
 
     def get_index_constants(self, depth):
-        rshift = np.uint8(self.dim * (self.max_depth - depth - 1))
+        rshift = self.dim * (self.max_depth - depth - 1)
         mask = np.uint64((2 ** self.dim - 1) << rshift)
-        return mask, rshift
+        return mask, np.uint8(rshift)
 
     def _adjust_domain_width(self):
         # Convert width of domain to a power of 2 multiple of cell size

@@ -43,7 +43,7 @@
         );
 
     key = interleave(c_x, c_y, c_z);
-    ulong mask = level << max_num_bits;
+    ulong mask = ((ulong) level) << max_num_bits;
     keys[i] = key + mask;
 
 </%def>
@@ -55,10 +55,9 @@
 
 <%def name="fill_start_indices_src(data_t)" cached="True">
     int curr_level = extract_level(keys[i], max_num_bits);
-    if(i != 0 && curr_level != extract_level(keys[i-1], max_num_bits))
+    if(i == 0 || curr_level != extract_level(keys[i-1], max_num_bits))
         atomic_min(&start_idx_levels[curr_level], i);
-    else
-        atomic_inc(&num_particles_levels[curr_level])
+    atomic_inc(&num_particles_levels[curr_level]);
 </%def>
 
 
@@ -116,7 +115,7 @@
         h_max = fmax(radius_scale*q.w, cell_size_level);
         H = ceil(h_max/cell_size_level);
 
-        mask = level << max_num_bits;
+        mask = ((ulong) level) << max_num_bits;
 
         #pragma unroll
         for(j=-H; j<H+1; j++)
@@ -190,7 +189,7 @@
         h_max = fmax(radius_scale*q.w, cell_size_level);
         H = ceil(h_max/cell_size_level);
 
-        mask = level << max_num_bits;
+        mask = ((ulong) level) << max_num_bits;
 
         #pragma unroll
         for(j=-H; j<H+1; j++)
