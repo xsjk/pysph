@@ -254,7 +254,7 @@ class HDFOutput(Output):
                 prop = ptype_grp.create_dataset(propname, data=array, **c_kw)
                 prop.attrs['stored'] = True
             else:
-                prop = ptype_grp.create_dataset(propname, (0,))
+                prop = ptype_grp.create_dataset(propname, (0,), dtype='f4')
                 prop.attrs['stored'] = False
 
             for attname, value in attributes.items():
