@@ -8,6 +8,7 @@ from mako.template import Template
 import numpy as np
 
 from compyle.config import get_config
+from compyle.transpiler import get_external_symbols_and_calls
 from .equation import get_array_names
 from .integrator_cython_helper import IntegratorCythonHelper
 from .acceleration_eval_gpu_helper import (
@@ -245,9 +246,13 @@ class IntegratorGPUHelper(IntegratorCythonHelper):
     def get_stepper_code(self):
         classes = {}
         helpers = []
+        methods = []
         for stepper in self.object.steppers.values():
             cls = stepper.__class__.__name__
             classes[cls] = stepper
+            for method in self.get_stepper_method_wrapper_names():
+                if hasattr(stepper, method):
+                    methods.append(getattr(stepper, method))
             if hasattr(stepper, '_get_helpers_'):
                 for helper in stepper._get_helpers_():
                     if helper not in helpers:
@@ -257,8 +262,18 @@ class IntegratorGPUHelper(IntegratorCythonHelper):
 
         Converter = get_converter(self.acceleration_eval_helper.backend)
         code_gen = Converter(known_types=known_types)
+        symbols = {}
+        for func in helpers + methods:
+            symbols.update(
+                get_external_symbols_and_calls(func, self.backend)[0]
+            )
 
-        wrappers = get_helper_code(helpers, code_gen, self.backend)
+        wrappers = [
+            '#define {name} {value}'.format(name=name, value=symbols[name])
+            for name in sorted(symbols)
+        ]
+        code_gen.add_known(symbols)
+        wrappers += get_helper_code(helpers, code_gen, self.backend)
         for cls in sorted(classes.keys()):
             wrappers.append(code_gen.parse_instance(classes[cls]))
         return '\n'.join(wrappers)
