@@ -20,6 +20,7 @@ from pysph.sph.basic_equations import SummationDensity
 from pysph.base.kernels import CubicSpline
 from pysph.base.nnps import LinkedListNNPS as NNPS
 from pysph.sph.sph_compiler import SPHCompiler
+from pysph.sph.acceleration_eval_gpu_helper import AccelerationEvalGPUHelper
 
 from pysph.base.reduce_array import serial_reduce_array
 
@@ -133,6 +134,18 @@ class TestCheckEquationArrayProps(unittest.TestCase):
 
         # Then.
         check_equation_array_properties(eq, [f])
+
+
+class TestAccelerationEvalGPUHelperCodegen(unittest.TestCase):
+    def test_opencl_periodic_image_setup_uses_overloaded_floor(self):
+        helper = object.__new__(AccelerationEvalGPUHelper)
+        helper.backend = "opencl"
+        helper._use_double = False
+
+        code = "\n".join(helper._periodic_image_setup_lines("d_h[d_idx]"))
+
+        self.assertIn("floor(", code)
+        self.assertNotIn("floorf(", code)
 
 
 class SimpleEquation(Equation):

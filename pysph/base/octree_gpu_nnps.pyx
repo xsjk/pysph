@@ -34,16 +34,33 @@ cdef class OctreeGPUNNPS(GPUNNPS):
                  "finding neighbors. A few particles outside of the original "
                  "search radius might be included.")
 
+        self.domain.update()
+        domain_manager = self.domain.manager
+        minimum_image_periodic = domain_manager.minimum_image_periodic
         for i in range(self.narrays):
             self.octrees.append(PointTree(pa=self.pa_wrappers[i].pa,
                                           radius_scale=radius_scale,
                                           use_double=self.use_double,
                                           leaf_size=leaf_size, dim=dim,
-                                          backend=self.backend))
+                                          backend=self.backend,
+                                          periodic_in_x=(
+                                              minimum_image_periodic and
+                                              domain_manager.periodic_in_x
+                                          ),
+                                          periodic_in_y=(
+                                              minimum_image_periodic and
+                                              domain_manager.periodic_in_y
+                                          ),
+                                          periodic_in_z=(
+                                              minimum_image_periodic and
+                                              domain_manager.periodic_in_z
+                                          ),
+                                          xtranslate=domain_manager.xtranslate,
+                                          ytranslate=domain_manager.ytranslate,
+                                          ztranslate=domain_manager.ztranslate))
         self.use_elementwise = use_elementwise
         self.use_partitions = use_partitions
         self.allow_sort = allow_sort
-        self.domain.update()
         self.update()
 
         # Check if device supports required workgroup size,
@@ -132,6 +149,9 @@ cdef class OctreeGPUNNPS(GPUNNPS):
         octree_src = self.octrees[self.src_index]
         pa_gpu_dst = octree_dst.pa.gpu
         pa_gpu_src = octree_src.pa.gpu
+        domain_manager = self.domain.manager
+        minimum_image_periodic = domain_manager.minimum_image_periodic
+        real_t = np.float64 if c_type == 'double' else np.float32
 
         return [
                    octree_dst.unique_cids.dev.data,
@@ -145,7 +165,16 @@ cdef class OctreeGPUNNPS(GPUNNPS):
                    pa_gpu_dst.x.dev.data, pa_gpu_dst.y.dev.data,
                    pa_gpu_dst.z.dev.data, pa_gpu_dst.h.dev.data,
                    pa_gpu_src.x.dev.data, pa_gpu_src.y.dev.data,
-                   pa_gpu_src.z.dev.data, pa_gpu_src.h.dev.data
+                   pa_gpu_src.z.dev.data, pa_gpu_src.h.dev.data,
+                   np.int32(minimum_image_periodic and
+                            domain_manager.periodic_in_x),
+                   np.int32(minimum_image_periodic and
+                            domain_manager.periodic_in_y),
+                   np.int32(minimum_image_periodic and
+                            domain_manager.periodic_in_z),
+                   real_t(domain_manager.xtranslate),
+                   real_t(domain_manager.ytranslate),
+                   real_t(domain_manager.ztranslate),
                ], [
                    (self.leaf_size * octree_dst.unique_cid_count,),
                    (self.leaf_size,)

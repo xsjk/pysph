@@ -2,6 +2,11 @@
 <%def name="preamble(data_t)" cached="True">
     #define IN_BOUNDS(X, MIN, MAX) ((X >= MIN) && (X < MAX))
     #define NORM2(X, Y, Z) ((X)*(X) + (Y)*(Y) + (Z)*(Z))
+    #define MINIMUM_IMAGE(DX, PERIODIC, TRANSLATE) \
+        ((PERIODIC) && (TRANSLATE) > 0 && (DX) > 0.5*(TRANSLATE) ? \
+         (DX) - (TRANSLATE) : \
+         ((PERIODIC) && (TRANSLATE) > 0 && (DX) < -0.5*(TRANSLATE) ? \
+          (DX) + (TRANSLATE) : (DX)))
     #define MIN(X, Y) ((X) < (Y) ? (X) : (Y))
     #define MAX(X, Y) ((X) > (Y) ? (X) : (Y))
     #define SQR(X) ((X) * (X))
@@ -79,7 +84,7 @@
     local ${data_t} ys[${wgs}];
     local ${data_t} zs[${wgs}];
     local ${data_t} hs[${wgs}];
-    ${data_t} r2;
+    ${data_t} r2, dx, dy, dz;
     ${caller.pre_loop()}
     while (offset_src < offset_lim) {
         cid_src = neighbor_cids[offset_src];
@@ -109,9 +114,13 @@
                     % else:
                         pid_src = pids_src[pbound_here2.s0 + j];
                     % endif
-                    ${data_t} dist2 = NORM2(xs[j] - xd,
-                                            ys[j] - yd,
-                                            zs[j] - zd);
+                    dx = MINIMUM_IMAGE(xs[j] - xd, periodic_in_x,
+                                       xtranslate);
+                    dy = MINIMUM_IMAGE(ys[j] - yd, periodic_in_y,
+                                       ytranslate);
+                    dz = MINIMUM_IMAGE(zs[j] - zd, periodic_in_z,
+                                       ztranslate);
+                    ${data_t} dist2 = NORM2(dx, dy, dz);
                     r2 = MAX(hs[j], hd) * radius_scale;
                     r2 *= r2;
                     if (dist2 < r2) {
@@ -132,6 +141,8 @@
     ${data_t} *xsrc, ${data_t} *ysrc, ${data_t} *zsrc, ${data_t} *hsrc,
     ${data_t} *xdst, ${data_t} *ydst, ${data_t} *zdst, ${data_t} *hdst,
     ${data_t} radius_scale,
+    int periodic_in_x, int periodic_in_y, int periodic_in_z,
+    ${data_t} xtranslate, ${data_t} ytranslate, ${data_t} ztranslate,
     int *neighbor_cid_offset, int *neighbor_cids,
     int *neighbor_counts
 </%def>
@@ -156,6 +167,8 @@
     ${data_t} *xsrc, ${data_t} *ysrc, ${data_t} *zsrc, ${data_t} *hsrc,
     ${data_t} *xdst, ${data_t} *ydst, ${data_t} *zdst, ${data_t} *hdst,
     ${data_t} radius_scale,
+    int periodic_in_x, int periodic_in_y, int periodic_in_z,
+    ${data_t} xtranslate, ${data_t} ytranslate, ${data_t} ztranslate,
     int *neighbor_cid_offset, int *neighbor_cids,
     int *neighbor_counts, int *neighbors
 </%def>
@@ -208,7 +221,7 @@
     int offset_src = neighbor_cid_offset[idx];
     int offset_lim = neighbor_cid_offset[idx + 1];
     uint2 pbound_here2;
-    ${data_t} r2;
+    ${data_t} r2, dx, dy, dz;
 
 
     ${caller.pre_loop()}
@@ -223,9 +236,13 @@
             % else:
                 pid_src = pids_src[j];
             % endif
-            ${data_t} dist2 = NORM2(xsrc[pid_src] - xd,
-                                    ysrc[pid_src] - yd,
-                                    zsrc[pid_src] - zd);
+            dx = MINIMUM_IMAGE(xsrc[pid_src] - xd, periodic_in_x,
+                               xtranslate);
+            dy = MINIMUM_IMAGE(ysrc[pid_src] - yd, periodic_in_y,
+                               ytranslate);
+            dz = MINIMUM_IMAGE(zsrc[pid_src] - zd, periodic_in_z,
+                               ztranslate);
+            ${data_t} dist2 = NORM2(dx, dy, dz);
 
             r2 = MAX(hsrc[pid_src], hd) * radius_scale;
             r2 *= r2;
@@ -244,6 +261,8 @@
     ${data_t} *xsrc, ${data_t} *ysrc, ${data_t} *zsrc, ${data_t} *hsrc,
     ${data_t} *xdst, ${data_t} *ydst, ${data_t} *zdst, ${data_t} *hdst,
     ${data_t} radius_scale,
+    int periodic_in_x, int periodic_in_y, int periodic_in_z,
+    ${data_t} xtranslate, ${data_t} ytranslate, ${data_t} ztranslate,
     int *neighbor_cid_offset, int *neighbor_cids,
     int *neighbor_counts
 </%def>
@@ -267,6 +286,8 @@
     ${data_t} *xsrc, ${data_t} *ysrc, ${data_t} *zsrc, ${data_t} *hsrc,
     ${data_t} *xdst, ${data_t} *ydst, ${data_t} *zdst, ${data_t} *hdst,
     ${data_t} radius_scale,
+    int periodic_in_x, int periodic_in_y, int periodic_in_z,
+    ${data_t} xtranslate, ${data_t} ytranslate, ${data_t} ztranslate,
     int *neighbor_cid_offset, int *neighbor_cids,
     int *neighbor_counts, int *neighbors
 </%def>

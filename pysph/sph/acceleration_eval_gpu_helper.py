@@ -126,6 +126,17 @@ def handle_precomp_literals(code, use_double=False):
     return src
 
 
+def periodic_kernel_args(data_t):
+    return [
+        'int periodic_in_x',
+        'int periodic_in_y',
+        'int periodic_in_z',
+        f'{data_t} xtranslate',
+        f'{data_t} ytranslate',
+        f'{data_t} ztranslate',
+    ]
+
+
 def get_converter(backend):
     if backend == 'opencl':
         return OpenCLConverter
@@ -219,6 +230,22 @@ class GPUAccelerationEval(object):
         else:
             return attr
 
+    def _periodic_args(self):
+        dtype = np.float64 if self._use_double else np.float32
+        manager = self.nnps.domain.manager
+        minimum_image_periodic = manager.minimum_image_periodic
+        return [
+            np.asarray(int(minimum_image_periodic and manager.periodic_in_x),
+                       dtype=np.int32),
+            np.asarray(int(minimum_image_periodic and manager.periodic_in_y),
+                       dtype=np.int32),
+            np.asarray(int(minimum_image_periodic and manager.periodic_in_z),
+                       dtype=np.int32),
+            np.asarray(manager.xtranslate, dtype=dtype),
+            np.asarray(manager.ytranslate, dtype=dtype),
+            np.asarray(manager.ztranslate, dtype=dtype),
+        ]
+
     def _call_kernel(self, info, extra_args):
         nnps = self.nnps
         call = info.get('method')
@@ -260,7 +287,7 @@ class GPUAccelerationEval(object):
                     cache._nbr_lengths_gpu.dev.data,
                     cache._start_idx_gpu.dev.data,
                     cache._neighbors_gpu.dev.data
-                ] + extra_args
+                ] + self._periodic_args() + extra_args
                 call(*args)
         else:
             call(*(args + extra_args))
@@ -378,6 +405,7 @@ class CUDAAccelerationEval(GPUAccelerationEval):
 
         if info.get('loop'):
             if self._use_local_memory:
+                self._assert_local_memory_supported()
                 # FIXME: Fix local memory for CUDA
                 nnps.set_context(info['src_idx'], info['dst_idx'])
 
@@ -398,7 +426,7 @@ class CUDAAccelerationEval(GPUAccelerationEval):
                     cache._nbr_lengths_gpu.dev,
                     cache._start_idx_gpu.dev,
                     cache._neighbors_gpu.dev
-                ] + extra_args
+                ] + self._periodic_args() + extra_args
                 event = drv.Event()
                 call(*args, block=(num_tpb, 1, 1), grid=(num_blocks, 1))
                 event.record()
@@ -410,6 +438,12 @@ class CUDAAccelerationEval(GPUAccelerationEval):
                  grid=(num_blocks, 1))
             event.record()
             event.synchronize()
+
+    def _assert_local_memory_supported(self):
+        manager = self.nnps.domain.manager
+        if manager.minimum_image_periodic:
+            msg = "CUDA local-memory loops do not support minimum-image periodic domains"
+            raise NotImplementedError(msg)
 
 
 def add_address_space(known_types):
@@ -851,6 +885,99 @@ class AccelerationEvalGPUHelper(object):
                 )
         return decl
 
+    def _precomp_lines(self, code, periodic_images=False):
+        src = code.strip().splitlines()
+        lines = []
+        for line in src:
+            line = handle_precomp_literals(line, self._use_double)
+            stripped = line.strip()
+            lines.extend(
+                self._minimum_image_xij_lines(
+                    stripped, periodic_images=periodic_images
+                )
+            )
+        return lines
+
+    def _minimum_image_xij_lines(self, line, periodic_images=False):
+        corrections = {
+            'XIJ[0] = d_x[d_idx] - s_x[s_idx]': (
+                'periodic_in_x', 'xtranslate', '_periodic_ix'
+            ),
+            'XIJ[1] = d_y[d_idx] - s_y[s_idx]': (
+                'periodic_in_y', 'ytranslate', '_periodic_iy'
+            ),
+            'XIJ[2] = d_z[d_idx] - s_z[s_idx]': (
+                'periodic_in_z', 'ztranslate', '_periodic_iz'
+            ),
+        }
+        if line not in corrections:
+            return [line + ';']
+        periodic_flag, translate, image_shift = corrections[line]
+        lhs = line.split(' = ')[0]
+        lines = [
+            line + ';',
+            'if ({flag} && {lhs} > 0.5*{translate}) {{ {lhs} -= {translate}; }}'.format(
+                flag=periodic_flag, lhs=lhs, translate=translate,
+            ),
+            'if ({flag} && {lhs} < -0.5*{translate}) {{ {lhs} += {translate}; }}'.format(
+                flag=periodic_flag, lhs=lhs, translate=translate,
+            ),
+        ]
+        if periodic_images:
+            lines.append(
+                '{lhs} += {shift} * {translate};'.format(
+                    lhs=lhs, shift=image_shift, translate=translate,
+                )
+            )
+        return lines
+
+    def _periodic_image_radius_expr(self, d_ary, s_ary):
+        if 'd_h' in d_ary and 's_h' in s_ary:
+            return '((d_h[d_idx] > s_h[s_idx]) ? d_h[d_idx] : s_h[s_idx])'
+        if 'd_h' in d_ary:
+            return 'd_h[d_idx]'
+        if 's_h' in s_ary:
+            return 's_h[s_idx]'
+        return None
+
+    def _periodic_image_setup_lines(self, radius_expr):
+        data_t = 'double' if self._use_double else 'float'
+        floor_fn = (
+            'floor' if self.backend == 'opencl' or self._use_double
+            else 'floorf'
+        )
+        half = literal_to_float(0.5, self._use_double)
+        return [
+            '{data_t} _periodic_radius = kern->radius_scale * ({radius});'.format(
+                data_t=data_t, radius=radius_expr
+            ),
+            '{data_t} _periodic_radius2 = _periodic_radius * _periodic_radius;'.format(
+                data_t=data_t
+            ),
+            'int _periodic_ix_count = periodic_in_x ? (int){floor_fn}(_periodic_radius / xtranslate + {half}) : 0;'.format(
+                floor_fn=floor_fn, half=half
+            ),
+            'int _periodic_iy_count = periodic_in_y ? (int){floor_fn}(_periodic_radius / ytranslate + {half}) : 0;'.format(
+                floor_fn=floor_fn, half=half
+            ),
+            'int _periodic_iz_count = periodic_in_z ? (int){floor_fn}(_periodic_radius / ztranslate + {half}) : 0;'.format(
+                floor_fn=floor_fn, half=half
+            ),
+            'int _periodic_ix_min = -_periodic_ix_count;',
+            'int _periodic_ix_max = _periodic_ix_count;',
+            'int _periodic_iy_min = -_periodic_iy_count;',
+            'int _periodic_iy_max = _periodic_iy_count;',
+            'int _periodic_iz_min = -_periodic_iz_count;',
+            'int _periodic_iz_max = _periodic_iz_count;',
+        ]
+
+    def _precomputed_has_r2ij(self, eq_group):
+        for cb in eq_group.precomputed.values():
+            for line in cb.code.strip().splitlines():
+                if line.strip().startswith('R2IJ = '):
+                    return True
+        return False
+
     def _set_kernel(self, code, kernel):
         if kernel is not None:
             name = kernel.__class__.__name__
@@ -913,6 +1040,9 @@ class AccelerationEvalGPUHelper(object):
 
     def get_loop_kernel(self, g_idx, sg_idx, group, dest, source, eq_group):
         if get_config().use_local_memory:
+            if self.backend == 'cuda':
+                msg = "CUDA local-memory loops are not supported"
+                raise NotImplementedError(msg)
             return self.get_lmem_loop_kernel(g_idx, sg_idx, group,
                                              dest, source, eq_group)
         kind = 'loop'
@@ -923,6 +1053,12 @@ class AccelerationEvalGPUHelper(object):
         sph_k_name = self.object.kernel.__class__.__name__
         context = eq_group.context
         all_args, py_args = [], []
+        s_ary, d_ary = eq_group.get_array_names()
+        periodic_image_radius = self._periodic_image_radius_expr(d_ary, s_ary)
+        use_periodic_images = (
+            periodic_image_radius is not None
+            and self._precomputed_has_r2ij(eq_group)
+        )
         code = self._declare_precomp_vars(context)
         code.extend([
             'unsigned int d_idx = GID_0 * LDIM_0 + LID_0 + OFFSET_IDX;',
@@ -951,26 +1087,55 @@ class AccelerationEvalGPUHelper(object):
             code.append('    s_idx = neighbors[i];')
             pre = []
             for p, cb in eq_group.precomputed.items():
-                src = cb.code.strip().splitlines()
                 pre.extend(
-                    [' ' * 4 + handle_precomp_literals(x, self._use_double) + ';' 
-                     for x in src]
+                    [
+                        (' ' * 12 if use_periodic_images else ' ' * 4) + x
+                        for x in self._precomp_lines(
+                            cb.code, periodic_images=use_periodic_images
+                        )
+                    ]
                 )
             if len(pre) > 0:
                 pre.append('')
-            code.extend(pre)
 
             _all_args, _py_args, _calls = self._get_equation_method_calls(
-                eq_group, kind, indent='    '
+                eq_group, kind,
+                indent='                ' if use_periodic_images else '    '
             )
-            code.extend(_calls)
+            if use_periodic_images:
+                code.extend(
+                    [
+                        '    ' + line
+                        for line in self._periodic_image_setup_lines(
+                            periodic_image_radius
+                        )
+                    ]
+                )
+                code.append(
+                    '    for (int _periodic_ix = _periodic_ix_min; _periodic_ix <= _periodic_ix_max; _periodic_ix++) {'
+                )
+                code.append(
+                    '        for (int _periodic_iy = _periodic_iy_min; _periodic_iy <= _periodic_iy_max; _periodic_iy++) {'
+                )
+                code.append(
+                    '            for (int _periodic_iz = _periodic_iz_min; _periodic_iz <= _periodic_iz_max; _periodic_iz++) {'
+                )
+                code.extend(pre)
+                code.append('            if (R2IJ <= _periodic_radius2) {')
+                code.extend(_calls)
+                code.append('            }')
+                code.append('            }')
+                code.append('        }')
+                code.append('    }')
+            else:
+                code.extend(pre)
+                code.extend(_calls)
             for arg, py_arg in zip(_all_args, _py_args):
                 if arg not in all_args:
                     all_args.append(arg)
                     py_args.append(py_arg)
             code.append('}')
 
-        s_ary, d_ary = eq_group.get_array_names()
         s_ary.update(d_ary)
 
         _args = sorted(s_ary)
@@ -985,6 +1150,7 @@ class AccelerationEvalGPUHelper(object):
              'GLOBAL_MEM unsigned int *nbr_length',
              'GLOBAL_MEM unsigned int *start_idx',
              'GLOBAL_MEM unsigned int *neighbors',
+             *periodic_kernel_args('double' if self._use_double else 'float'),
              'double t', 'double dt', 'unsigned int NP_MAX',
              'unsigned int OFFSET_IDX']
         )
@@ -1026,11 +1192,7 @@ class AccelerationEvalGPUHelper(object):
         loop_code = []
         pre = []
         for p, cb in eq_group.precomputed.items():
-            src = cb.code.strip().splitlines()
-            pre.extend(
-               [' ' * 4 + handle_precomp_literals(x, self._use_double) + ';'
-                for x in src]
-            )
+            pre.extend([' ' * 4 + x for x in self._precomp_lines(cb.code)])
         if len(pre) > 0:
             pre.append('')
         loop_code.extend(pre)

@@ -16,14 +16,16 @@ class GPUDomainManager(DomainManagerBase):
                  ymax=0., zmin=0., zmax=0.,
                  periodic_in_x=False, periodic_in_y=False,
                  periodic_in_z=False, n_layers=2.0, backend=None, props=None,
-                 mirror_in_x=False, mirror_in_y=False, mirror_in_z=False):
+                 mirror_in_x=False, mirror_in_y=False, mirror_in_z=False,
+                 periodic_mode="ghost"):
         """Constructor"""
         DomainManagerBase.__init__(self, xmin=xmin, xmax=xmax,
                                    ymin=ymin, ymax=ymax, zmin=zmin, zmax=zmax,
                                    periodic_in_x=periodic_in_x,
                                    periodic_in_y=periodic_in_y,
                                    periodic_in_z=periodic_in_z,
-                                   n_layers=n_layers, props=props)
+                                   n_layers=n_layers, props=props,
+                                   periodic_mode=periodic_mode)
 
         self.use_double = get_config().use_double
         self.dtype = np.float64 if self.use_double else np.float32
@@ -32,6 +34,13 @@ class GPUDomainManager(DomainManagerBase):
         self.backend = get_backend(backend)
 
         self.ghosts = None
+
+    def _periodic_flags(self):
+        return (
+            int(self.periodic_in_x),
+            int(self.periodic_in_y),
+            int(self.periodic_in_z),
+        )
 
     def update(self):
         """General method that is called before NNPS can bin particles.
@@ -56,7 +65,8 @@ class GPUDomainManager(DomainManagerBase):
             self._box_wrap_periodic()
 
             # create new periodic ghosts
-            self._create_ghosts_periodic()
+            if not self.minimum_image_periodic:
+                self._create_ghosts_periodic()
 
     def _compute_cell_size_for_binning(self):
         """Compute the cell size for the binning.
@@ -143,9 +153,7 @@ class GPUDomainManager(DomainManagerBase):
         ztranslate = self.ztranslate
 
         # periodicity flags for NNPS
-        periodic_in_x = self.periodic_in_x
-        periodic_in_y = self.periodic_in_y
-        periodic_in_z = self.periodic_in_z
+        periodic_in_x, periodic_in_y, periodic_in_z = self._periodic_flags()
 
         box_wrap_knl = self._get_box_wrap_kernel()
 
@@ -338,9 +346,7 @@ class GPUDomainManager(DomainManagerBase):
         ztranslate = self.ztranslate
 
         # periodicity flags
-        periodic_in_x = self.periodic_in_x
-        periodic_in_y = self.periodic_in_y
-        periodic_in_z = self.periodic_in_z
+        periodic_in_x, periodic_in_y, periodic_in_z = self._periodic_flags()
 
         reduce_knl = self._get_ghosts_reduction_kernel()
         scan_knl = self._get_ghosts_scan_kernel()

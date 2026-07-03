@@ -229,7 +229,8 @@ cdef class DomainManager:
                  double ymax=0, double zmin=0, double zmax=0,
                  periodic_in_x=False, periodic_in_y=False, periodic_in_z=False,
                  double n_layers=2.0, backend=None, props=None,
-                 mirror_in_x=False, mirror_in_y=False, mirror_in_z=False):
+                 mirror_in_x=False, mirror_in_y=False, mirror_in_z=False,
+                 periodic_mode="ghost"):
 
         """Constructor
 
@@ -247,11 +248,16 @@ cdef class DomainManager:
             Provide a list or dict with the keys as particle array names.
             Only the specified properties are copied.  If not specified,
             all props are copied.
+
+        periodic_mode: str, default "ghost"
+            "ghost" preserves the existing explicit periodic image behavior.
+            "minimum_image" keeps only real particles and requires NNPS/pair
+            kernels to apply minimum-image distances.
         """
         self.backend = get_backend(backend)
         is_periodic = periodic_in_x or periodic_in_y or periodic_in_z
         is_mirror = mirror_in_x or mirror_in_y or mirror_in_z
-        if (self.backend is 'opencl' or self.backend is 'cuda'):
+        if self.backend == 'opencl' or self.backend == 'cuda':
             if not is_mirror:
                 from pysph.base.gpu_domain_manager import GPUDomainManager
                 domain_manager = GPUDomainManager
@@ -267,7 +273,7 @@ cdef class DomainManager:
             periodic_in_y=periodic_in_y, periodic_in_z=periodic_in_z,
             n_layers=n_layers, backend=self.backend, props=props,
             mirror_in_x=mirror_in_x, mirror_in_y=mirror_in_y,
-            mirror_in_z=mirror_in_z
+            mirror_in_z=mirror_in_z, periodic_mode=periodic_mode
         )
 
     def set_pa_wrappers(self, wrappers):
@@ -303,7 +309,8 @@ cdef class DomainManagerBase(object):
                  double ymax=0, double zmin=0, double zmax=0,
                  periodic_in_x=False, periodic_in_y=False, periodic_in_z=False,
                  double n_layers=2.0, props=None, mirror_in_x=False,
-                 mirror_in_y=False, mirror_in_z=False):
+                 mirror_in_y=False, mirror_in_z=False,
+                 periodic_mode="ghost"):
         """Constructor
 
         The n_layers argument specifies the number of ghost layers as multiples
@@ -315,12 +322,15 @@ cdef class DomainManagerBase(object):
             all props are copied.
         """
         self._check_limits(xmin, xmax, ymin, ymax, zmin, zmax)
+        assert periodic_mode in ("ghost", "minimum_image")
 
         self.xmin = xmin; self.xmax = xmax
         self.ymin = ymin; self.ymax = ymax
         self.zmin = zmin; self.zmax = zmax
 
         self.props = props
+        self.periodic_mode = periodic_mode
+        self.minimum_image_periodic = periodic_mode == "minimum_image"
         # Indicates if the domain is periodic
         self.periodic_in_x = periodic_in_x
         self.periodic_in_y = periodic_in_y
@@ -420,7 +430,8 @@ cdef class CPUDomainManager(DomainManagerBase):
                  double ymax=0, double zmin=0, double zmax=0,
                  periodic_in_x=False, periodic_in_y=False, periodic_in_z=False,
                  double n_layers=2.0, backend=None, props=None,
-                 mirror_in_x=False, mirror_in_y=False, mirror_in_z=False):
+                 mirror_in_x=False, mirror_in_y=False, mirror_in_z=False,
+                 periodic_mode="ghost"):
 
         """Constructor
 
@@ -438,7 +449,7 @@ cdef class CPUDomainManager(DomainManagerBase):
             periodic_in_x=periodic_in_x, periodic_in_y=periodic_in_y,
             periodic_in_z=periodic_in_z, n_layers=n_layers, props=props,
             mirror_in_x=mirror_in_x, mirror_in_y=mirror_in_y,
-            mirror_in_z=mirror_in_z
+            mirror_in_z=mirror_in_z, periodic_mode=periodic_mode
         )
 
         self.use_double = True

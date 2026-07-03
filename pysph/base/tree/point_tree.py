@@ -27,8 +27,13 @@ def _get_neighbor_count_prefix_sum_kernel(ctx, backend='opencl'):
 
 
 @memoize
-def _get_macros_preamble(c_type, sorted, dim):
+def _get_macros_preamble(c_type, sorted, dim, backend):
     result = Template("""
+    % if backend == 'cuda':
+    #define DEVICE_INLINE __device__
+    % else:
+    #define DEVICE_INLINE inline
+    % endif
     #define IN_BOUNDS(X, MIN, MAX) ((X >= MIN) && (X < MAX))
     #define NORM2(X, Y, Z) ((X)*(X) + (Y)*(Y) + (Z)*(Z))
     #define NORM2_2D(X, Y) ((X)*(X) + (Y)*(Y))
@@ -58,7 +63,7 @@ def _get_macros_preamble(c_type, sorted, dim):
     #define PID(idx) (pids[idx])
     % endif
 
-    char contains(${data_t}${dim} node_xmin1, ${data_t}${dim} node_xmax1,
+    DEVICE_INLINE char contains(${data_t}${dim} node_xmin1, ${data_t}${dim} node_xmax1,
                   ${data_t}${dim} node_xmin2, ${data_t}${dim} node_xmax2)
     {
         // Check if node n1 contains node n2
@@ -71,7 +76,7 @@ def _get_macros_preamble(c_type, sorted, dim):
         return res;
     }
 
-    char contains_search(${data_t}${dim} node_xmin1,
+    DEVICE_INLINE char contains_search(${data_t}${dim} node_xmin1,
                   ${data_t}${dim} node_xmax1,
                   ${data_t} node_hmax1,
                   ${data_t}${dim} node_xmin2, ${data_t}${dim} node_xmax2)
@@ -88,10 +93,23 @@ def _get_macros_preamble(c_type, sorted, dim):
         return res;
     }
 
-    char intersects(${data_t}${dim} node_xmin1, ${data_t}${dim} node_xmax1,
+    DEVICE_INLINE ${data_t} minimum_image_distance(${data_t} distance,
+                                      int periodic,
+                                      ${data_t} translate)
+    {
+        if (periodic && translate > 0 && distance > 0.5 * translate) {
+            distance = translate - distance;
+        }
+        return distance;
+    }
+
+    DEVICE_INLINE char intersects(${data_t}${dim} node_xmin1, ${data_t}${dim} node_xmax1,
                     ${data_t} node_hmax1,
                     ${data_t}${dim} node_xmin2, ${data_t}${dim} node_xmax2,
-                    ${data_t} node_hmax2) {
+                    ${data_t} node_hmax2,
+                    int periodic_in_x, int periodic_in_y, int periodic_in_z,
+                    ${data_t} xtranslate, ${data_t} ytranslate,
+                    ${data_t} ztranslate) {
         // Check if node n1 'intersects' node n2
         ${data_t} cdist;
         ${data_t} w1, w2, wavg = 0;
@@ -101,6 +119,13 @@ def _get_macros_preamble(c_type, sorted, dim):
         % for i in range(dim):
             cdist = fabs((node_xmin1.s${i} + node_xmax1.s${i}) / 2 -
                          (node_xmin2.s${i} + node_xmax2.s${i}) / 2);
+            % if i == 0:
+            cdist = minimum_image_distance(cdist, periodic_in_x, xtranslate);
+            % elif i == 1:
+            cdist = minimum_image_distance(cdist, periodic_in_y, ytranslate);
+            % else:
+            cdist = minimum_image_distance(cdist, periodic_in_z, ztranslate);
+            % endif
             w1 = fabs(node_xmin1.s${i} - node_xmax1.s${i});
             w2 = fabs(node_xmin2.s${i} - node_xmax2.s${i});
             wavg = AVG(w1, w2);
@@ -109,7 +134,7 @@ def _get_macros_preamble(c_type, sorted, dim):
 
         return res;
     }
-    """).render(data_t=c_type, sorted=sorted,
+    """).render(data_t=c_type, sorted=sorted, backend=backend,
                                                  dim=dim)
     return result
 
@@ -203,7 +228,9 @@ def _get_leaf_neighbor_kernel_parameters(data_t, dim, args, setup, operation,
             node_hmax2 = node_hmax_src[cid_src];
 
             if (!intersects(node_xmin1, node_xmax1, node_hmax1,
-                            node_xmin2, node_xmax2, node_hmax2) &&
+                            node_xmin2, node_xmax2, node_hmax2,
+                            periodic_in_x, periodic_in_y, periodic_in_z,
+                            xtranslate, ytranslate, ztranslate) &&
                 !contains(node_xmin2, node_xmax2, node_xmin1, node_xmax1)) {
                 flag = 0;
                 break;
@@ -215,7 +242,9 @@ def _get_leaf_neighbor_kernel_parameters(data_t, dim, args, setup, operation,
             node_hmax2 = node_hmax_src[cid_src];
 
             if (intersects(node_xmin1, node_xmax1, node_hmax1,
-                            node_xmin2, node_xmax2, node_hmax2) ||
+                            node_xmin2, node_xmax2, node_hmax2,
+                            periodic_in_x, periodic_in_y, periodic_in_z,
+                            xtranslate, ytranslate, ztranslate) ||
                 contains_search(node_xmin1, node_xmax1, node_hmax1,
                                 node_xmin2, node_xmax2)) {
                 %(operation)s;
@@ -227,6 +256,9 @@ def _get_leaf_neighbor_kernel_parameters(data_t, dim, args, setup, operation,
             ${data_t} *node_hmax_src,
             ${data_t}${dim} *node_xmin_dst, ${data_t}${dim} *node_xmax_dst,
             ${data_t} *node_hmax_dst,
+            int periodic_in_x, int periodic_in_y, int periodic_in_z,
+            ${data_t} xtranslate, ${data_t} ytranslate,
+            ${data_t} ztranslate,
             """ + args).render(data_t=data_t, dim=dim)
     }
     return result
@@ -243,7 +275,10 @@ def register_custom_pyopencl_ctypes():
 
 class PointTree(Tree):
     def __init__(self, pa, dim=2, leaf_size=32, radius_scale=2.0,
-                 use_double=False, c_type='float', backend=None):
+                 use_double=False, c_type='float', backend=None,
+                 periodic_in_x=False, periodic_in_y=False,
+                 periodic_in_z=False, xtranslate=0.0, ytranslate=0.0,
+                 ztranslate=0.0):
         backend = get_backend(backend or 'opencl')
         if backend == 'opencl':
             register_custom_pyopencl_ctypes()
@@ -272,6 +307,12 @@ class PointTree(Tree):
 
         self.radius_scale = radius_scale
         self.use_double = use_double
+        self.periodic_in_x = int(periodic_in_x)
+        self.periodic_in_y = int(periodic_in_y)
+        self.periodic_in_z = int(periodic_in_z)
+        self.xtranslate = xtranslate
+        self.ytranslate = ytranslate
+        self.ztranslate = ztranslate
 
         self.helper = get_helper('tree/point_tree.mako', self.c_type, backend)
         self.xmin = None
@@ -288,6 +329,17 @@ class PointTree(Tree):
         self.index_function_consts = ['mask', 'rshift']
         self.index_function_const_ctypes = ['ulong', 'char']
         self.index_code = "((sfc[i] & mask) >> rshift)"
+
+    def _periodic_args(self):
+        dtype = ctype_to_dtype(self.c_type)
+        return [
+            np.int32(self.periodic_in_x),
+            np.int32(self.periodic_in_y),
+            np.int32(self.periodic_in_z),
+            dtype(self.xtranslate),
+            dtype(self.ytranslate),
+            dtype(self.ztranslate),
+        ]
 
     def _calc_cell_size_and_depth(self):
         self.cell_size = self.hmin * self.radius_scale * (1. + 1e-3)
@@ -336,6 +388,7 @@ class PointTree(Tree):
         self.xmax += diff
 
     def setup_build(self, xmin, xmax, hmin):
+        self.n = self.pa.get_number_of_particles()
         self._setup_build()
         self.pa.sync()
         self.xmin = np.array(xmin)
@@ -378,7 +431,9 @@ class PointTree(Tree):
         set_node_bounds = self.tree_bottom_up(
             params['args'], params['setup'], params['leaf_operation'],
             params['node_operation'], params['output_expr'],
-            preamble=_get_macros_preamble(self.c_type, self.sorted, self.dim)
+            preamble=_get_macros_preamble(
+                self.c_type, self.sorted, self.dim, self.backend
+            )
         )
         set_node_bounds = profile_kernel(set_node_bounds, 'set_node_bounds',
                                          backend=self.backend)
@@ -408,7 +463,9 @@ class PointTree(Tree):
         kernel = tree_src.leaf_tree_traverse(
             params['args'], params['setup'], params['node_operation'],
             params['leaf_operation'], params['output_expr'],
-            preamble=_get_macros_preamble(self.c_type, self.sorted, self.dim)
+            preamble=_get_macros_preamble(
+                self.c_type, self.sorted, self.dim, self.backend
+            )
         )
 
         def callable(*args):
@@ -418,6 +475,7 @@ class PointTree(Tree):
                           tree_src.node_hmax.dev,
                           self.node_xmin.dev, self.node_xmax.dev,
                           self.node_hmax.dev,
+                          *self._periodic_args(),
                           *args)
 
         return callable
@@ -493,6 +551,7 @@ class PointTree(Tree):
                              pa_gpu_dst.z.dev,
                              pa_gpu_dst.h.dev,
                              dtype(self.radius_scale),
+                             *self._periodic_args(),
                              neighbor_cid_count.dev,
                              neighbor_cids.dev,
                              neighbor_count.dev)
@@ -517,6 +576,7 @@ class PointTree(Tree):
                        pa_gpu_dst.x.dev, pa_gpu_dst.y.dev, pa_gpu_dst.z.dev,
                        pa_gpu_dst.h.dev,
                        dtype(self.radius_scale),
+                       *self._periodic_args(),
                        neighbor_cid_count.dev,
                        neighbor_cids.dev,
                        start_indices.dev,
@@ -570,6 +630,7 @@ class PointTree(Tree):
                                  pa_gpu_dst.z.dev,
                                  pa_gpu_dst.h.dev,
                                  dtype(self.radius_scale),
+                                 *self._periodic_args(),
                                  neighbor_cid_count.dev,
                                  neighbor_cids.dev,
                                  neighbor_count.dev,
@@ -616,6 +677,7 @@ class PointTree(Tree):
                            pa_gpu_dst.x.dev, pa_gpu_dst.y.dev, pa_gpu_dst.z.dev,
                            pa_gpu_dst.h.dev,
                            dtype(self.radius_scale),
+                           *self._periodic_args(),
                            neighbor_cid_count.dev,
                            neighbor_cids.dev,
                            start_indices.dev,

@@ -171,8 +171,10 @@ cdef class DomainManagerBase:
     cdef public bint is_periodic
     cdef public bint mirror_in_x, mirror_in_y, mirror_in_z
     cdef public bint is_mirror
+    cdef public bint minimum_image_periodic
 
     cdef public object props
+    cdef public object periodic_mode
     cdef public list copy_props
     cdef public list pa_wrappers     # NNPS particle array wrappers
     cdef public int narrays          # number of arrays

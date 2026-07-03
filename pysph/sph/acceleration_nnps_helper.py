@@ -90,9 +90,29 @@ NNPS_TEMPLATE = r"""
             if (_svalid) {
                 _nbr_cnt = 0;
                 for (int _j=0; _j < _m; _j++) {
-                    ${data_t} _dist2 = NORM2(_xs[_j] - _xd,
-                                _ys[_j] - _yd,
-                                _zs[_j] - _zd);
+                    ${data_t} _dist2;
+                    ${data_t} _dx = _xs[_j] - _xd;
+                    ${data_t} _dy = _ys[_j] - _yd;
+                    ${data_t} _dz = _zs[_j] - _zd;
+                    if (periodic_in_x && _dx > 0.5*xtranslate) {
+                        _dx -= xtranslate;
+                    }
+                    if (periodic_in_x && _dx < -0.5*xtranslate) {
+                        _dx += xtranslate;
+                    }
+                    if (periodic_in_y && _dy > 0.5*ytranslate) {
+                        _dy -= ytranslate;
+                    }
+                    if (periodic_in_y && _dy < -0.5*ytranslate) {
+                        _dy += ytranslate;
+                    }
+                    if (periodic_in_z && _dz > 0.5*ztranslate) {
+                        _dz -= ztranslate;
+                    }
+                    if (periodic_in_z && _dz < -0.5*ztranslate) {
+                        _dz += ztranslate;
+                    }
+                    _dist2 = NORM2(_dx, _dy, _dz);
 
                     ${data_t} _r2 = MAX(_hs[_j], _hd) * _radius_scale;
                     _r2 *= _r2;
@@ -129,7 +149,9 @@ NNPS_ARGS_TEMPLATE = """
     GLOBAL_MEM %(data_t)s *xd, GLOBAL_MEM %(data_t)s *yd,
     GLOBAL_MEM %(data_t)s *zd, GLOBAL_MEM %(data_t)s *hd,
     GLOBAL_MEM %(data_t)s *xs, GLOBAL_MEM %(data_t)s *ys,
-    GLOBAL_MEM %(data_t)s *zs, GLOBAL_MEM %(data_t)s *hs
+    GLOBAL_MEM %(data_t)s *zs, GLOBAL_MEM %(data_t)s *hs,
+    int periodic_in_x, int periodic_in_y, int periodic_in_z,
+    %(data_t)s xtranslate, %(data_t)s ytranslate, %(data_t)s ztranslate
     """
 
 
