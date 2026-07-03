@@ -263,6 +263,14 @@ class StepWithHelper(IntegratorStep):
         d_u[d_idx] += d_au[d_idx] * my_helper(dt)
 
 
+class StepWithConstant(IntegratorStep):
+    def __init__(self):
+        self.factor = 3.0
+
+    def stage1(self, d_idx, d_u, d_au, dt):
+        d_u[d_idx] += d_au[d_idx] * self.factor * dt
+
+
 class TestLeapFrogIntegrator(TestIntegratorBase):
     def test_leapfrog(self):
         # Given.
@@ -578,8 +586,32 @@ class TestLeapFrogIntegratorGPU(TestIntegratorBase):
         u = self.pa.u
         self.assertEqual(u, -2.0*self.pa.x)
 
+    def test_stepper_constants_can_be_used_on_gpu(self):
+        # Given.
+        integrator = EulerIntegrator(fluid=StepWithConstant())
+        equations = [SHM(dest="fluid", sources=None)]
+        self._setup_integrator(equations=equations, integrator=integrator)
+
+        # When
+        tf = 1.0
+        dt = tf / 2
+
+        def callback(t):
+            pass
+
+        self._integrate(integrator, dt, tf, callback)
+
+        # Then
+        if self.pa.gpu is not None:
+            self.pa.gpu.pull("u")
+        np.testing.assert_array_almost_equal(self.pa.u, [-3.0])
+
 
 class TestLeapFrogIntegratorCUDA(TestLeapFrogIntegratorGPU):
+    @unittest.skip("BruteForceNNPS only supports the OpenCL backend")
+    def test_stepper_constants_can_be_used_on_gpu(self):
+        pass
+
     def _setup_integrator(self, equations, integrator):
         pytest.importorskip('pycuda')
         pytest.importorskip('pysph.base.gpu_nnps')

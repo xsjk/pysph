@@ -7,14 +7,21 @@ import types
 from mako.template import Template
 import numpy as np
 
+from compyle.api import KnownType
 from compyle.config import get_config
 from compyle.transpiler import get_external_symbols_and_calls
+from compyle.translator import OpenCLConverter
 from .equation import get_array_names
 from .integrator_cython_helper import IntegratorCythonHelper
 from .acceleration_eval_gpu_helper import (
     get_kernel_definition, get_converter, profile_kernel, wrap_code,
     get_helper_code
 )
+
+
+class OpenCLStepperConverter(OpenCLConverter):
+    def _get_self_type(self):
+        return KnownType('%s*' % self._class_name)
 
 
 class GPUIntegrator(object):
@@ -260,7 +267,10 @@ class IntegratorGPUHelper(IntegratorCythonHelper):
 
         known_types = dict(self.acceleration_eval_helper.known_types)
 
-        Converter = get_converter(self.acceleration_eval_helper.backend)
+        if self.acceleration_eval_helper.backend == 'opencl':
+            Converter = OpenCLStepperConverter
+        else:
+            Converter = get_converter(self.acceleration_eval_helper.backend)
         code_gen = Converter(known_types=known_types)
         symbols = {}
         for func in helpers + methods:
@@ -292,17 +302,25 @@ class IntegratorGPUHelper(IntegratorCythonHelper):
         )
         all_args.append('unsigned int NP_MAX')
 
-        # All the steppers are essentially empty structs so we just pass 0 as
-        # the stepper struct as it is not used at all. This simplifies things
-        # as we do not need to generate structs and pass them around.
+        stepper_arg = '0'
+        stepper_setup = []
+        constants = self._get_stepper_constants(stepper)
+        if constants:
+            stepper_arg = '&stepper'
+            stepper_setup.append('{cls} stepper;'.format(cls=cls))
+            for name, value in constants:
+                if isinstance(value, bool):
+                    value = int(value)
+                stepper_setup.append('stepper.{name} = {value};'.format(name=name, value=repr(value)))
+
         code = [
             'int d_idx = GID_0 * LDIM_0 + LID_0;',
             '/* Guard for padded threads. */',
             'if (d_idx > NP_MAX) {return;};'
-        ] + wrap_code(
+        ] + stepper_setup + wrap_code(
             '{cls}_{method}({args});'.format(
                 cls=cls, method=method,
-                args=', '.join(['0'] + args)
+                args=', '.join([stepper_arg] + args)
             ), indent=''
         )
 
@@ -316,3 +334,10 @@ class IntegratorGPUHelper(IntegratorCythonHelper):
                 sig=sig, body=body
             )
         )
+
+    def _get_stepper_constants(self, stepper):
+        constants = []
+        for name, value in stepper.__dict__.items():
+            if isinstance(value, (bool, int, float)):
+                constants.append((name, value))
+        return constants
