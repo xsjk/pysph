@@ -223,6 +223,10 @@ class GPUAccelerationEval(object):
         cfg = get_config()
         self._use_double = cfg.use_double
         self._use_local_memory = cfg.use_local_memory
+        self.stage_backend = None
+        self.cuda_stage_plan = helper.cuda_stage_plan
+        self.cuda_fused_kernel_specs = helper.cuda_fused_kernel_specs
+        self.cuda_fused_launch_budget = helper.cuda_fused_launch_budget
 
     def _get_index(self, dest, attr):
         if isinstance(attr, str):
@@ -314,11 +318,15 @@ class GPUAccelerationEval(object):
                       np.asarray(dt, dtype=dtype),
                       np.asarray(0, dtype=np.uint32),
                       np.asarray(0, dtype=np.uint32)]
+        self._stage_backend_begin_compute(t, dt)
         i = 0
         iter_count = 0
         iter_start = 0
         while i < len(helper.calls):
             info = helper.calls[i]
+            if self._stage_backend_handles_call(info, extra_args, t, dt):
+                i += 1
+                continue
             type = info['type']
             if type == 'method':
                 self._sync_before_host()
@@ -339,7 +347,8 @@ class GPUAccelerationEval(object):
                 func = info.get('callable')
                 func(*info.get('args'))
             elif type == 'kernel':
-                self._call_kernel(info, extra_args)
+                if not self._stage_backend_handles_kernel(info, extra_args):
+                    self._call_kernel(info, extra_args)
             elif type == 'check_condition':
                 self._sync_before_host()
                 group = info['group']
@@ -365,7 +374,33 @@ class GPUAccelerationEval(object):
                         self.update_nnps()
                     i = iter_start
             i += 1
-        self._sync_before_host()
+        if self._stage_backend_needs_final_sync(t, dt):
+            self._sync_before_host()
+
+    def _stage_backend_handles_kernel(self, info, extra_args):
+        if self.stage_backend is None:
+            return False
+        return self.stage_backend.handle_kernel(self, info, extra_args)
+
+    def _stage_backend_handles_call(self, info, extra_args, t, dt):
+        if self.stage_backend is None:
+            return False
+        if not hasattr(self.stage_backend, "handle_call"):
+            return False
+        return self.stage_backend.handle_call(self, info, extra_args, t, dt)
+
+    def _stage_backend_begin_compute(self, t, dt):
+        if self.stage_backend is None:
+            return
+        if hasattr(self.stage_backend, "begin_compute"):
+            self.stage_backend.begin_compute(self, t, dt)
+
+    def _stage_backend_needs_final_sync(self, t, dt):
+        if self.stage_backend is None:
+            return True
+        if not hasattr(self.stage_backend, "end_compute"):
+            return True
+        return self.stage_backend.end_compute(self, t, dt)
 
     def set_nnps(self, nnps):
         self.nnps = nnps
@@ -373,7 +408,16 @@ class GPUAccelerationEval(object):
     def update_particle_arrays(self, arrays):
         raise NotImplementedError('GPU backend is incomplete')
 
+    def _stage_backend_handles_internal_update_nnps(self):
+        if self.stage_backend is None:
+            return False
+        if not hasattr(self.stage_backend, "handle_internal_update_nnps"):
+            return False
+        return self.stage_backend.handle_internal_update_nnps(self)
+
     def update_nnps(self):
+        if self._stage_backend_handles_internal_update_nnps():
+            return
         with profile_ctx('Integrator.update_domain'):
             self.nnps.update_domain()
         with profile_ctx('nnps.update'):
@@ -476,6 +520,34 @@ def get_equations_with_converged(group):
     return eqs
 
 
+def _cuda_supported_convergence_equation_names(groups):
+    names = set()
+    for group in groups:
+        names.update(_cuda_supported_convergence_names_for_group(group))
+    return frozenset(names)
+
+
+def _cuda_supported_convergence_names_for_group(group):
+    names = set()
+    if group.has_subgroups:
+        for subgroup in group.equations:
+            names.update(_cuda_supported_convergence_names_for_group(subgroup))
+        return names
+    for equation in getattr(group, 'equations', ()):
+        if hasattr(equation, 'converged') and hasattr(
+                equation, 'equation_has_converged'
+        ):
+            names.add(equation.__class__.__name__)
+    return names
+
+
+def _use_generated_fused_cuda_stage_backend():
+    if 'PYSPH_FUSED_CUDA_STAGE_BACKEND' not in os.environ:
+        return False
+    assert os.environ['PYSPH_FUSED_CUDA_STAGE_BACKEND'] == '1'
+    return True
+
+
 def convert_to_float_if_needed(code):
     use_double = get_config().use_double
     if not use_double:
@@ -529,8 +601,8 @@ class AccelerationEvalGPUHelper(object):
     def _setup_structs_on_device(self):
         if self.backend == 'opencl':
             import pyopencl as cl
-            import pyopencl.array  # noqa: 401
-            import pyopencl.tools  # noqa: 401
+            import pyopencl.array  # noqa: F401
+            import pyopencl.tools  # noqa: F401
 
             gpu = self._gpu_structs
             cpu = self._cpu_structs
@@ -617,6 +689,8 @@ class AccelerationEvalGPUHelper(object):
                     dst_idx=array_index[dest],
                     start_idx=item.get('start_idx'),
                     stop_idx=item.get('stop_idx'),
+                    stage_group=item.get('stage_group'),
+                    stage_method_kind=item.get('stage_method_kind'),
                     type='kernel'
                 )
             elif type == 'method':
@@ -664,6 +738,7 @@ class AccelerationEvalGPUHelper(object):
                             'acceleration_eval_gpu.mako')
         template = Template(filename=path)
         main = template.render(helper=self)
+        self._setup_cuda_stage_plan()
         if self.backend == 'opencl':
             from pyopencl._cluda import CLUDA_PREAMBLE
         elif self.backend == 'cuda':
@@ -671,6 +746,31 @@ class AccelerationEvalGPUHelper(object):
         cluda = Template(CLUDA_PREAMBLE).render(double_support=self._use_double)
         main = "\n".join([cluda, main])
         return main
+
+    def _setup_cuda_stage_plan(self):
+        if self.backend != 'cuda':
+            self.cuda_stage_plan = None
+            self.cuda_fused_kernel_specs = None
+            self.cuda_fused_launch_budget = None
+            return
+        from pysph.sph.fused_cuda_codegen import (
+            fused_kernel_specs,
+            launch_budget_for_specs,
+        )
+        from pysph.sph.fused_cuda_stage_plan import plan_equation_groups
+
+        supported_convergence = _cuda_supported_convergence_equation_names(
+            self.object.equation_groups
+        )
+        self.cuda_stage_plan = plan_equation_groups(
+            self.object.equation_groups, False, supported_convergence
+        )
+        self.cuda_fused_kernel_specs = fused_kernel_specs(
+            'cuda_eval', self.cuda_stage_plan
+        )
+        self.cuda_fused_launch_budget = launch_budget_for_specs(
+            self.cuda_fused_kernel_specs
+        )
 
     def setup_compiled_module(self, module):
         object = self.object
@@ -680,6 +780,12 @@ class AccelerationEvalGPUHelper(object):
             acceleration_eval = GPUAccelerationEval(self)
         elif self.backend == 'cuda':
             acceleration_eval = CUDAAccelerationEval(self)
+            if _use_generated_fused_cuda_stage_backend():
+                from pysph.sph.fused_cuda_stage_backend import (
+                    GeneratedFusedCudaStageBackend,
+                )
+
+                acceleration_eval.stage_backend = GeneratedFusedCudaStageBackend(self)
 
         object.set_compiled_object(acceleration_eval)
 
@@ -831,7 +937,8 @@ class AccelerationEvalGPUHelper(object):
         self.data.append(dict(
             kernel=kernel, args=py_args, dest=dest, loop=False,
             real=group.real, start_idx=group.start_idx,
-            stop_idx=group.stop_idx, type='kernel'
+            stop_idx=group.stop_idx, type='kernel',
+            stage_group=(g_idx, sg_idx), stage_method_kind=kind
         ))
 
         sig = get_kernel_definition(kernel, all_args)
@@ -1167,7 +1274,8 @@ class AccelerationEvalGPUHelper(object):
         self.data.append(dict(
             kernel=kernel, args=py_args, dest=dest, source=source, loop=True,
             real=group.real, start_idx=group.start_idx,
-            stop_idx=group.stop_idx, type='kernel'
+            stop_idx=group.stop_idx, type='kernel',
+            stage_group=(g_idx, sg_idx), stage_method_kind=kind
         ))
 
         sig = get_kernel_definition(kernel, all_args)
@@ -1249,7 +1357,8 @@ class AccelerationEvalGPUHelper(object):
         self.data.append(dict(
             kernel=kernel, args=py_args, dest=dest, source=source, loop=True,
             real=group.real, start_idx=group.start_idx,
-            stop_idx=group.stop_idx, type='kernel'
+            stop_idx=group.stop_idx, type='kernel',
+            stage_group=(g_idx, sg_idx), stage_method_kind=kind
         ))
 
         body = generate_body(setup=setup_body, loop=loop_body,

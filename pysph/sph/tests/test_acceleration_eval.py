@@ -1,4 +1,5 @@
 # Standard library imports.
+import os
 import unittest
 
 # Library imports.
@@ -20,7 +21,10 @@ from pysph.sph.basic_equations import SummationDensity
 from pysph.base.kernels import CubicSpline
 from pysph.base.nnps import LinkedListNNPS as NNPS
 from pysph.sph.sph_compiler import SPHCompiler
-from pysph.sph.acceleration_eval_gpu_helper import AccelerationEvalGPUHelper
+from pysph.sph.acceleration_eval_gpu_helper import (
+    AccelerationEvalGPUHelper, GPUAccelerationEval
+)
+from pysph.sph.fused_cuda_stage_plan import CudaStagePlan
 
 from pysph.base.reduce_array import serial_reduce_array
 
@@ -146,6 +150,130 @@ class TestAccelerationEvalGPUHelperCodegen(unittest.TestCase):
 
         self.assertIn("floor(", code)
         self.assertNotIn("floorf(", code)
+
+    def test_stage_backend_call_hook_can_handle_non_kernel_call(self):
+        class Queue(object):
+            def __init__(self):
+                self.finished = 0
+
+            def finish(self):
+                self.finished += 1
+
+        class HandlingStageBackend(object):
+            def __init__(self):
+                self.calls = []
+
+            def handle_call(self, evaluator, info, extra_args, t, dt):
+                self.calls.append((evaluator, info, extra_args, t, dt))
+                return True
+
+        called = []
+
+        def pre_post():
+            called.append("pre_post")
+
+        evaluator = object.__new__(GPUAccelerationEval)
+        evaluator.helper = type(
+            "Helper",
+            (),
+            {"calls": [{"type": "pre_post", "callable": pre_post, "args": ()}]},
+        )()
+        evaluator._use_double = False
+        evaluator._queue = Queue()
+        evaluator.stage_backend = HandlingStageBackend()
+
+        evaluator.compute(1.0, 0.25)
+
+        self.assertEqual(called, [])
+        self.assertEqual(len(evaluator.stage_backend.calls), 1)
+        self.assertEqual(evaluator.stage_backend.calls[0][3:], (1.0, 0.25))
+
+    def test_stage_backend_can_skip_final_sync_after_full_device_compute(self):
+        class Queue(object):
+            def __init__(self):
+                self.finished = 0
+
+            def finish(self):
+                self.finished += 1
+
+        class DeviceResidentBackend(object):
+            def __init__(self):
+                self.calls = []
+
+            def begin_compute(self, evaluator, t, dt):
+                self.calls.append(("begin", evaluator, t, dt))
+
+            def end_compute(self, evaluator, t, dt):
+                self.calls.append(("end", evaluator, t, dt))
+                return False
+
+        evaluator = object.__new__(GPUAccelerationEval)
+        evaluator.helper = type("Helper", (), {"calls": []})()
+        evaluator._use_double = False
+        evaluator._queue = Queue()
+        evaluator.stage_backend = DeviceResidentBackend()
+
+        evaluator.compute(1.0, 0.25)
+
+        self.assertEqual(evaluator._queue.finished, 0)
+        self.assertEqual(
+            evaluator.stage_backend.calls,
+            [("begin", evaluator, 1.0, 0.25), ("end", evaluator, 1.0, 0.25)],
+        )
+
+    def test_stage_backend_can_handle_internal_update_nnps(self):
+        class HandlingStageBackend(object):
+            def __init__(self):
+                self.calls = []
+
+            def handle_internal_update_nnps(self, evaluator):
+                self.calls.append(evaluator)
+                return True
+
+        class NNPS(object):
+            def update_domain(self):
+                raise AssertionError("update_domain should be handled by backend")
+
+            def update(self):
+                raise AssertionError("update should be handled by backend")
+
+        evaluator = object.__new__(GPUAccelerationEval)
+        evaluator.stage_backend = HandlingStageBackend()
+        evaluator.nnps = NNPS()
+
+        evaluator.update_nnps()
+
+        self.assertEqual(evaluator.stage_backend.calls, [evaluator])
+
+    def test_cuda_helper_can_install_generated_fused_stage_backend(self):
+        class CompiledObject(object):
+            particle_arrays = []
+
+            def set_compiled_object(self, compiled):
+                self.compiled = compiled
+
+        helper = object.__new__(AccelerationEvalGPUHelper)
+        helper.backend = "cuda"
+        helper.object = CompiledObject()
+        helper._queue = None
+        helper.calls = []
+        helper.cuda_stage_plan = CudaStagePlan(stages=(), strict=True)
+        helper.cuda_fused_kernel_specs = ()
+        helper.cuda_fused_launch_budget = None
+        helper._setup_arrays_on_device = lambda: None
+        helper._setup_calls = lambda: []
+
+        old_env = os.environ.get("PYSPH_FUSED_CUDA_STAGE_BACKEND")
+        os.environ["PYSPH_FUSED_CUDA_STAGE_BACKEND"] = "1"
+        try:
+            helper.setup_compiled_module(None)
+        finally:
+            if old_env is None:
+                os.environ.pop("PYSPH_FUSED_CUDA_STAGE_BACKEND")
+            else:
+                os.environ["PYSPH_FUSED_CUDA_STAGE_BACKEND"] = old_env
+
+        self.assertIsNotNone(helper.object.compiled.stage_backend)
 
 
 class SimpleEquation(Equation):
