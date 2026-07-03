@@ -31,10 +31,15 @@ cdef class OctreeGPUNNPS(GPUNNPS):
     cdef public bint use_elementwise
     cdef public bint use_partitions
     cdef public object leaf_size
+    cdef long _neighbor_cid_generation
+    cdef long _neighbor_cid_context_generation
+    cdef int _neighbor_cid_src_index
+    cdef int _neighbor_cid_dst_index
 
     cpdef _bin(self, int pa_index)
 
     cpdef _refresh(self)
+    cpdef update(self)
 
     cdef void find_neighbor_lengths(self, nbr_lengths)
     cdef void find_nearest_neighbors_gpu(self, nbrs, start_indices)

@@ -65,6 +65,8 @@ cdef class GPUNeighborCache:
 
         self._neighbors_gpu = Array(np.uint32,
                                     backend=self.backend)
+        self._start_idx_gpu = Array(np.uint32, n=n_p,
+                                    backend=self.backend)
 
     #### Public protocol ################################################
 
@@ -97,7 +99,8 @@ cdef class GPUNeighborCache:
         # Allocate _neighbors_cpu and neighbors_gpu
         self._neighbors_gpu.resize(total_size)
 
-        self._start_idx_gpu = self._nbr_lengths_gpu.copy()
+        self._start_idx_gpu.resize(self._nbr_lengths_gpu.length)
+        self._start_idx_gpu.dev[:] = self._nbr_lengths_gpu.dev
 
         # Do prefix sum on self._neighbor_lengths for the self._start_idx
         if self._get_start_indices is None:

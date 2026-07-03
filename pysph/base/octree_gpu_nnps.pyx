@@ -61,6 +61,10 @@ cdef class OctreeGPUNNPS(GPUNNPS):
         self.use_elementwise = use_elementwise
         self.use_partitions = use_partitions
         self.allow_sort = allow_sort
+        self._neighbor_cid_generation = 0
+        self._neighbor_cid_context_generation = -1
+        self._neighbor_cid_src_index = -1
+        self._neighbor_cid_dst_index = -1
         self.update()
 
         # Check if device supports required workgroup size,
@@ -90,6 +94,13 @@ cdef class OctreeGPUNNPS(GPUNNPS):
     cpdef _refresh(self):
         pass
 
+    cpdef update(self):
+        GPUNNPS.update(self)
+        self._neighbor_cid_generation += 1
+        self._neighbor_cid_context_generation = -1
+        self._neighbor_cid_src_index = -1
+        self._neighbor_cid_dst_index = -1
+
     cpdef set_context(self, int src_index, int dst_index):
         """Setup the context before asking for neighbors.  The `dst_index`
         represents the particles for whom the neighbors are to be determined
@@ -109,9 +120,15 @@ cdef class OctreeGPUNNPS(GPUNNPS):
         octree_src = self.octrees[src_index]
         octree_dst = self.octrees[dst_index]
         self.dst_src = src_index != dst_index
+        if self._neighbor_cid_context_generation == self._neighbor_cid_generation:
+            if self._neighbor_cid_src_index == src_index and self._neighbor_cid_dst_index == dst_index:
+                return
 
         self.neighbor_cid_counts, self.neighbor_cids = octree_dst.find_neighbor_cids(
             octree_src)
+        self._neighbor_cid_context_generation = self._neighbor_cid_generation
+        self._neighbor_cid_src_index = src_index
+        self._neighbor_cid_dst_index = dst_index
 
     cdef void find_neighbor_lengths(self, nbr_lengths):
         octree_src = self.octrees[self.src_index]

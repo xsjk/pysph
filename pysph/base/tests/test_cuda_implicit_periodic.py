@@ -8,6 +8,7 @@ from pysph.base.gpu_nnps import OctreeGPUNNPS
 from pysph.base.kernels import CubicSpline
 from pysph.base.nnps import DomainManager
 from pysph.base.particle_array import get_ghost_tag
+from pysph.base.tree.point_tree import PointTree
 from pysph.base.utils import get_particle_array
 from pysph.sph.acceleration_eval import AccelerationEval
 from pysph.sph.equation import Equation, Group
@@ -130,6 +131,41 @@ def test_octree_gpu_nnps_minimum_image_finds_periodic_x_neighbors(cuda_config):
     assert 1 in neighbors
     assert pa.gpu.get_number_of_particles() == pa.num_real_particles
     assert np.count_nonzero(pa.tag == get_ghost_tag()) == 0
+
+
+def test_octree_gpu_nnps_reuses_neighbor_cids_for_same_context(cuda_config, monkeypatch):
+    calls = []
+    original = PointTree.find_neighbor_cids
+
+    def counted_find_neighbor_cids(self, tree_src):
+        calls.append((id(self), id(tree_src)))
+        return original(self, tree_src)
+
+    monkeypatch.setattr(PointTree, "find_neighbor_cids", counted_find_neighbor_cids)
+    pa = get_particle_array(
+        name="fluid",
+        x=np.array([0.01, 0.25, 0.5, 0.99]),
+        y=np.zeros(4),
+        z=np.zeros(4),
+        h=np.ones(4) * 0.1,
+    )
+    nnps = OctreeGPUNNPS(
+        dim=3,
+        particles=[pa],
+        domain=_periodic_x_domain(),
+        radius_scale=2.0,
+        backend="cuda",
+        leaf_size=8,
+        use_elementwise=True,
+    )
+
+    nnps.set_context(0, 0)
+    nnps.set_context(0, 0)
+    assert len(calls) == 1
+
+    nnps.update()
+    nnps.set_context(0, 0)
+    assert len(calls) == 2
 
 
 def test_cuda_equation_loop_uses_minimum_image_xij_without_ghosts(cuda_config):
