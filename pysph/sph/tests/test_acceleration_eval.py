@@ -1305,6 +1305,63 @@ class TestAccelerationEval1DCUDA(TestAccelerationEval1DGPU):
         assert call['type'] == 'kernel'
         assert call['loop'] is True
 
+    def test_iterated_update_nnps_is_skipped_when_converged_on_cuda(self):
+        class ConvergedEquation(Equation):
+            def loop(self, d_idx, d_u, s_idx, s_m):
+                d_u[d_idx] += s_m[s_idx]
+
+            def converged(self):
+                return 1
+
+        equations = [
+            Group(
+                equations=[ConvergedEquation(dest='fluid', sources=['fluid'])],
+                update_nnps=True,
+                iterate=True,
+                max_iterations=3,
+            )
+        ]
+        a_eval = self._make_accel_eval(equations)
+        calls = []
+
+        def update_nnps():
+            calls.append(1)
+
+        a_eval.c_acceleration_eval.update_nnps = update_nnps
+
+        a_eval.compute(0.1, 0.1)
+
+        self.assertEqual(len(calls), 0)
+
+    def test_iterated_update_nnps_runs_before_repeating_on_cuda(self):
+        class ConvergedEquation(Equation):
+            def loop(self, d_idx, d_u, s_idx, s_m):
+                d_u[d_idx] += s_m[s_idx]
+
+            def converged(self):
+                return 1
+
+        equations = [
+            Group(
+                equations=[ConvergedEquation(dest='fluid', sources=['fluid'])],
+                update_nnps=True,
+                iterate=True,
+                min_iterations=2,
+                max_iterations=2,
+            )
+        ]
+        a_eval = self._make_accel_eval(equations)
+        calls = []
+
+        def update_nnps():
+            calls.append(1)
+
+        a_eval.c_acceleration_eval.update_nnps = update_nnps
+
+        a_eval.compute(0.1, 0.1)
+
+        self.assertEqual(len(calls), 1)
+
     def test_cuda_evaluator_names_sync_as_host_boundary(self):
         equations = [
             Group(

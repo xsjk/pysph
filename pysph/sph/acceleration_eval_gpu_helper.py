@@ -359,9 +359,10 @@ class GPUAccelerationEval(object):
                 if has_min_iterations and not at_max_iterations:
                     self._sync_before_host()
                     has_converged = self._converged(eqs)
-                if has_min_iterations and (at_max_iterations or has_converged):
-                    pass
-                else:
+                if not (has_min_iterations and (at_max_iterations or has_converged)):
+                    if group.update_nnps:
+                        self._sync_before_host()
+                        self.update_nnps()
                     i = iter_start
             i += 1
         self._sync_before_host()

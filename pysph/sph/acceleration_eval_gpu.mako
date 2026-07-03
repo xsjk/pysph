@@ -65,7 +65,7 @@ ${helper.get_post_loop_kernel(g_idx, sg_idx, group, dest, all_eqs)}
 #######################################################################
 ## Update NNPS locally if needed
 #######################################################################
-% if group.update_nnps:
+% if group.update_nnps and not group.iterate:
 <% helper.call_update_nnps(group) %>
 % endif
 #######################################################################
@@ -122,7 +122,7 @@ ${do_group(helper, g_idx, sg_idx, sub_group)}
 #######################################################################
 ## Update NNPS locally if needed
 #######################################################################
-% if group.update_nnps:
+% if group.update_nnps and not group.iterate:
 <% helper.call_update_nnps(group) %>
 % endif
 #######################################################################
