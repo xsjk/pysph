@@ -1,4 +1,5 @@
 # Standard library imports.
+from types import SimpleNamespace
 import unittest
 
 # Library imports.
@@ -13,7 +14,7 @@ from pysph.sph.acceleration_eval import AccelerationEval
 from pysph.base.kernels import CubicSpline
 from pysph.base.nnps import LinkedListNNPS
 from pysph.sph.sph_compiler import SPHCompiler
-from pysph.sph.integrator import (LeapFrogIntegrator, PECIntegrator,
+from pysph.sph.integrator import (Integrator, LeapFrogIntegrator, PECIntegrator,
                                   PEFRLIntegrator, EulerIntegrator)
 from pysph.sph.integrator_step import (
     IntegratorStep, LeapFrogStep, PEFRLStep, TwoStageRigidBodyStep
@@ -70,6 +71,82 @@ class TestIntegrator(unittest.TestCase):
 
         # Then
         self.assertRaises(RuntimeError, comp.compile)
+
+    def test_stage_backend_can_handle_outer_update_nnps(self):
+        class Backend(object):
+            def __init__(self):
+                self.calls = []
+
+            def handle_outer_update_nnps(self, integrator, index):
+                self.calls.append((integrator, index))
+                return True
+
+        class NNPS(object):
+            def update(self):
+                raise AssertionError("nnps.update should be handled by backend")
+
+        class AccelerationEval(object):
+            def __init__(self, backend):
+                self.c_acceleration_eval = SimpleNamespace(stage_backend=backend)
+                self.calls = []
+
+            def compute(self, t, dt):
+                self.calls.append((t, dt))
+
+        backend = Backend()
+        a_eval = AccelerationEval(backend)
+        integrator = Integrator()
+        integrator.nnps = NNPS()
+        integrator.parallel_manager = None
+        integrator.acceleration_evals = [a_eval]
+        integrator.c_integrator = SimpleNamespace(t=1.0, dt=0.25)
+
+        integrator.compute_accelerations(index=0, update_nnps=True)
+
+        self.assertEqual(backend.calls, [(integrator, 0)])
+        self.assertEqual(a_eval.calls, [(1.0, 0.25)])
+
+    def test_stage_backend_can_handle_update_domain(self):
+        class Backend(object):
+            def __init__(self):
+                self.calls = []
+
+            def handle_update_domain(self, integrator):
+                self.calls.append(integrator)
+                return True
+
+        class NNPS(object):
+            def update_domain(self):
+                raise AssertionError("update_domain should be handled by backend")
+
+        backend = Backend()
+        integrator = Integrator()
+        integrator.nnps = NNPS()
+        integrator.acceleration_evals = [
+            SimpleNamespace(c_acceleration_eval=SimpleNamespace(stage_backend=backend))
+        ]
+
+        integrator.update_domain()
+
+        self.assertEqual(backend.calls, [integrator])
+
+    def test_stage_backend_can_compute_time_step(self):
+        class Backend(object):
+            def __init__(self):
+                self.calls = []
+
+            def compute_time_step(self, integrator, dt, cfl):
+                self.calls.append((integrator, dt, cfl))
+                return 0.125
+
+        backend = Backend()
+        integrator = Integrator()
+        integrator.acceleration_evals = [
+            SimpleNamespace(c_acceleration_eval=SimpleNamespace(stage_backend=backend))
+        ]
+
+        self.assertEqual(integrator.compute_time_step(0.5, 0.25), 0.125)
+        self.assertEqual(backend.calls, [(integrator, 0.5, 0.25)])
 
 
 class TestIntegratorBase(unittest.TestCase):

@@ -277,6 +277,23 @@ class Solver(object):
         """
         self.pre_step_callbacks.append(callback)
 
+    def _stage_backend_for_acceleration_eval(self, index):
+        acceleration_eval = self.acceleration_evals[index]
+        if not hasattr(acceleration_eval, "c_acceleration_eval"):
+            return None
+        compiled_eval = acceleration_eval.c_acceleration_eval
+        if not hasattr(compiled_eval, "stage_backend"):
+            return None
+        return compiled_eval.stage_backend
+
+    def _stage_backend_handles_reorder_update_nnps(self):
+        backend = self._stage_backend_for_acceleration_eval(0)
+        if backend is None:
+            return False
+        if not hasattr(backend, "handle_reorder_update_nnps"):
+            return False
+        return backend.handle_reorder_update_nnps(self)
+
     def append_particle_arrrays(self, arrays):
         """ Append the particle arrays to the existing particle arrays
         """
@@ -299,7 +316,8 @@ class Solver(object):
         for i in range(len(self.particles)):
             self.nnps.spatially_order_particles(i)
         # We must update after the reorder.
-        self.nnps.update()
+        if not self._stage_backend_handles_reorder_update_nnps():
+            self.nnps.update()
 
     def set_adaptive_timestep(self, value):
         """Set it to True to use adaptive timestepping based on

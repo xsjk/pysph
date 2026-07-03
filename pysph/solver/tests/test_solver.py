@@ -160,6 +160,38 @@ class TestSolver(TestCase):
             np.max(np.abs(expected - record)) < 1e-12, error_message
         )
 
+    def test_stage_backend_can_handle_reorder_nnps_update(self):
+        class Backend(object):
+            def __init__(self):
+                self.calls = []
+
+            def handle_reorder_update_nnps(self, solver):
+                self.calls.append(solver)
+                return True
+
+        class NNPS(object):
+            def __init__(self):
+                self.ordered_indices = []
+
+            def spatially_order_particles(self, index):
+                self.ordered_indices.append(index)
+
+            def update(self):
+                raise AssertionError("stage backend should handle reorder update")
+
+        backend = Backend()
+        solver = Solver(integrator=self.integrator)
+        solver.particles = [object(), object()]
+        solver.nnps = NNPS()
+        solver.acceleration_evals = [
+            mock.Mock(c_acceleration_eval=mock.Mock(stage_backend=backend))
+        ]
+
+        solver.reorder_particles()
+
+        self.assertEqual(solver.nnps.ordered_indices, [0, 1])
+        self.assertEqual(backend.calls, [solver])
+
 
 if __name__ == '__main__':
     main()
