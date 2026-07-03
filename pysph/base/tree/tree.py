@@ -75,7 +75,7 @@ LEAF_DFS_TEMPLATE = r"""
         }
 
         // Recurse back to find node with a valid neighbor
-        while (child_stack[idx] >= %(k)s-1 && idx >= 0)
+        while (idx >= 0 && child_stack[idx] >= %(k)s-1)
             idx--;
 
         // Iterate to next neighbor
@@ -136,7 +136,7 @@ POINT_DFS_TEMPLATE = r"""
         }
 
         // Recurse back to find node with a valid neighbor
-        while (child_stack[idx] >= %(k)s-1 && idx >= 0)
+        while (idx >= 0 && child_stack[idx] >= %(k)s-1)
             idx--;
 
         // Iterate to next neighbor
