@@ -1,10 +1,12 @@
 import numpy as np
 import unittest
+from unittest.mock import patch
 from pytest import importorskip
 
 cl = importorskip('pyopencl')
 
 import pysph.base.particle_array
+import pysph.base.tree.point_tree as point_tree_module  # noqa: E402
 from pysph.base.device_helper import DeviceHelper   # noqa: E402
 from pysph.base.utils import get_particle_array  # noqa: E402
 from pysph.base.tree.point_tree import PointTree  # noqa: E402
@@ -117,6 +119,87 @@ def _test_tree_structure(tree, k):
             s.append(child_idx)
             d.append(depth + 1)
         assert (start == pbound[1])
+
+
+class PointTreeNeighborCIDAllocationTestCase(unittest.TestCase):
+    def test_find_neighbor_cids_uses_leaf_pair_capacity_without_host_total(self):
+        class DeviceScalar:
+            def get(self):
+                raise AssertionError("neighbor cid total should stay on device")
+
+        class DeviceArray:
+            def __getitem__(self, key):
+                return DeviceScalar()
+
+        class FakeArray:
+            created = []
+
+            def __init__(self, dtype, n=0, backend=None):
+                self.dtype = dtype
+                self.length = n
+                self.alloc = n
+                self.backend = backend
+                self.dev = DeviceArray()
+                self.resize_calls = []
+                FakeArray.created.append(self)
+
+            def resize(self, size):
+                self.length = size
+                self.alloc = max(self.alloc, size)
+                self.resize_calls.append(size)
+
+        class FakeSourceTree:
+            unique_cid_count = 5
+
+            class PBounds:
+                dev = DeviceArray()
+
+            pbounds = PBounds()
+
+        kernels = []
+
+        def fake_leaf_neighbor_operation(*args, **kwargs):
+            def kernel(*kernel_args):
+                kernels.append(kernel_args)
+
+            return kernel
+
+        tree = object.__new__(PointTree)
+        tree.unique_cid_count = 3
+        tree.backend = "cuda"
+        tree.ctx = None
+        tree._neighbor_cid_buffers = {}
+        tree._leaf_neighbor_operation = fake_leaf_neighbor_operation
+
+        def fake_prefix_sum(ctx, backend):
+            def prefix_sum(dev):
+                pass
+
+            return prefix_sum
+
+        with patch.object(point_tree_module, "Array", FakeArray), \
+                patch.object(
+                    point_tree_module, "_get_neighbor_count_prefix_sum_kernel",
+                    fake_prefix_sum
+                ), \
+                patch.object(
+                    point_tree_module, "profile_kernel",
+                    lambda kernel, name, backend: kernel
+                ):
+            source_tree = FakeSourceTree()
+            neighbor_cid_count, neighbor_cids = tree.find_neighbor_cids(
+                source_tree
+            )
+            neighbor_cid_count2, neighbor_cids2 = tree.find_neighbor_cids(
+                source_tree
+            )
+
+        assert neighbor_cid_count.length == 4
+        assert neighbor_cids.length == 15
+        assert neighbor_cid_count2 is neighbor_cid_count
+        assert neighbor_cids2 is neighbor_cids
+        assert len(FakeArray.created) == 2
+        assert len(kernels) == 4
 
 
 class QuadtreeTestCase(unittest.TestCase):

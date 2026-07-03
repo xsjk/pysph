@@ -318,6 +318,7 @@ class PointTree(Tree):
         self.xmin = None
         self.xmax = None
         self.hmin = None
+        self._neighbor_cid_buffers = {}
         self.make_vec = lambda *values: make_vec(
             backend, c_type, self.dim, *values
         )
@@ -481,8 +482,20 @@ class PointTree(Tree):
         return callable
 
     def find_neighbor_cids(self, tree_src):
-        neighbor_cid_count = Array(np.uint32, n=self.unique_cid_count + 1,
-                                   backend=self.backend)
+        buffer_key = id(tree_src)
+        if buffer_key not in self._neighbor_cid_buffers:
+            self._neighbor_cid_buffers[buffer_key] = {}
+        buffers = self._neighbor_cid_buffers[buffer_key]
+
+        neighbor_cid_count_size = int(self.unique_cid_count) + 1
+        if "neighbor_cid_count" in buffers:
+            neighbor_cid_count = buffers["neighbor_cid_count"]
+            if neighbor_cid_count.length != neighbor_cid_count_size:
+                neighbor_cid_count.resize(neighbor_cid_count_size)
+        else:
+            neighbor_cid_count = Array(np.uint32, n=neighbor_cid_count_size,
+                                       backend=self.backend)
+            buffers["neighbor_cid_count"] = neighbor_cid_count
         find_neighbor_cid_counts = self._leaf_neighbor_operation(
             tree_src,
             args="uint2 *pbounds, int *cnt",
@@ -505,9 +518,17 @@ class PointTree(Tree):
         )
         neighbor_psum(neighbor_cid_count.dev)
 
-        total_neighbors = int(neighbor_cid_count.dev[-1].get())
-        neighbor_cids = Array(np.uint32, n=total_neighbors,
-                              backend=self.backend)
+        neighbor_cid_capacity = (
+            int(self.unique_cid_count) * int(tree_src.unique_cid_count)
+        )
+        if "neighbor_cids" in buffers:
+            neighbor_cids = buffers["neighbor_cids"]
+            if neighbor_cids.alloc < neighbor_cid_capacity:
+                neighbor_cids.resize(neighbor_cid_capacity)
+        else:
+            neighbor_cids = Array(np.uint32, n=neighbor_cid_capacity,
+                                  backend=self.backend)
+            buffers["neighbor_cids"] = neighbor_cids
 
         find_neighbor_cids = self._leaf_neighbor_operation(
             tree_src,
