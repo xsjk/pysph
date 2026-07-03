@@ -275,6 +275,35 @@ class TestAccelerationEvalGPUHelperCodegen(unittest.TestCase):
 
         self.assertIsNotNone(helper.object.compiled.stage_backend)
 
+    def test_cuda_helper_skips_fused_specs_for_non_strict_plan(self):
+        class ConvergedEquation(Equation):
+            def loop(self, d_idx, d_u, s_idx, s_m):
+                d_u[d_idx] += s_m[s_idx]
+
+            def converged(self):
+                return 1
+
+        class CompiledObject(object):
+            equation_groups = [
+                Group(
+                    equations=[
+                        ConvergedEquation(dest='fluid', sources=['fluid'])
+                    ],
+                    update_nnps=True,
+                    iterate=True,
+                )
+            ]
+
+        helper = object.__new__(AccelerationEvalGPUHelper)
+        helper.backend = "cuda"
+        helper.object = CompiledObject()
+
+        helper._setup_cuda_stage_plan()
+
+        self.assertFalse(helper.cuda_stage_plan.strict)
+        self.assertEqual(helper.cuda_fused_kernel_specs, ())
+        self.assertEqual(helper.cuda_fused_launch_budget.total_launch_count, 0)
+
 
 class SimpleEquation(Equation):
     def __init__(self, dest, sources):

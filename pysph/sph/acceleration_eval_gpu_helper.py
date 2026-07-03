@@ -765,6 +765,10 @@ class AccelerationEvalGPUHelper(object):
         self.cuda_stage_plan = plan_equation_groups(
             self.object.equation_groups, False, supported_convergence
         )
+        if not self.cuda_stage_plan.strict:
+            self.cuda_fused_kernel_specs = ()
+            self.cuda_fused_launch_budget = launch_budget_for_specs(())
+            return
         self.cuda_fused_kernel_specs = fused_kernel_specs(
             'cuda_eval', self.cuda_stage_plan
         )
