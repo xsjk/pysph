@@ -1305,6 +1305,19 @@ class TestAccelerationEval1DCUDA(TestAccelerationEval1DGPU):
         assert call['type'] == 'kernel'
         assert call['loop'] is True
 
+    def test_cuda_evaluator_names_sync_as_host_boundary(self):
+        equations = [
+            Group(
+                equations=[SummationDensity(dest='fluid', sources=['fluid'])],
+            )
+        ]
+        a_eval = self._make_accel_eval(equations)
+        c_eval = a_eval.c_acceleration_eval
+
+        self.assertTrue(hasattr(c_eval, '_sync_before_host'))
+        self.assertFalse(hasattr(c_eval, '_finish'))
+        self.assertIsNone(c_eval._sync_before_host())
+
 
 class TestAEvalMultipleDests(unittest.TestCase):
     def setUp(self):

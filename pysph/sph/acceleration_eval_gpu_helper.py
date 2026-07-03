@@ -304,6 +304,9 @@ class GPUAccelerationEval(object):
                 return False
         return True
 
+    def _sync_before_host(self):
+        self._queue.finish()
+
     def compute(self, t, dt):
         helper = self.helper
         dtype = np.float64 if self._use_double else np.float32
@@ -318,6 +321,7 @@ class GPUAccelerationEval(object):
             info = helper.calls[i]
             type = info['type']
             if type == 'method':
+                self._sync_before_host()
                 method_name = info.get('method')
                 method = getattr(self, method_name)
                 if method_name == 'do_reduce':
@@ -326,15 +330,18 @@ class GPUAccelerationEval(object):
                 else:
                     method(*info.get('args'))
             elif type == 'py_initialize':
+                self._sync_before_host()
                 args = info['dest'], t, dt
                 for call in info['calls']:
                     call(*args)
             elif type == 'pre_post':
+                self._sync_before_host()
                 func = info.get('callable')
                 func(*info.get('args'))
             elif type == 'kernel':
                 self._call_kernel(info, extra_args)
             elif type == 'check_condition':
+                self._sync_before_host()
                 group = info['group']
                 if not group.condition(t, dt):
                     # Condition failed so skip group.
@@ -346,13 +353,18 @@ class GPUAccelerationEval(object):
                 eqs = info['equations']
                 group = info['group']
                 iter_count += 1
-                if ((iter_count >= group.min_iterations) and
-                        (iter_count == group.max_iterations or
-                         self._converged(eqs))):
+                has_min_iterations = iter_count >= group.min_iterations
+                at_max_iterations = iter_count == group.max_iterations
+                has_converged = False
+                if has_min_iterations and not at_max_iterations:
+                    self._sync_before_host()
+                    has_converged = self._converged(eqs)
+                if has_min_iterations and (at_max_iterations or has_converged):
                     pass
                 else:
                     i = iter_start
             i += 1
+        self._sync_before_host()
 
     def set_nnps(self, nnps):
         self.nnps = nnps
@@ -372,9 +384,11 @@ class GPUAccelerationEval(object):
 
 
 class CUDAAccelerationEval(GPUAccelerationEval):
+    def _sync_before_host(self):
+        pass
+
     def _call_kernel(self, info, extra_args):
         from pycuda.gpuarray import splay
-        import pycuda.driver as drv
         nnps = self.nnps
         call = info.get('method')
         args = list(info.get('args'))
@@ -427,17 +441,11 @@ class CUDAAccelerationEval(GPUAccelerationEval):
                     cache._start_idx_gpu.dev,
                     cache._neighbors_gpu.dev
                 ] + self._periodic_args() + extra_args
-                event = drv.Event()
                 call(*args, block=(num_tpb, 1, 1), grid=(num_blocks, 1))
-                event.record()
-                event.synchronize()
         else:
-            event = drv.Event()
             call(*(args + extra_args),
                  block=(num_tpb, 1, 1),
                  grid=(num_blocks, 1))
-            event.record()
-            event.synchronize()
 
     def _assert_local_memory_supported(self):
         manager = self.nnps.domain.manager
