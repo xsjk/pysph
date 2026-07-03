@@ -150,7 +150,7 @@ cdef class ParticleArray:
         # list of output property arrays
         self.output_property_arrays = []
 
-        if self.backend is not 'cython':
+        if self.backend != 'cython':
             h = DeviceHelper(self, backend=self.backend)
             self.set_device_helper(h)
         else:
@@ -374,7 +374,7 @@ cdef class ParticleArray:
 
         # number of particles
         num_particles = self.get_number_of_particles(only_real)
-        if self.gpu is not None and self.backend is not 'cython':
+        if self.gpu is not None and self.backend != 'cython':
             self.gpu.pull(*props)
 
         # add the property arrays
@@ -422,8 +422,8 @@ cdef class ParticleArray:
 
     cpdef int get_number_of_particles(self, bint real=False):
         """ Return the number of particles """
-        if self.gpu is not None and self.backend is not 'cython':
-            return self.gpu.get_number_of_particles()
+        if self.gpu is not None and self.backend != 'cython':
+            return self.gpu.get_number_of_particles(real)
         if real:
             return self.num_real_particles
         else:
@@ -464,7 +464,7 @@ cdef class ParticleArray:
                 array.remove(sorted_indices)
 
         """
-        if self.gpu is not None and self.backend is not 'cython':
+        if self.gpu is not None and self.backend != 'cython':
             if type(indices) != Array:
                 if isinstance(indices, BaseArray):
                     indices = indices.get_npy_array()
@@ -513,7 +513,7 @@ cdef class ParticleArray:
             the type of particles that need to be removed.
 
         """
-        if self.gpu is not None and self.backend is not 'cython':
+        if self.gpu is not None and self.backend != 'cython':
             return self.gpu.remove_tagged_particles(tag, align=align)
         cdef LongArray indices = LongArray()
         cdef IntArray tag_array = self.properties['tag']
@@ -558,7 +558,7 @@ cdef class ParticleArray:
         for prop in particle_props:
             self._check_property(prop)
 
-        if self.gpu is not None and self.backend is not 'cython':
+        if self.gpu is not None and self.backend != 'cython':
             gpu_particle_props = {}
             for prop, ary in particle_props.items():
                 if prop in self.gpu.properties:
@@ -610,7 +610,7 @@ cdef class ParticleArray:
         if parray.get_number_of_particles() == 0:
             return 0
 
-        if self.gpu is not None and self.backend is not 'cython':
+        if self.gpu is not None and self.backend != 'cython':
             self.gpu.append_parray(parray, align=align,
                                    update_constants=update_constants)
             return 0
@@ -670,7 +670,7 @@ cdef class ParticleArray:
         if num_particles <= 0:
             return
 
-        if self.gpu is not None and self.backend is not 'cython':
+        if self.gpu is not None and self.backend != 'cython':
             self.gpu.extend(num_particles)
             return 0
 
@@ -1127,7 +1127,7 @@ cdef class ParticleArray:
                          prop[i] = prop[index_arr[i]]
                          prop[index_arr[i]] = tmp
         """
-        if self.gpu is not None and self.backend is not 'cython':
+        if self.gpu is not None and self.backend != 'cython':
             self.gpu.align_particles()
             return 0
 
@@ -1175,7 +1175,7 @@ cdef class ParticleArray:
     cpdef ParticleArray empty_clone(self, props=None):
         """Creates an empty clone of the particle array
         """
-        if self.gpu is not None and self.backend is not 'cython':
+        if self.gpu is not None and self.backend != 'cython':
             return self.gpu.empty_clone(props=props)
 
         cdef ParticleArray result_array = ParticleArray()
@@ -1269,7 +1269,7 @@ cdef class ParticleArray:
              - copy the properties from the existing array to the new array.
 
         """
-        if self.gpu is not None and self.backend is not 'cython':
+        if self.gpu is not None and self.backend != 'cython':
             if type(indices) != Array:
                 indices = to_device(
                         numpy.array(indices, dtype=numpy.uint32),
@@ -1423,7 +1423,7 @@ cdef class ParticleArray:
 
     def update_min_max(self, props=None):
         """Update the min,max values of all properties """
-        if self.gpu is not None and self.backend is not 'cython':
+        if self.gpu is not None and self.backend != 'cython':
             backend = self.gpu
         else:
             backend = self
@@ -1442,7 +1442,7 @@ cdef class ParticleArray:
         To do that, you need to call `align_particles`.
 
         """
-        if self.gpu is not None and self.backend is not 'cython':
+        if self.gpu is not None and self.backend != 'cython':
             return self.gpu.resize(size)
 
         for prop, array in self.properties.items():

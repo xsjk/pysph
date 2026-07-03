@@ -319,7 +319,7 @@ class DeviceHelper(object):
 
         self.align(indices)
 
-        self.num_real_particles = int(num_real_particles.get())
+        self.num_real_particles = int(np.asarray(num_real_particles.get()).item())
 
     def _build_indices_with_strides(self, tag_arr, stride):
         num_particles = len(tag_arr.dev)
@@ -387,7 +387,7 @@ class DeviceHelper(object):
                    num_removed_particles=num_removed_particles,
                    num_particles=num_particles)
 
-        new_num_particles = num_particles - int(num_removed_particles.get())
+        new_num_particles = num_particles - int(np.asarray(num_removed_particles.get()).item())
 
         strides = set(self._particle_array.stride.values())
         s_indices = {1: new_indices}
@@ -528,8 +528,7 @@ class DeviceHelper(object):
             arr = self._data[prop]
             stride = self._particle_array.stride.get(prop, 1)
             arr.resize(new_size * stride)
-            arr[old_size * stride:] = \
-                self._particle_array.default_values[prop]
+            arr[old_size * stride:] = self._particle_array.default_values.get(prop, 0)
             self.update_prop(prop, arr)
 
     def append_parray(self, parray, align=True, update_constants=False):
