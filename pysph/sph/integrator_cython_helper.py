@@ -12,6 +12,7 @@ from textwrap import dedent
 from mako.template import Template
 
 # Local imports.
+from pysph.base.utils import is_overloaded_method
 from pysph.sph.equation import get_array_names
 from .acceleration_eval_cython_helper import get_helper_code
 from compyle.api import CythonGenerator, get_func_definition
@@ -82,7 +83,16 @@ class IntegratorCythonHelper(object):
         code_gen = CythonGenerator(known_types=known_types)
 
         wrappers = []
+        hook_methods = (
+            'initialize', 'stage1', 'stage2', 'stage3', 'stage4', 'stage5'
+        )
         for cls in sorted(classes.keys()):
+            stepper = classes[cls]
+            code_gen.ignore_methods = ['_cython_code_']
+            code_gen.ignore_methods.extend(
+                name for name in hook_methods
+                if not _has_overloaded_method(stepper, name)
+            )
             code_gen.parse(classes[cls])
             wrappers.append(code_gen.get_code())
         return '\n'.join(wrappers)
@@ -109,10 +119,10 @@ class IntegratorCythonHelper(object):
 
     def get_args(self, dest, method):
         stepper = self.object.steppers[dest]
-        meth = getattr(stepper, method, None)
-        if meth is None:
+        if not _has_overloaded_method(stepper, method):
             return []
         else:
+            meth = getattr(stepper, method)
             return getfullargspec(meth).args
 
     def get_array_declarations(self, method):
@@ -157,7 +167,7 @@ class IntegratorCythonHelper(object):
             return ''
 
     def has_stepper_loop(self, dest, method):
-        return hasattr(self.object.steppers[dest], method)
+        return _has_overloaded_method(self.object.steppers[dest], method)
 
     def get_stepper_method_wrapper_names(self):
         """Returns the names of the methods we should wrap.  For a 2 stage
@@ -170,7 +180,8 @@ class IntegratorCythonHelper(object):
                 if x.startswith('py_stage'):
                     stages.append(x[3:])
                 elif x.startswith('stage') or x == 'initialize':
-                    stages.append(x)
+                    if _has_overloaded_method(stepper, x):
+                        stages.append(x)
             methods.update(stages)
         return list(sorted(methods))
 
@@ -221,3 +232,7 @@ class IntegratorCythonHelper(object):
         print(msg)
         print('*'*70)
         raise RuntimeError(msg)
+
+
+def _has_overloaded_method(obj, method_name):
+    return is_overloaded_method(getattr(obj, method_name))

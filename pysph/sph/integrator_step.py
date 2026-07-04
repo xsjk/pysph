@@ -14,6 +14,24 @@ class IntegratorStep(object):
     def __repr__(self):
         return '%s()'%(self.__class__.__name__)
 
+    def initialize(self, *args):
+        """Optional per-particle initialization hook."""
+
+    def stage1(self, *args):
+        """Optional first integration-stage hook."""
+
+    def stage2(self, *args):
+        """Optional second integration-stage hook."""
+
+    def stage3(self, *args):
+        """Optional third integration-stage hook."""
+
+    def stage4(self, *args):
+        """Optional fourth integration-stage hook."""
+
+    def stage5(self, *args):
+        """Optional fifth integration-stage hook."""
+
 
 ###############################################################################
 # `EulerStep` class

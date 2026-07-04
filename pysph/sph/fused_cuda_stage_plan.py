@@ -12,6 +12,8 @@ import textwrap
 from dataclasses import dataclass, replace
 from enum import Enum
 
+from pysph.base.utils import is_overloaded_method
+
 
 class MethodKind(Enum):
     """PySPH equation method kinds understood by the fused CUDA planner."""
@@ -523,7 +525,7 @@ def _format_convergence_policy(policy):
 
 def analyze_equation_method(equation, method_name):
     """Return dependency metadata for one equation method."""
-    assert hasattr(equation, method_name)
+    assert _has_overloaded_method(equation, method_name)
     method = getattr(equation, method_name)
     method_kind = MethodKind(method_name)
     source = textwrap.dedent(inspect.getsource(method))
@@ -571,7 +573,7 @@ def analyze_equation_method(equation, method_name):
 
 def analyze_pair_reduction_method(equation, method_name):
     """Return whether one equation method is a destination additive pair loop."""
-    assert hasattr(equation, method_name)
+    assert _has_overloaded_method(equation, method_name)
     method = getattr(equation, method_name)
     method_kind = MethodKind(method_name)
     source = textwrap.dedent(inspect.getsource(method))
@@ -637,9 +639,13 @@ def method_deps_for_equation(equation):
     methods = []
     for method_kind in MethodKind:
         method_name = method_kind.value
-        if hasattr(equation, method_name):
+        if _has_overloaded_method(equation, method_name):
             methods.append(analyze_equation_method(equation, method_name))
     return tuple(methods)
+
+
+def _has_overloaded_method(obj, method_name):
+    return is_overloaded_method(getattr(obj, method_name))
 
 
 def plan_equation_groups(groups, strict, supported_convergence):
@@ -1031,7 +1037,7 @@ def _plan_group(group, supported_convergence, stage_start_index):
     methods = []
     unsupported = []
     for equation in group.equations:
-        if hasattr(equation, "py_initialize"):
+        if _has_overloaded_method(equation, "py_initialize"):
             unsupported.append("py_initialize")
         deps = method_deps_for_equation(equation)
         methods.extend(deps)

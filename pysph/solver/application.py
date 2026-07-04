@@ -1486,7 +1486,6 @@ class Application(object):
     def initialize(self):
         """Called on the constructor, set constants etc. up here if needed.
         """
-        pass
 
     @property
     def output_files(self):
@@ -1630,14 +1629,12 @@ class Application(object):
 
         This uses the `argparse` module.
         """
-        pass
 
     def configure_scheme(self):
         """This is called after :py:meth:`consume_user_options` is called.
         One can configure the SPH scheme here as at this point all the command
         line options are known.
         """
-        pass
 
     def consume_user_options(self):
         """This is called right after the command line arguments are parsed.
@@ -1649,7 +1646,6 @@ class Application(object):
         etc. that depend on the command line arguments passed.  Note that this
         method is called well before the solver or particles are created.
         """
-        pass
 
     def create_domain(self):
         """Create a `pysph.base.nnps_base.DomainManager` and return it if
@@ -1667,7 +1663,6 @@ class Application(object):
         The method is passed a dictionary of particle arrays keyed on the name
         of the particle array.
         """
-        pass
 
     def create_equations(self):
         """Create the equations to be used and return them.
@@ -1723,13 +1718,11 @@ class Application(object):
 
         Note that this is executed before the simulation starts.
         """
-        pass
 
     def pre_step(self, solver):
         """If overloaded, this is called automatically before each integrator
         step.  The method is passed the solver instance.
         """
-        pass
 
     def post_stage(self, current_time, dt, stage):
         """If overloaded, this is called automatically after each integrator
@@ -1741,13 +1734,11 @@ class Application(object):
         examples of how this is called.
 
         """
-        pass
 
     def post_step(self, solver):
         """If overloaded, this is called automatically after each integrator
         step.  The method is passed the solver instance.
         """
-        pass
 
     def post_process(self, info_fname_or_directory):
         """Given an info filename or a directory containing the info file, read

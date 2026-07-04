@@ -6,6 +6,7 @@ import unittest
 
 # Local imports.
 from compyle.api import KnownType
+from pysph.base.utils import is_overloaded_method
 from pysph.sph.equation import (
     BasicCodeBlock, Context, CythonGroup, Equation, Group, sort_precomputed
 )
@@ -87,9 +88,9 @@ class TestEquations(TestBase):
         self.assertEqual(eq.no_source, True)
         self.assertEqual(eq.dest, 'fluid')
         self.assertEqual(eq.sources, None)
-        self.assertFalse(hasattr(eq, 'loop'))
-        self.assertFalse(hasattr(eq, 'post_loop'))
-        self.assertFalse(hasattr(eq, 'initialize'))
+        self.assertFalse(is_overloaded_method(eq.loop))
+        self.assertFalse(is_overloaded_method(eq.post_loop))
+        self.assertFalse(is_overloaded_method(eq.initialize))
 
         eq = Equation('fluid', sources=['fluid'])
         self.assertEqual(eq.name, 'Equation')

@@ -516,7 +516,7 @@ def get_equations_with_converged(group):
             return g.equations
 
     eqs = [x for x in _get_eqs(group)
-           if is_overloaded_method(getattr(x, 'converged'))]
+           if is_overloaded_method(x.converged)]
     return eqs
 
 
@@ -698,8 +698,10 @@ class AccelerationEvalGPUHelper(object):
                 if info.get('method') == 'do_reduce':
                     args = info.get('args')
                     grp = args[0]
-                    args[0] = [x for x in grp.equations
-                               if hasattr(x, 'reduce')]
+                    args[0] = [
+                        x for x in grp.equations
+                        if is_overloaded_method(x.reduce)
+                    ]
                     args[1] = self._array_map[args[1]]
             elif type == 'pre_post':
                 info = dict(item)
@@ -1120,8 +1122,8 @@ class AccelerationEvalGPUHelper(object):
     def call_py_initialize(self, all_eq_group, dest):
         calls = []
         for eq in all_eq_group.equations:
-            method = getattr(eq, 'py_initialize', None)
-            if method is not None:
+            method = eq.py_initialize
+            if is_overloaded_method(method):
                 calls.append(method)
         if len(calls) > 0:
             self.data.append(

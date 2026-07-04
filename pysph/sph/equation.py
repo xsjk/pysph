@@ -22,6 +22,7 @@ from compyle.api import (CythonGenerator, KnownType,
                          OpenCLConverter, get_symbols)
 from compyle.translator import CUDAConverter
 from compyle.config import get_config
+from pysph.base.utils import is_overloaded_method
 
 
 getfullargspec = inspect.getfullargspec
@@ -367,13 +368,17 @@ def get_arrays_used_in_equation(equation):
         'initialize', 'initialize_pair', 'loop', 'loop_all', 'post_loop'
     )
     for meth_name in methods:
-        meth = getattr(equation, meth_name, None)
-        if meth is not None:
+        if _has_overloaded_method(equation, meth_name):
+            meth = getattr(equation, meth_name)
             args = getfullargspec(meth).args
             s, d = get_array_names(args)
             src_arrays.update(s)
             dest_arrays.update(d)
     return src_arrays, dest_arrays
+
+
+def _has_overloaded_method(obj, method_name):
+    return is_overloaded_method(getattr(obj, method_name))
 
 
 def get_init_args(obj, method, ignore=None):
@@ -425,6 +430,27 @@ class Equation(object):
         """Return > 0 to indicate converged iterations and < 0 otherwise.
         """
         return 1.0
+
+    def initialize(self, *args):
+        """Optional per-destination-particle initialization hook."""
+
+    def initialize_pair(self, *args):
+        """Optional per-destination-particle pair initialization hook."""
+
+    def loop(self, *args):
+        """Optional per-neighbor or pointwise equation hook."""
+
+    def loop_all(self, *args):
+        """Optional hook that receives all neighbors at once."""
+
+    def post_loop(self, *args):
+        """Optional per-destination-particle post-loop hook."""
+
+    def reduce(self, *args):
+        """Optional host-side reduction hook."""
+
+    def py_initialize(self, *args):
+        """Optional host-side initialization hook."""
 
     def _pull(self, *args):
         """Pull attributes from the GPU if needed.
@@ -583,7 +609,7 @@ class Group(object):
         assert kind in ('initialize', 'initialize_pair', 'loop', 'loop_all',
                         'post_loop', 'reduce')
         for equation in self.equations:
-            if hasattr(equation, kind):
+            if _has_overloaded_method(equation, kind):
                 return True
 
     def _setup_precomputed(self):
@@ -592,7 +618,7 @@ class Group(object):
         # Calculate the precomputed symbols for this equation.
         all_args = set()
         for equation in self.equations:
-            if hasattr(equation, 'loop'):
+            if _has_overloaded_method(equation, 'loop'):
                 args = getfullargspec(equation.loop).args
                 all_args.update(args)
         all_args.discard('self')
@@ -760,8 +786,8 @@ class CythonGroup(Group):
 
         code = []
         for eq in self.equations:
-            meth = getattr(eq, kind, None)
-            if meth is not None:
+            if _has_overloaded_method(eq, kind):
+                meth = getattr(eq, kind)
                 args = getfullargspec(meth).args
                 if 'self' in args:
                     args.remove('self')
@@ -839,7 +865,7 @@ class CythonGroup(Group):
     def get_py_initialize_code(self):
         lines = []
         for i, equation in enumerate(self.equations):
-            if hasattr(equation, 'py_initialize'):
+            if _has_overloaded_method(equation, 'py_initialize'):
                 code = [
                     'with profile_ctx'
                     '("AccelerationEval.%s.py_initialize"):' % self.name
@@ -869,7 +895,16 @@ class CythonGroup(Group):
         predefined = dict(get_predefined_types(self.pre_comp))
         predefined.update(known_types)
         code_gen = CythonGenerator(known_types=predefined)
+        hook_methods = (
+            'initialize', 'initialize_pair', 'loop', 'loop_all', 'post_loop',
+            'reduce', 'py_initialize'
+        )
         for cls in sorted(classes.keys()):
+            code_gen.ignore_methods = ['_cython_code_']
+            code_gen.ignore_methods.extend(
+                name for name in hook_methods
+                if not _has_overloaded_method(eqs[cls], name)
+            )
             code_gen.parse(eqs[cls])
             wrappers.append(code_gen.get_code())
         return '\n'.join(wrappers)
@@ -909,8 +944,8 @@ class OpenCLGroup(Group):
                 loop_ann[k] = KnownType(new_type)
         for eq in eqs.values():
             cls = eq.__class__
-            loop = getattr(cls, 'loop', None)
-            if loop is not None:
+            if _has_overloaded_method(eq, 'loop'):
+                loop = cls.loop
                 self._set_loop_annotation(loop, loop_ann)
                 modified_classes.append(cls)
         return modified_classes
@@ -946,8 +981,16 @@ class OpenCLGroup(Group):
             modified_classes = self._update_for_local_memory(predefined, eqs)
 
         code_gen = self._Converter_Class(known_types=predefined)
-        ignore = ['reduce', 'converged']
+        hook_methods = (
+            'initialize', 'initialize_pair', 'loop', 'loop_all', 'post_loop',
+            'reduce', 'py_initialize'
+        )
         for cls in sorted(classes.keys()):
+            ignore = ['reduce', 'converged']
+            ignore.extend(
+                name for name in hook_methods
+                if not _has_overloaded_method(eqs[cls], name)
+            )
             src = code_gen.parse_instance(eqs[cls], ignore_methods=ignore)
             wrappers.append(src)
 
