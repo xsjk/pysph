@@ -542,10 +542,7 @@ def _cuda_supported_convergence_names_for_group(group):
 
 
 def _use_generated_fused_cuda_stage_backend():
-    if 'PYSPH_FUSED_CUDA_STAGE_BACKEND' not in os.environ:
-        return False
-    assert os.environ['PYSPH_FUSED_CUDA_STAGE_BACKEND'] == '1'
-    return True
+    return bool(getattr(get_config(), 'use_fused_cuda', False))
 
 
 def convert_to_float_if_needed(code):

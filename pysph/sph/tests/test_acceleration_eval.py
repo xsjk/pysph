@@ -1,5 +1,4 @@
 # Standard library imports.
-import os
 import unittest
 
 # Library imports.
@@ -263,15 +262,13 @@ class TestAccelerationEvalGPUHelperCodegen(unittest.TestCase):
         helper._setup_arrays_on_device = lambda: None
         helper._setup_calls = lambda: []
 
-        old_env = os.environ.get("PYSPH_FUSED_CUDA_STAGE_BACKEND")
-        os.environ["PYSPH_FUSED_CUDA_STAGE_BACKEND"] = "1"
+        config = get_config()
+        old_use_fused_cuda = getattr(config, "use_fused_cuda", False)
+        config.use_fused_cuda = True
         try:
             helper.setup_compiled_module(None)
         finally:
-            if old_env is None:
-                os.environ.pop("PYSPH_FUSED_CUDA_STAGE_BACKEND")
-            else:
-                os.environ["PYSPH_FUSED_CUDA_STAGE_BACKEND"] = old_env
+            config.use_fused_cuda = old_use_fused_cuda
 
         self.assertIsNotNone(helper.object.compiled.stage_backend)
 

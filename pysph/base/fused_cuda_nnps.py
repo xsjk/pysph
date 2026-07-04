@@ -1343,41 +1343,6 @@ def build_fused_cuda_hbucket_context_with_workspace(
     )
 
 
-def build_fused_cuda_hbucket_context_with_fixed_hmin(
-    x: object,
-    y: object,
-    z: object,
-    h: object,
-    n: int,
-    lower: np.ndarray,
-    upper: np.ndarray,
-    periodic: np.ndarray,
-    radius_scale: np.float32,
-    bucket_count: int,
-    stream: object,
-    workspace: FusedCudaNeighborWorkspace,
-    fixed_h_min: np.float32,
-) -> FusedCudaHBucketNeighborContext:
-    """Build h-bucket context from a caller-supplied conservative h-min."""
-    assert isinstance(fixed_h_min, np.float32)
-    assert fixed_h_min > np.float32(0.0)
-    return _build_fused_cuda_hbucket_context_from_hmin(
-        x,
-        y,
-        z,
-        h,
-        n,
-        lower,
-        upper,
-        periodic,
-        radius_scale,
-        bucket_count,
-        stream,
-        workspace,
-        fixed_h_min,
-    )
-
-
 def _build_fused_cuda_hbucket_context_from_hmin(
     x: object,
     y: object,

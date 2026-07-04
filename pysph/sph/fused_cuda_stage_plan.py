@@ -7,7 +7,6 @@ to execute without changing the existing GPU evaluator.
 
 import ast
 import inspect
-import os
 import textwrap
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -731,12 +730,6 @@ def _can_merge_pair_rate_head(left, right, future_stages):
         and left.sources == ()
         and not _stage_invalidates_neighbor_metadata(left)
         and not _stage_source_reads(right).intersection(_stage_dest_writes(left))
-        and (
-            not _hoist_source_visible_pair_windows()
-            or not _future_source_reads(future_stages).intersection(
-                _stage_dest_writes(left)
-            )
-        )
     )
 
 
@@ -963,31 +956,11 @@ def _stage_source_reads(stage):
     return frozenset(reads)
 
 
-def _future_source_reads(stages):
-    reads = set()
-    for stage in stages:
-        reads.update(_stage_source_reads(stage))
-    return frozenset(reads)
-
-
-def _hoist_source_visible_pair_windows():
-    if "PYSPH_FUSED_HOIST_SOURCE_VISIBLE_PAIR_WINDOWS" not in os.environ:
-        return False
-    assert os.environ["PYSPH_FUSED_HOIST_SOURCE_VISIBLE_PAIR_WINDOWS"] == "1"
-    return True
-
-
 def _coalesce_pair_segments():
-    if "PYSPH_FUSED_COALESCE_PAIR_SEGMENTS" not in os.environ:
-        return False
-    assert os.environ["PYSPH_FUSED_COALESCE_PAIR_SEGMENTS"] == "1"
     return True
 
 
 def _local_reduction_accumulators():
-    if "PYSPH_FUSED_LOCAL_REDUCTION_ACCUMULATORS" not in os.environ:
-        return False
-    assert os.environ["PYSPH_FUSED_LOCAL_REDUCTION_ACCUMULATORS"] == "1"
     return True
 
 

@@ -745,11 +745,10 @@ def test_stage_planner_merges_adjacent_pair_rates_without_source_visible_depende
 
     assert [stage.kind for stage in plan.stages] == [StageKind.PAIR_RATE]
     assert plan.stages[0].legacy_group_count == 2
-    assert len(plan.stages[0].method_segments) == 2
+    assert len(plan.stages[0].method_segments) == 1
 
 
-def test_stage_planner_coalesces_independent_pair_segments_when_enabled(monkeypatch):
-    monkeypatch.setenv("PYSPH_FUSED_COALESCE_PAIR_SEGMENTS", "1")
+def test_stage_planner_coalesces_independent_pair_segments_by_default():
     groups = [
         Group([RateEquation(dest="fluid", sources=["fluid"])]),
         Group([SourceIndependentPairEquation(dest="fluid", sources=["fluid"])]),
@@ -766,10 +765,7 @@ def test_stage_planner_coalesces_independent_pair_segments_when_enabled(monkeypa
     ]
 
 
-def test_stage_planner_keeps_segments_when_later_pair_reads_prior_post_loop(
-    monkeypatch,
-):
-    monkeypatch.setenv("PYSPH_FUSED_COALESCE_PAIR_SEGMENTS", "1")
+def test_stage_planner_keeps_segments_when_later_pair_reads_prior_post_loop():
     groups = [
         Group([PostProcessedPairEquation(dest="fluid", sources=["fluid"])]),
         Group([DestinationDiagnosticPairEquation(dest="fluid", sources=["fluid"])]),
@@ -781,8 +777,7 @@ def test_stage_planner_keeps_segments_when_later_pair_reads_prior_post_loop(
     assert len(plan.stages[0].method_segments) == 2
 
 
-def test_stage_planner_coalesces_ordered_post_loop_dependency(monkeypatch):
-    monkeypatch.setenv("PYSPH_FUSED_COALESCE_PAIR_SEGMENTS", "1")
+def test_stage_planner_coalesces_ordered_post_loop_dependency():
     groups = [
         Group([PostProcessedPairEquation(dest="fluid", sources=["fluid"])]),
         Group([LaterPostReadsEarlierPostPairEquation(dest="fluid", sources=["fluid"])]),
@@ -794,10 +789,7 @@ def test_stage_planner_coalesces_ordered_post_loop_dependency(monkeypatch):
     assert len(plan.stages[0].method_segments) == 1
 
 
-def test_stage_planner_hoists_right_pre_methods_when_coalescing_pair_segments(
-    monkeypatch,
-):
-    monkeypatch.setenv("PYSPH_FUSED_COALESCE_PAIR_SEGMENTS", "1")
+def test_stage_planner_hoists_right_pre_methods_when_coalescing_pair_segments():
     groups = [
         Group([PostProcessedPairEquation(dest="fluid", sources=["fluid"])]),
         Group([RateEquation(dest="fluid", sources=["fluid"])]),
@@ -818,26 +810,7 @@ def test_stage_planner_hoists_right_pre_methods_when_coalescing_pair_segments(
     ]
 
 
-def test_stage_planner_keeps_segments_for_shared_additive_accumulator_writes(
-    monkeypatch,
-):
-    monkeypatch.setenv("PYSPH_FUSED_COALESCE_PAIR_SEGMENTS", "1")
-    groups = [
-        Group([RateEquation(dest="fluid", sources=["fluid"])]),
-        Group([AccumulateEquation(dest="fluid", sources=["fluid"])]),
-    ]
-
-    plan = plan_equation_groups(groups, True, ())
-
-    assert [stage.kind for stage in plan.stages] == [StageKind.PAIR_RATE]
-    assert len(plan.stages[0].method_segments) == 2
-
-
-def test_stage_planner_coalesces_shared_additive_accumulators_with_local_reductions(
-    monkeypatch,
-):
-    monkeypatch.setenv("PYSPH_FUSED_COALESCE_PAIR_SEGMENTS", "1")
-    monkeypatch.setenv("PYSPH_FUSED_LOCAL_REDUCTION_ACCUMULATORS", "1")
+def test_stage_planner_keeps_segments_for_shared_additive_accumulator_writes():
     groups = [
         Group([RateEquation(dest="fluid", sources=["fluid"])]),
         Group([AccumulateEquation(dest="fluid", sources=["fluid"])]),
@@ -849,11 +822,19 @@ def test_stage_planner_coalesces_shared_additive_accumulators_with_local_reducti
     assert len(plan.stages[0].method_segments) == 1
 
 
-def test_stage_planner_keeps_segments_when_pair_loop_mutates_precompute(
-    monkeypatch,
-):
-    monkeypatch.setenv("PYSPH_FUSED_COALESCE_PAIR_SEGMENTS", "1")
-    monkeypatch.setenv("PYSPH_FUSED_LOCAL_REDUCTION_ACCUMULATORS", "1")
+def test_stage_planner_coalesces_shared_additive_accumulators_with_local_reductions():
+    groups = [
+        Group([RateEquation(dest="fluid", sources=["fluid"])]),
+        Group([AccumulateEquation(dest="fluid", sources=["fluid"])]),
+    ]
+
+    plan = plan_equation_groups(groups, True, ())
+
+    assert [stage.kind for stage in plan.stages] == [StageKind.PAIR_RATE]
+    assert len(plan.stages[0].method_segments) == 1
+
+
+def test_stage_planner_keeps_segments_when_pair_loop_mutates_precompute():
     groups = [
         Group([MutatesPrecomputedXijEquation(dest="fluid", sources=["fluid"])]),
         Group([ReadsPrecomputedXijEquation(dest="fluid", sources=["fluid"])]),
@@ -865,10 +846,7 @@ def test_stage_planner_keeps_segments_when_pair_loop_mutates_precompute(
     assert len(plan.stages[0].method_segments) == 2
 
 
-def test_stage_planner_keeps_segments_for_non_reduction_shared_write(
-    monkeypatch,
-):
-    monkeypatch.setenv("PYSPH_FUSED_COALESCE_PAIR_SEGMENTS", "1")
+def test_stage_planner_keeps_segments_for_non_reduction_shared_write():
     groups = [
         Group([OverwritePairEquation(dest="fluid", sources=["fluid"])]),
         Group([AccumulateEquation(dest="fluid", sources=["fluid"])]),
@@ -878,37 +856,6 @@ def test_stage_planner_keeps_segments_for_non_reduction_shared_write(
 
     assert [stage.kind for stage in plan.stages] == [StageKind.PAIR_RATE]
     assert len(plan.stages[0].method_segments) == 2
-
-
-def test_stage_planner_keeps_future_source_visible_pointwise_head_out_of_pair_stage(
-    monkeypatch,
-):
-    monkeypatch.setenv("PYSPH_FUSED_HOIST_SOURCE_VISIBLE_PAIR_WINDOWS", "1")
-    groups = [
-        Group([EosEquation(dest="fluid", sources=None)]),
-        Group([SourceIndependentPairEquation(dest="fluid", sources=["fluid"])]),
-        Group([SourcePressureReadEquation(dest="fluid", sources=["fluid"])]),
-    ]
-
-    plan = plan_equation_groups(groups, True, ())
-
-    assert [stage.kind for stage in plan.stages] == [
-        StageKind.POINTWISE,
-        StageKind.PAIR_RATE,
-    ]
-    assert [
-        (method.equation_name, method.method_kind) for method in plan.stages[0].methods
-    ] == [
-        ("EosEquation", MethodKind.LOOP),
-    ]
-    assert [
-        (method.equation_name, method.method_kind) for method in plan.stages[1].methods
-    ] == [
-        ("SourceIndependentPairEquation", MethodKind.LOOP),
-        ("SourcePressureReadEquation", MethodKind.LOOP),
-    ]
-    assert len(plan.stages[1].method_segments) == 2
-
 
 def test_stage_planner_keeps_adjacent_pair_rates_when_next_reads_written_source_field():
     groups = [

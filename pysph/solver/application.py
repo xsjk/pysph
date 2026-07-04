@@ -453,6 +453,15 @@ class Application(object):
             help="Use CUDA to run the simulation."
         )
 
+        # --fused
+        parser.add_argument(
+            "--fused",
+            action="store_true",
+            dest="with_fused_cuda",
+            default=False,
+            help="Use the generated fused CUDA stage backend."
+        )
+
         # --use-local-memory
         parser.add_argument(
             "--use-local-memory",
@@ -506,9 +515,10 @@ class Application(object):
             dest="nnps",
             choices=[
                 'box', 'll', 'sh', 'esh', 'ci', 'sfc', 'comp_tree',
-                'strat_hash', 'strat_sfc', 'tree', 'gpu_octree'
+                'strat_hash', 'strat_sfc', 'tree', 'gpu_octree',
+                'hbucket'
             ],
-            default='ll',
+            default=None,
             help="Use one of box-sort ('box') or "
             "the linked list algorithm ('ll') or "
             "the spatial hash algorithm ('sh') or "
@@ -519,7 +529,8 @@ class Application(object):
             "the stratified sfc algorithm ('strat_sfc') or "
             "the octree algorithm ('tree') or "
             "the compressed octree algorithm ('comp_tree') or "
-            "the gpu octree algorithm ('gpu_octree')")
+            "the gpu octree algorithm ('gpu_octree') or "
+            "the fused CUDA hashed bucket algorithm ('hbucket')")
 
         nnps_options.add_argument(
             "--spatial-hash-sub-factor",
@@ -763,11 +774,25 @@ class Application(object):
         else:
             options = self.arg_parse.parse_args(self.args)
 
+        self._validate_command_line_options(options)
+
         if options.profile:
             # Remove the default callback from compyle.
             atexit.unregister(print_profile)
 
         self.options = options
+
+    def _validate_command_line_options(self, options):
+        if options.nnps is None:
+            options.nnps = 'hbucket' if options.with_fused_cuda else 'll'
+        if options.with_fused_cuda and not options.with_cuda:
+            self.arg_parse.error("--fused requires --cuda")
+        if options.with_fused_cuda and options.with_opencl:
+            self.arg_parse.error("--fused cannot be used with --opencl")
+        if options.with_fused_cuda and options.nnps != 'hbucket':
+            self.arg_parse.error("--fused requires --nnps hbucket")
+        if options.nnps == 'hbucket' and not options.with_fused_cuda:
+            self.arg_parse.error("--nnps hbucket requires --cuda --fused")
 
     def _process_command_line(self):
         """Process the parsed command line arguments.
@@ -936,6 +961,7 @@ class Application(object):
         elif options.with_cuda:
             config.use_cuda = True
             logger.info('Using CUDA')
+        config.use_fused_cuda = bool(options.with_fused_cuda)
 
         if options.with_local_memory:
             leaf_size = int(options.octree_leaf_size)

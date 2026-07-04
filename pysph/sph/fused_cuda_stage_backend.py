@@ -5,57 +5,37 @@ import ctypes
 import ctypes.util
 import inspect
 import os
-import shlex
 
 import numpy as np
 
 from pysph.base.fused_cuda_nnps import (
     FusedCudaNeighborWorkspace,
-    build_fused_cuda_hbucket_context_with_fixed_hmin,
     build_fused_cuda_hbucket_context_with_workspace,
-    build_fused_cuda_context_with_workspace,
-    cell_counts_from_cell_size,
     create_fused_cuda_convergence_flag,
     read_fused_cuda_convergence_flag,
-    reduce_min_float,
     reset_fused_cuda_convergence_flag,
     wrap_periodic_xyz,
 )
 from pysph.sph.fused_cuda_codegen import (
     CudaPairPrecompute,
     cubic_spline_pair_precompute_for_symbols,
-    generate_cluster_pair_stage_outline_from_equations,
-    generate_cluster_pair_stage_outline_from_equations_with_convergence_flag,
-    generate_direct_pair_stage_outline_from_equations,
-    generate_direct_pair_stage_outline_from_equations_with_convergence_flag,
-    generate_hbucket_old_state_pair_stage_outline_from_equations,
     generate_hbucket_pair_stage_outline_from_equations,
     generate_hbucket_pair_stage_outline_from_equations_with_convergence_flag,
-    generate_hbucket_source_parallel_pair_stage_outline_from_equations,
     generate_hbucket_source_inline_pair_window_outline_from_equations,
-    hbucket_old_state_pair_stage_argument_names,
     hbucket_source_inline_pair_window_argument_names,
     PairLaunchConfig,
     generate_pointwise_stage_outline_from_equations,
     generate_resident_hbucket_pair_window_outline_from_equations,
-    generate_source_parallel_pair_stage_outline_from_equations,
-    launch_cluster_pair_kernel_with_context,
-    launch_direct_pair_kernel_with_context,
     launch_hbucket_pair_kernel_with_context,
-    launch_hbucket_source_parallel_pair_kernel_with_context,
     launch_pointwise_kernel,
-    launch_source_parallel_pair_kernel_with_context,
-    pair_traversal_mode,
     precompute_argument_names,
     quintic_spline_pair_precompute_for_symbols,
     _kernel_arg,
-    _pair_cluster_size,
     _pair_block_size_for_count,
 )
 from pysph.sph.fused_cuda_stage_plan import (
     MethodKind,
     StageKind,
-    analyze_pair_reduction_stage,
     cooperative_grid_sync_windows,
     resident_rhs_windows,
     source_visible_inline_precompute_windows,
@@ -189,15 +169,6 @@ class FusedCudaStageBackend:
     def _launch_cooperative_grid_sync_window(
         self, evaluator, stage_indices, extra_args
     ):
-        if _hoist_source_visible_pair_windows():
-            hoisted_stages = _hoisted_source_visible_pair_window_stages(
-                self.helper.cuda_stage_plan, stage_indices
-            )
-            if hoisted_stages:
-                info = self._kernel_info_for_plan_stage_index(stage_indices[0])
-                for stage in hoisted_stages:
-                    self._launch_stage(evaluator, stage, info, extra_args)
-                return
         for stage_index in stage_indices:
             info = self._kernel_info_for_plan_stage_index(stage_index)
             stage = self.helper.cuda_stage_plan.stages[stage_index]
@@ -330,7 +301,6 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
         self.device_convergence_uses_particle_flag = False
         self.launch_count = 0
         self.h_reduce_scratch = []
-        self.hbucket_first_hmins = {}
         self.traversal_launch_counts = {}
         self.pair_launch_config_counts = {}
         self.stage_timing_ms = {}
@@ -338,28 +308,17 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
         self.cooperative_modules = {}
         self.cooperative_outlines = {}
         self.cooperative_extra_arg_names = {}
-        self.old_source_snapshots = {}
 
     def begin_compute(self, evaluator, t, dt):
         super().begin_compute(evaluator, t, dt)
         self.neighbor_contexts = {}
 
     def _launch_stage(self, evaluator, stage, info, extra_args):
-        launch_segments = _launch_segments_for_stage(stage)
-        if len(launch_segments) > 1:
-            for launch_stage in launch_segments:
-                self._launch_single_stage(evaluator, launch_stage, info, extra_args)
-            return
         self._launch_single_stage(evaluator, stage, info, extra_args)
 
     def _launch_cooperative_grid_sync_window(
         self, evaluator, stage_indices, extra_args
     ):
-        if self._can_launch_hbucket_old_state_pair_window(stage_indices):
-            self._launch_hbucket_old_state_pair_window(
-                evaluator, stage_indices, extra_args
-            )
-            return
         if self._can_launch_resident_hbucket_pair_window(
             stage_indices
         ) and self._resident_grid_sync_window_allowed(evaluator, stage_indices):
@@ -372,19 +331,12 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
                 evaluator, stage_indices, extra_args
             )
             return
-        if self._can_split_hbucket_source_inline_pair_window(stage_indices):
-            self._launch_split_hbucket_source_inline_pair_window(
-                evaluator, stage_indices, extra_args
-            )
-            return
         super()._launch_cooperative_grid_sync_window(
             evaluator, stage_indices, extra_args
         )
 
     def _can_launch_resident_hbucket_pair_window(self, stage_indices):
         if not _resident_grid_sync_pair_windows():
-            return False
-        if pair_traversal_mode() != "hbucket":
             return False
         if len(stage_indices) < 2:
             return False
@@ -406,155 +358,11 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
         context = self._neighbor_context_for_stage(evaluator, info)
         return _resident_grid_sync_context_allowed(context)
 
-    def _can_launch_hbucket_old_state_pair_window(self, stage_indices):
-        if not _old_state_single_pass_windows():
-            return False
-        if pair_traversal_mode() != "hbucket":
-            return False
-        return bool(
-            _hbucket_old_state_pair_window_methods(
-                self.helper.cuda_stage_plan, stage_indices
-            )
-        )
-
-    def _launch_hbucket_old_state_pair_window(
-        self, evaluator, stage_indices, extra_args
-    ):
-        prelude_methods, old_state_methods, old_state_fields = (
-            _hbucket_old_state_pair_window_methods(
-                self.helper.cuda_stage_plan, stage_indices
-            )
-        )
-        stages = tuple(
-            self.helper.cuda_stage_plan.stages[index] for index in stage_indices
-        )
-        infos = tuple(
-            self._kernel_info_for_plan_stage_index(index) for index in stage_indices
-        )
-        prelude_stage, pair_stages = _hbucket_old_state_pair_window_stages(
-            stages, prelude_methods
-        )
-        self._launch_stage(evaluator, prelude_stage, infos[0], extra_args)
-        equations_by_stage = tuple(
-            _equations_for_stage(self.helper, stage, info["stage_group"])
-            for stage, info in zip(pair_stages, infos)
-        )
-        window_stage = _hbucket_old_state_pair_window_stage(pair_stages)
-        precompute = _precompute_for_stage(window_stage, self.helper.object.kernel)
-        outline = self._outline_for_hbucket_old_state_pair_stage(
-            pair_stages,
-            equations_by_stage,
-            precompute,
-            old_state_methods,
-            old_state_fields,
-        )
-        module = self._module_for_stage(outline, infos[0], window_stage)
-        stage_args = self._hbucket_old_state_pair_stage_extra_args(
-            pair_stages,
-            equations_by_stage,
-            infos,
-            extra_args,
-            precompute,
-            old_state_methods,
-            old_state_fields,
-        )
-        context = self._neighbor_context_for_stage(evaluator, infos[0])
-        timer = _stage_timer(self.stream)
-        launch_config = launch_hbucket_pair_kernel_with_context(
-            module, outline.name, context, stage_args
-        )
-        if launch_config is not None:
-            launch_config = PairLaunchConfig(
-                traversal="hbucket_old_state",
-                n=launch_config.n,
-                block_size=launch_config.block_size,
-                grid_x=launch_config.grid_x,
-            )
-        self._record_pair_traversal_launch("hbucket_old_state")
-        self._record_pair_launch_config(launch_config)
-        for stage in pair_stages:
-            self._finish_launched_stage(stage)
-        self._record_stage_timing(window_stage, "hbucket_old_state", timer)
-        self.launch_count += 1
-
-    def _outline_for_hbucket_old_state_pair_stage(
-        self,
-        stages,
-        equations_by_stage,
-        precompute,
-        old_state_methods,
-        old_state_fields,
-    ):
-        outline_key = _hbucket_old_state_pair_window_key(
-            stages, precompute, (), old_state_methods, old_state_fields
-        )
-        if outline_key in self.outlines:
-            return self.outlines[outline_key]
-        outline = generate_hbucket_old_state_pair_stage_outline_from_equations(
-            "cuda_eval",
-            stages,
-            equations_by_stage,
-            precompute,
-            old_state_methods,
-            old_state_fields,
-        )
-        self.outlines[outline_key] = outline
-        return outline
-
-    def _hbucket_old_state_pair_stage_extra_args(
-        self,
-        stages,
-        equations_by_stage,
-        infos,
-        extra_args,
-        precompute,
-        old_state_methods,
-        old_state_fields,
-    ):
-        names_key = _hbucket_old_state_pair_window_key(
-            stages, precompute, (), old_state_methods, old_state_fields
-        )
-        if names_key not in self.cooperative_extra_arg_names:
-            self.cooperative_extra_arg_names[names_key] = (
-                _hbucket_old_state_pair_stage_extra_arg_names(
-                    stages,
-                    equations_by_stage,
-                    precompute,
-                    old_state_methods,
-                    old_state_fields,
-                )
-            )
-        old_state_values = self._old_state_snapshot_values(infos[0], old_state_fields)
-        return _extra_args_from_names_with_values(
-            self.helper,
-            self.cooperative_extra_arg_names[names_key],
-            infos[-1],
-            extra_args,
-            old_state_values,
-        )
-
     def _can_launch_hbucket_source_inline_pair_window(self, stage_indices):
         if not _source_inline_pair_windows():
             return False
-        if pair_traversal_mode() != "hbucket":
-            return False
         return bool(
             _source_inline_pair_window_methods(
-                self.helper.cuda_stage_plan, stage_indices
-            )
-        )
-
-    def _can_split_hbucket_source_inline_pair_window(self, stage_indices):
-        if not _source_inline_pair_windows():
-            return False
-        if not _source_inline_split_windows():
-            return False
-        if _source_inline_old_source_snapshots():
-            return False
-        if pair_traversal_mode() != "hbucket":
-            return False
-        return bool(
-            _split_source_inline_pair_window_stages(
                 self.helper.cuda_stage_plan, stage_indices
             )
         )
@@ -571,39 +379,12 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
         inline_methods = _source_inline_pair_window_methods(
             self.helper.cuda_stage_plan, stage_indices
         )
-        old_source_fields = _source_inline_pair_window_old_source_fields(
-            self.helper.cuda_stage_plan, stage_indices
-        )
         self._launch_hbucket_source_inline_pair_window_for_stages(
-            evaluator, stages, infos, extra_args, inline_methods, old_source_fields
-        )
-
-    def _launch_split_hbucket_source_inline_pair_window(
-        self, evaluator, stage_indices, extra_args
-    ):
-        prefix_stage, inline_stage, right_stage = (
-            _split_source_inline_pair_window_stages(
-                self.helper.cuda_stage_plan, stage_indices
-            )
-        )
-        inline_methods = _source_inline_pair_window_candidate_methods(
-            self.helper.cuda_stage_plan, stage_indices
-        )
-        infos = tuple(
-            self._kernel_info_for_plan_stage_index(index) for index in stage_indices
-        )
-        self._launch_stage(evaluator, prefix_stage, infos[0], extra_args)
-        self._launch_hbucket_source_inline_pair_window_for_stages(
-            evaluator,
-            (inline_stage, right_stage),
-            infos,
-            extra_args,
-            inline_methods,
-            (),
+            evaluator, stages, infos, extra_args, inline_methods
         )
 
     def _launch_hbucket_source_inline_pair_window_for_stages(
-        self, evaluator, stages, infos, extra_args, inline_methods, old_source_fields
+        self, evaluator, stages, infos, extra_args, inline_methods
     ):
         window_stage = _resident_hbucket_pair_window_stage(stages)
         equations_by_stage = tuple(
@@ -614,7 +395,7 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
             _precompute_for_stage(stage, self.helper.object.kernel) for stage in stages
         )
         outline = self._outline_for_hbucket_source_inline_pair_window(
-            stages, equations_by_stage, precomputes, inline_methods, old_source_fields
+            stages, equations_by_stage, precomputes, inline_methods
         )
         module = self._module_for_stage(outline, infos[0], window_stage)
         stage_args = self._hbucket_source_inline_pair_window_extra_args(
@@ -624,7 +405,6 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
             extra_args,
             precomputes,
             inline_methods,
-            old_source_fields,
         )
         context = self._neighbor_context_for_stage(evaluator, infos[0])
         timer = _stage_timer(self.stream)
@@ -638,7 +418,7 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
                 block_size=launch_config.block_size,
                 grid_x=launch_config.grid_x,
             )
-        self._record_pair_traversal_launch("hbucket_source_inline")
+        self._record_pair_launch("hbucket_source_inline")
         self._record_pair_launch_config(launch_config)
         for stage in stages:
             self._finish_launched_stage(stage)
@@ -646,10 +426,10 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
         self.launch_count += 1
 
     def _outline_for_hbucket_source_inline_pair_window(
-        self, stages, equations_by_stage, precomputes, inline_methods, old_source_fields
+        self, stages, equations_by_stage, precomputes, inline_methods
     ):
         outline_key = _hbucket_source_inline_pair_window_key(
-            stages, precomputes, inline_methods, old_source_fields
+            stages, precomputes, inline_methods
         )
         if outline_key in self.cooperative_outlines:
             return self.cooperative_outlines[outline_key]
@@ -659,7 +439,6 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
             equations_by_stage,
             precomputes,
             inline_methods,
-            old_source_fields,
         )
         self.cooperative_outlines[outline_key] = outline
         return outline
@@ -672,10 +451,9 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
         extra_args,
         precomputes,
         inline_methods,
-        old_source_fields,
     ):
         names_key = _hbucket_source_inline_pair_window_key(
-            stages, precomputes, inline_methods, old_source_fields
+            stages, precomputes, inline_methods
         )
         if names_key not in self.cooperative_extra_arg_names:
             self.cooperative_extra_arg_names[names_key] = (
@@ -684,54 +462,14 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
                     equations_by_stage,
                     precomputes,
                     inline_methods,
-                    old_source_fields,
                 )
             )
-        old_source_values = {}
-        if old_source_fields:
-            old_source_values = self._old_source_snapshot_values(
-                infos[0], old_source_fields
-            )
-        return _extra_args_from_names_with_values(
+        return _extra_args_from_names(
             self.helper,
             self.cooperative_extra_arg_names[names_key],
             infos[-1],
             extra_args,
-            old_source_values,
         )
-
-    def _old_source_snapshot_values(self, info, fields):
-        values = {}
-        for field in fields:
-            values[f"s_old_{field}"] = self._old_source_snapshot_for_field(info, field)
-        return values
-
-    def _old_state_snapshot_values(self, info, fields):
-        values = {}
-        for field in fields:
-            snapshot = self._old_source_snapshot_for_field(info, field)
-            values[f"d_old_{field}"] = snapshot
-            values[f"s_old_{field}"] = snapshot
-        return values
-
-    def _old_source_snapshot_for_field(self, info, field):
-        source_array = getattr(info["src"].gpu, field).dev
-        key = (id(info["src"]), field)
-        if key not in self.old_source_snapshots:
-            self.old_source_snapshots[key] = _empty_gpu_array_like(source_array)
-        snapshot = self.old_source_snapshots[key]
-        if snapshot.shape != source_array.shape or snapshot.dtype != source_array.dtype:
-            snapshot = _empty_gpu_array_like(source_array)
-            self.old_source_snapshots[key] = snapshot
-        import pycuda.driver as cuda
-
-        cuda.memcpy_dtod_async(
-            snapshot.gpudata,
-            source_array.gpudata,
-            source_array.nbytes,
-            self.stream,
-        )
-        return snapshot
 
     def _launch_resident_hbucket_pair_window(
         self, evaluator, stage_indices, extra_args
@@ -768,7 +506,7 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
             stage_args,
             self.stream,
         )
-        self._record_pair_traversal_launch("resident_hbucket")
+        self._record_pair_launch("resident_hbucket")
         self._record_pair_launch_config(launch_config)
         for stage in stages:
             self._finish_launched_stage(stage)
@@ -824,30 +562,11 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
         traversal = "pointwise"
         if stage.kind in (StageKind.PAIR_DENSITY, StageKind.PAIR_RATE):
             context = self._neighbor_context_for_stage(evaluator, info)
-            traversal = _pair_traversal_for_stage(stage, equations, convergence_field)
-            self._record_pair_traversal_launch(traversal)
-            launch_config = None
-            if traversal == "cluster":
-                launch_config = launch_cluster_pair_kernel_with_context(
-                    module, outline.name, context, stage_args
-                )
-            elif traversal == "hbucket":
-                launch_config = launch_hbucket_pair_kernel_with_context(
-                    module, outline.name, context, stage_args
-                )
-            elif traversal == "hbucket_source_parallel":
-                launch_config = launch_hbucket_source_parallel_pair_kernel_with_context(
-                    module, outline.name, context, stage_args
-                )
-            elif traversal == "source_parallel":
-                launch_config = launch_source_parallel_pair_kernel_with_context(
-                    module, outline.name, context, stage_args
-                )
-            else:
-                assert traversal == "direct"
-                launch_config = launch_direct_pair_kernel_with_context(
-                    module, outline.name, context, stage_args
-                )
+            traversal = "hbucket"
+            self._record_pair_launch(traversal)
+            launch_config = launch_hbucket_pair_kernel_with_context(
+                module, outline.name, context, stage_args
+            )
             self._record_pair_launch_config(launch_config)
         elif _stage_can_use_pointwise_kernel(stage):
             n = info["dest"].get_number_of_particles(True)
@@ -858,7 +577,7 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
         self._record_stage_timing(stage, traversal, timer)
         self.launch_count += 1
 
-    def _record_pair_traversal_launch(self, traversal):
+    def _record_pair_launch(self, traversal):
         if traversal not in self.traversal_launch_counts:
             self.traversal_launch_counts[traversal] = 0
         self.traversal_launch_counts[traversal] += 1
@@ -898,45 +617,13 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
         key = _neighbor_context_key(info)
         if key not in self.neighbor_workspaces:
             self.neighbor_workspaces[key] = FusedCudaNeighborWorkspace()
-        traversal_mode = pair_traversal_mode()
-        if (
-            traversal_mode
-            in (
-                "hbucket",
-                "hbucket_source_parallel",
-            )
-            and _hbucket_uses_first_hmin()
-        ):
-            return _hbucket_neighbor_context_for_info(
-                evaluator,
-                info,
-                self.stream,
-                self.neighbor_workspaces[key],
-                self._first_hbucket_hmin_for_info(info, key),
-            )
         return _neighbor_context_for_info(
             evaluator,
             info,
             self.stream,
             self.h_reduce_scratch,
             self.neighbor_workspaces[key],
-            traversal_mode,
         )
-
-    def _first_hbucket_hmin_for_info(self, info, key):
-        if key not in self.hbucket_first_hmins:
-            dest = info["dest"]
-            nreal = dest.get_number_of_particles(True)
-            first_hmin = reduce_min_float(
-                dest.gpu.h.dev,
-                nreal,
-                self.stream,
-                self.h_reduce_scratch,
-            )
-            self.hbucket_first_hmins[key] = np.float32(
-                first_hmin * _hbucket_fixed_hmin_scale()
-            )
-        return self.hbucket_first_hmins[key]
 
     def handle_update_domain(self, integrator):
         manager = integrator.nnps.domain.manager
@@ -1039,7 +726,7 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
 
     def _outline_for_stage(self, stage, equations, precompute, info, convergence_field):
         stage_group = info["stage_group"]
-        traversal = _pair_traversal_for_stage(stage, equations, convergence_field)
+        traversal = "hbucket"
         outline_key = (
             stage_group,
             stage.kind.value,
@@ -1053,47 +740,15 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
         if outline_key in self.outlines:
             return self.outlines[outline_key]
         if stage.kind in (StageKind.PAIR_DENSITY, StageKind.PAIR_RATE):
-            if traversal == "cluster":
-                if convergence_field is None:
-                    outline = generate_cluster_pair_stage_outline_from_equations(
-                        "cuda_eval", stage, equations, precompute
-                    )
-                else:
-                    outline = generate_cluster_pair_stage_outline_from_equations_with_convergence_flag(
-                        "cuda_eval", stage, equations, precompute, convergence_field
-                    )
-            elif traversal == "hbucket":
-                if convergence_field is None:
-                    outline = generate_hbucket_pair_stage_outline_from_equations(
-                        "cuda_eval", stage, equations, precompute
-                    )
-                else:
-                    outline = generate_hbucket_pair_stage_outline_from_equations_with_convergence_flag(
-                        "cuda_eval", stage, equations, precompute, convergence_field
-                    )
-            elif traversal == "hbucket_source_parallel":
-                assert convergence_field is None
-                outline = (
-                    generate_hbucket_source_parallel_pair_stage_outline_from_equations(
-                        "cuda_eval", stage, equations, precompute
-                    )
+            if convergence_field is None:
+                outline = generate_hbucket_pair_stage_outline_from_equations(
+                    "cuda_eval", stage, equations, precompute
                 )
-            elif convergence_field is None:
-                if traversal == "source_parallel":
-                    outline = (
-                        generate_source_parallel_pair_stage_outline_from_equations(
-                            "cuda_eval", stage, equations, precompute
-                        )
-                    )
-                else:
-                    assert traversal == "direct"
-                    outline = generate_direct_pair_stage_outline_from_equations(
-                        "cuda_eval", stage, equations, precompute
-                    )
             else:
-                assert traversal == "direct"
-                outline = generate_direct_pair_stage_outline_from_equations_with_convergence_flag(
-                    "cuda_eval", stage, equations, precompute, convergence_field
+                outline = (
+                    generate_hbucket_pair_stage_outline_from_equations_with_convergence_flag(
+                        "cuda_eval", stage, equations, precompute, convergence_field
+                    )
                 )
         elif _stage_can_use_pointwise_kernel(stage):
             outline = generate_pointwise_stage_outline_from_equations(
@@ -1169,24 +824,6 @@ def _has_device_convergence(helper):
     )
 
 
-def _launch_segments_for_stage(stage):
-    if not _split_pair_segments():
-        return (stage,)
-    if stage.kind not in (StageKind.PAIR_DENSITY, StageKind.PAIR_RATE):
-        return (stage,)
-    if len(stage.method_segments) <= 1:
-        return (stage,)
-    return tuple(
-        replace(
-            stage,
-            methods=segment,
-            method_segments=(),
-            reason=f"{stage.reason} segment {index}",
-        )
-        for index, segment in enumerate(stage.method_segments)
-    )
-
-
 def _resident_window_mapping(helper, stage_group_by_plan_index):
     window_by_group = {}
     covered_groups = set()
@@ -1237,137 +874,6 @@ def _source_visible_inline_precompute_window_mapping(helper, stage_group_by_plan
     return window_by_stage_index, covered_stage_indices
 
 
-def _hoisted_source_visible_pair_window_stages(plan, stage_indices):
-    if len(stage_indices) != 2:
-        return ()
-    left = plan.stages[stage_indices[0]]
-    right = plan.stages[stage_indices[1]]
-    if left.kind is not StageKind.PAIR_RATE or right.kind is not StageKind.PAIR_RATE:
-        return ()
-    source_visible_fields = _methods_source_reads(right.methods).intersection(
-        _methods_dest_writes(left.methods)
-    )
-    if not source_visible_fields:
-        return ()
-    hoisted_methods = []
-    remaining_left_methods = []
-    for method in left.methods:
-        if method.dest_writes.intersection(source_visible_fields):
-            if not _method_can_hoist_to_pointwise(method):
-                return ()
-            hoisted_methods.append(method)
-        else:
-            remaining_left_methods.append(method)
-    if not hoisted_methods:
-        return ()
-    if not source_visible_fields.issubset(_methods_dest_writes(hoisted_methods)):
-        return ()
-    remaining_left_writes = _methods_dest_writes(remaining_left_methods)
-    if _methods_dest_reads(hoisted_methods).intersection(remaining_left_writes):
-        return ()
-    if _methods_source_reads(right.methods).intersection(remaining_left_writes):
-        return ()
-    if _methods_source_reads(remaining_left_methods).intersection(
-        _methods_dest_writes(right.methods)
-    ):
-        return ()
-    pointwise_stage = replace(
-        left,
-        kind=StageKind.POINTWISE,
-        sources=(),
-        methods=tuple(hoisted_methods),
-        reason=f"{left.reason} hoisted source-visible prep",
-        legacy_group_count=0,
-        method_segments=(),
-    )
-    pair_segments = []
-    if remaining_left_methods:
-        pair_segments.append(tuple(remaining_left_methods))
-    pair_segments.append(right.methods)
-    pair_stage = replace(
-        left,
-        methods=tuple(remaining_left_methods) + right.methods,
-        reason=f"{left.reason} hoisted pair body; {right.reason}",
-        legacy_group_count=left.legacy_group_count + right.legacy_group_count,
-        method_segments=tuple(pair_segments),
-    )
-    return (pointwise_stage, pair_stage)
-
-
-def _hbucket_old_state_pair_window_methods(plan, stage_indices):
-    if len(stage_indices) != 2:
-        return ()
-    left = plan.stages[stage_indices[0]]
-    right = plan.stages[stage_indices[1]]
-    if left.kind is not StageKind.PAIR_RATE or right.kind is not StageKind.PAIR_RATE:
-        return ()
-    if left.dest != right.dest or left.sources != right.sources:
-        return ()
-    if left.sources != (left.dest,):
-        return ()
-    right_reads = set(_methods_dest_reads(right.methods))
-    right_reads.update(_methods_source_reads_with_precompute(right.methods))
-    source_visible_fields = frozenset(right_reads).intersection(
-        _methods_dest_writes(left.methods)
-    )
-    if not source_visible_fields:
-        return ()
-    right_writes = _methods_dest_writes(right.methods)
-    prelude_methods = _old_state_pair_window_prelude_methods(left.methods)
-    if not source_visible_fields.issubset(_methods_dest_writes(prelude_methods)):
-        return ()
-    old_state_methods = []
-    old_state_fields = []
-    for method in left.methods:
-        if method in prelude_methods:
-            continue
-        method_reads = set(method.dest_reads)
-        method_reads.update(_methods_source_reads_with_precompute((method,)))
-        active_fields = frozenset(method_reads).intersection(right_writes)
-        if not active_fields:
-            continue
-        if not (method.sources and method.method_kind is MethodKind.LOOP):
-            return ()
-        old_state_methods.append(method)
-        for field in sorted(active_fields):
-            _append_once(old_state_fields, field)
-    if not old_state_methods:
-        return ()
-    remaining_left_methods = tuple(
-        method for method in left.methods if method not in prelude_methods
-    )
-    remaining_writes = _methods_dest_writes(remaining_left_methods)
-    if (
-        frozenset(right_reads)
-        .intersection(remaining_writes)
-        .difference(old_state_fields)
-    ):
-        return ()
-    return (prelude_methods, tuple(old_state_methods), tuple(old_state_fields))
-
-
-def _old_state_pair_window_prelude_methods(methods):
-    pair_loop_writes = _methods_dest_writes(
-        tuple(method for method in methods if _is_pair_loop_method_dep(method))
-    )
-    post_dependency_fields = set(pair_loop_writes)
-    prelude_methods = []
-    for method in methods:
-        if method.sources:
-            continue
-        if not _method_can_source_inline(method):
-            continue
-        if method.dest_reads.intersection(post_dependency_fields):
-            post_dependency_fields.update(method.dest_writes)
-            continue
-        prelude_methods.append(method)
-    return tuple(prelude_methods)
-
-
-def _is_pair_loop_method_dep(method):
-    return bool(method.sources) and method.method_kind is MethodKind.LOOP
-
-
 def _source_inline_pair_window_methods(plan, stage_indices):
     inline_precompute = _source_visible_inline_precompute_window_for_indices(
         plan, stage_indices
@@ -1375,82 +881,9 @@ def _source_inline_pair_window_methods(plan, stage_indices):
     if inline_precompute is not None:
         return inline_precompute.producer_methods
     blockers = source_inline_pair_window_blockers(plan, stage_indices)
-    if blockers and not _source_inline_pair_window_blockers_are_snapshotable(blockers):
-        return ()
-    if blockers and not _source_inline_old_source_snapshots():
+    if blockers:
         return ()
     return _source_inline_pair_window_candidate_methods(plan, stage_indices)
-
-
-def _source_inline_pair_window_blockers_are_snapshotable(blockers):
-    return all(
-        blocker["reason"] == "remaining_left_source_reads_right_writes"
-        for blocker in blockers
-    )
-
-
-def _source_inline_pair_window_old_source_fields(plan, stage_indices):
-    if _source_visible_inline_precompute_window_for_indices(plan, stage_indices):
-        return ()
-    fields = []
-    for blocker in source_inline_pair_window_blockers(plan, stage_indices):
-        if blocker["reason"] == "remaining_left_source_reads_right_writes":
-            for field in blocker["fields"]:
-                if field not in fields:
-                    fields.append(field)
-    return tuple(fields)
-
-
-def _split_source_inline_pair_window_stages(plan, stage_indices):
-    if len(stage_indices) != 2:
-        return ()
-    blockers = source_inline_pair_window_blockers(plan, stage_indices)
-    if not blockers:
-        return ()
-    if not _source_inline_pair_window_blockers_are_snapshotable(blockers):
-        return ()
-    inline_methods = _source_inline_pair_window_candidate_methods(plan, stage_indices)
-    if not inline_methods:
-        return ()
-    left = plan.stages[stage_indices[0]]
-    right = plan.stages[stage_indices[1]]
-    prefix_methods = _old_source_reader_prefix_methods(left.methods, right.methods)
-    prelude_methods = tuple(
-        method for method in left.methods if method not in prefix_methods
-    )
-    if not _methods_include_pair_loop(prefix_methods):
-        return ()
-    if _methods_include_pair_loop(prelude_methods):
-        return ()
-    prelude_writes = _methods_dest_writes(prelude_methods)
-    if _methods_dest_reads(prefix_methods).intersection(prelude_writes):
-        return ()
-    if _methods_source_reads_with_precompute(prefix_methods).intersection(
-        prelude_writes
-    ):
-        return ()
-    if _methods_source_reads_with_precompute(prelude_methods):
-        return ()
-    inline_method_set = frozenset(inline_methods)
-    if not inline_method_set.issubset(frozenset(prelude_methods)):
-        return ()
-    prefix_stage = replace(
-        left,
-        methods=prefix_methods,
-        reason=f"{left.reason} source-inline prefix",
-        legacy_group_count=0,
-        method_segments=(prefix_methods,),
-    )
-    inline_stage = replace(
-        left,
-        kind=StageKind.POINTWISE,
-        sources=(),
-        methods=prelude_methods,
-        reason=f"{left.reason} source-inline producer",
-        legacy_group_count=0,
-        method_segments=(),
-    )
-    return (prefix_stage, inline_stage, right)
 
 
 def source_inline_pair_window_status(plan, stage_indices):
@@ -1474,16 +907,7 @@ def source_inline_pair_window_status(plan, stage_indices):
     ).intersection(_methods_dest_writes(left.methods))
     blockers = source_inline_pair_window_blockers(plan, stage_indices)
     inline_methods = _source_inline_pair_window_candidate_methods(plan, stage_indices)
-    if blockers and _source_inline_pair_window_blockers_are_snapshotable(blockers):
-        if _source_inline_old_source_snapshots():
-            status = "launchable_with_old_source_snapshots"
-        elif _source_inline_split_windows() and _split_source_inline_pair_window_stages(
-            plan, stage_indices
-        ):
-            status = "launchable_split"
-        else:
-            status = "blocked_old_source_snapshots_disabled"
-    elif blockers:
+    if blockers:
         status = "blocked"
     elif inline_methods:
         status = "launchable"
@@ -1623,41 +1047,6 @@ def _source_visible_inline_precompute_window_for_indices(plan, stage_indices):
     return None
 
 
-def _old_source_reader_prefix_methods(left_methods, right_methods):
-    right_writes = _methods_dest_writes(right_methods)
-    prefix_indices = set()
-    for index, method in enumerate(left_methods):
-        if _methods_source_reads_with_precompute((method,)).intersection(right_writes):
-            prefix_indices.add(index)
-    changed = True
-    while changed:
-        changed = False
-        for prefix_index in tuple(sorted(prefix_indices)):
-            required_fields = _method_dependency_reads(left_methods[prefix_index])
-            for index, method in enumerate(left_methods[:prefix_index]):
-                if index in prefix_indices:
-                    continue
-                if method.dest_writes.intersection(required_fields):
-                    prefix_indices.add(index)
-                    changed = True
-    return tuple(
-        method for index, method in enumerate(left_methods) if index in prefix_indices
-    )
-
-
-def _method_dependency_reads(method):
-    reads = set(method.dest_reads)
-    reads.update(method.source_reads)
-    reads.update(_methods_source_reads_with_precompute((method,)))
-    return frozenset(reads)
-
-
-def _methods_include_pair_loop(methods):
-    return any(
-        method.sources and method.method_kind is MethodKind.LOOP for method in methods
-    )
-
-
 def _source_inline_blocker(reason, fields):
     return {
         "reason": reason,
@@ -1790,100 +1179,18 @@ def _stage_timer(stream):
 
 
 def _source_module_options():
-    options = []
-    if "PYSPH_FUSED_CUDA_FAST_MATH" in os.environ:
-        assert os.environ["PYSPH_FUSED_CUDA_FAST_MATH"] == "1"
-        options.append("--use_fast_math")
-    if "PYSPH_FUSED_CUDA_NVCC_OPTIONS" in os.environ:
-        options.extend(shlex.split(os.environ["PYSPH_FUSED_CUDA_NVCC_OPTIONS"]))
-    return tuple(options)
+    return ("--use_fast_math",)
 
 
 def _assume_converged_after_min_iterations():
-    if "PYSPH_FUSED_ASSUME_CONVERGED_AFTER_MIN_ITERATIONS" not in os.environ:
-        return False
-    assert os.environ["PYSPH_FUSED_ASSUME_CONVERGED_AFTER_MIN_ITERATIONS"] == "1"
     return True
 
 
 def _hbucket_bucket_count():
-    if "PYSPH_FUSED_HBUCKET_BUCKET_COUNT" not in os.environ:
-        return 4
-    bucket_count = int(os.environ["PYSPH_FUSED_HBUCKET_BUCKET_COUNT"])
-    assert bucket_count in (1, 2, 4, 8, 16, 32)
-    return bucket_count
-
-
-def _hbucket_fixed_hmin(nnps):
-    if "PYSPH_FUSED_HBUCKET_FIXED_HMIN" not in os.environ:
-        return None
-    fixed_hmin = os.environ["PYSPH_FUSED_HBUCKET_FIXED_HMIN"]
-    if fixed_hmin == "first":
-        return None
-    if fixed_hmin == "domain_cell_size":
-        cell_size = np.float32(nnps.domain.manager.cell_size)
-        radius_scale = np.float32(nnps.radius_scale)
-        assert cell_size > np.float32(0.0)
-        assert radius_scale > np.float32(0.0)
-        return np.float32(cell_size / radius_scale)
-    value = np.float32(float(fixed_hmin))
-    assert value > np.float32(0.0)
-    return value
-
-
-def _hbucket_uses_first_hmin():
-    if "PYSPH_FUSED_HBUCKET_FIXED_HMIN" not in os.environ:
-        return False
-    return os.environ["PYSPH_FUSED_HBUCKET_FIXED_HMIN"] == "first"
-
-
-def _hbucket_fixed_hmin_scale():
-    if "PYSPH_FUSED_HBUCKET_FIXED_HMIN_SCALE" not in os.environ:
-        return np.float32(1.0)
-    scale = np.float32(float(os.environ["PYSPH_FUSED_HBUCKET_FIXED_HMIN_SCALE"]))
-    assert scale > np.float32(0.0)
-    return scale
-
-
-def _split_pair_segments():
-    if "PYSPH_FUSED_SPLIT_PAIR_SEGMENTS" not in os.environ:
-        return False
-    assert os.environ["PYSPH_FUSED_SPLIT_PAIR_SEGMENTS"] == "1"
-    return True
-
-
-def _hoist_source_visible_pair_windows():
-    if "PYSPH_FUSED_HOIST_SOURCE_VISIBLE_PAIR_WINDOWS" not in os.environ:
-        return False
-    assert os.environ["PYSPH_FUSED_HOIST_SOURCE_VISIBLE_PAIR_WINDOWS"] == "1"
-    return True
+    return 4
 
 
 def _source_inline_pair_windows():
-    if "PYSPH_FUSED_SOURCE_INLINE_PAIR_WINDOWS" not in os.environ:
-        return False
-    assert os.environ["PYSPH_FUSED_SOURCE_INLINE_PAIR_WINDOWS"] == "1"
-    return True
-
-
-def _source_inline_old_source_snapshots():
-    if "PYSPH_FUSED_SOURCE_INLINE_OLD_SOURCE_SNAPSHOTS" not in os.environ:
-        return False
-    assert os.environ["PYSPH_FUSED_SOURCE_INLINE_OLD_SOURCE_SNAPSHOTS"] == "1"
-    return True
-
-
-def _source_inline_split_windows():
-    if "PYSPH_FUSED_SOURCE_INLINE_SPLIT_WINDOWS" not in os.environ:
-        return False
-    assert os.environ["PYSPH_FUSED_SOURCE_INLINE_SPLIT_WINDOWS"] == "1"
-    return True
-
-
-def _old_state_single_pass_windows():
-    if "PYSPH_FUSED_OLD_STATE_SINGLE_PASS_WINDOWS" not in os.environ:
-        return False
-    assert os.environ["PYSPH_FUSED_OLD_STATE_SINGLE_PASS_WINDOWS"] == "1"
     return True
 
 
@@ -1892,12 +1199,6 @@ def _resident_grid_sync_pair_windows():
 
 
 def _resident_grid_sync_pair_window_policy():
-    if "PYSPH_FUSED_RESIDENT_GRID_SYNC" not in os.environ:
-        return "off"
-    policy = os.environ["PYSPH_FUSED_RESIDENT_GRID_SYNC"]
-    assert policy in ("1", "auto")
-    if policy == "1":
-        return "always"
     return "auto"
 
 
@@ -1918,10 +1219,6 @@ def _resident_grid_block_count():
     multiprocessor_count = int(
         device.get_attribute(cuda.device_attribute.MULTIPROCESSOR_COUNT)
     )
-    if "PYSPH_FUSED_RESIDENT_GRID_BLOCKS_PER_SM" in os.environ:
-        blocks_per_sm = int(os.environ["PYSPH_FUSED_RESIDENT_GRID_BLOCKS_PER_SM"])
-        assert blocks_per_sm > 0
-        return multiprocessor_count * blocks_per_sm
     return multiprocessor_count
 
 
@@ -2123,25 +1420,6 @@ def _stage_timing_key(stage, traversal):
     return f"{stage.kind.value}:{traversal}:{method_names}"
 
 
-def _pair_traversal_for_stage(stage, equations, convergence_field):
-    mode = pair_traversal_mode()
-    if mode == "hbucket_source_parallel":
-        if convergence_field is not None:
-            return "hbucket"
-        reduction = analyze_pair_reduction_stage(stage, equations)
-        if reduction.supported:
-            return "hbucket_source_parallel"
-        return "hbucket"
-    if mode != "source_parallel":
-        return mode
-    if convergence_field is not None:
-        return "direct"
-    reduction = analyze_pair_reduction_stage(stage, equations)
-    if reduction.supported:
-        return "source_parallel"
-    return "direct"
-
-
 def _equations_for_stage(helper, stage, stage_group):
     equations = list(_equations_for_stage_group(helper, stage_group))
     names = [equation.__class__.__name__ for equation in equations]
@@ -2249,26 +1527,10 @@ def _resident_hbucket_pair_window_extra_arg_names(
 
 
 def _hbucket_source_inline_pair_window_extra_arg_names(
-    stages, equations_by_stage, precomputes, inline_methods, old_source_fields
+    stages, equations_by_stage, precomputes, inline_methods
 ):
     return hbucket_source_inline_pair_window_argument_names(
-        stages, equations_by_stage, precomputes, inline_methods, old_source_fields
-    )
-
-
-def _hbucket_old_state_pair_stage_extra_arg_names(
-    stages,
-    equations_by_stage,
-    precompute,
-    old_state_methods,
-    old_state_fields,
-):
-    return hbucket_old_state_pair_stage_argument_names(
-        stages,
-        equations_by_stage,
-        precompute,
-        old_state_methods,
-        old_state_fields,
+        stages, equations_by_stage, precomputes, inline_methods
     )
 
 
@@ -2300,43 +1562,6 @@ def _resident_hbucket_pair_window_stage(stages):
     )
 
 
-def _hbucket_old_state_pair_window_stage(stages):
-    methods = tuple(method for stage in stages for method in stage.methods)
-    method_segments = tuple(stage.methods for stage in stages)
-    reason = "; ".join(stage.reason for stage in stages)
-    return replace(
-        stages[0],
-        methods=methods,
-        reason=f"old-state single-pass hbucket pair window: {reason}",
-        legacy_group_count=sum(stage.legacy_group_count for stage in stages),
-        method_segments=method_segments,
-    )
-
-
-def _hbucket_old_state_pair_window_stages(stages, prelude_methods):
-    left, right = stages
-    remaining_left_methods = tuple(
-        method for method in left.methods if method not in prelude_methods
-    )
-    prelude_stage = replace(
-        left,
-        kind=StageKind.POINTWISE,
-        sources=(),
-        methods=prelude_methods,
-        reason=f"{left.reason} old-state prelude",
-        legacy_group_count=0,
-        method_segments=(),
-    )
-    left_pair_stage = replace(
-        left,
-        methods=remaining_left_methods,
-        reason=f"{left.reason} old-state pair prefix",
-        legacy_group_count=0,
-        method_segments=(remaining_left_methods,),
-    )
-    return prelude_stage, (left_pair_stage, right)
-
-
 def _resident_hbucket_pair_window_key(stages, precomputes):
     return (
         tuple(
@@ -2350,32 +1575,8 @@ def _resident_hbucket_pair_window_key(stages, precomputes):
     )
 
 
-def _hbucket_old_state_pair_window_key(
-    stages, precompute, prelude_methods, old_state_methods, old_state_fields
-):
-    return (
-        tuple(
-            tuple(
-                (method.equation_name, method.method_kind.value)
-                for method in stage.methods
-            )
-            for stage in stages
-        ),
-        tuple(precompute.symbols),
-        tuple(
-            (method.equation_name, method.method_kind.value)
-            for method in prelude_methods
-        ),
-        tuple(
-            (method.equation_name, method.method_kind.value)
-            for method in old_state_methods
-        ),
-        tuple(old_state_fields),
-    )
-
-
 def _hbucket_source_inline_pair_window_key(
-    stages, precomputes, inline_methods, old_source_fields
+    stages, precomputes, inline_methods
 ):
     return (
         _resident_hbucket_pair_window_key(stages, precomputes),
@@ -2383,7 +1584,6 @@ def _hbucket_source_inline_pair_window_key(
             (method.equation_name, method.method_kind.value)
             for method in inline_methods
         ),
-        tuple(old_source_fields),
     )
 
 
@@ -2431,12 +1631,6 @@ def _stage_extra_arg_value(helper, name, info, extra_args):
     assert False
 
 
-def _empty_gpu_array_like(source_array):
-    import pycuda.gpuarray as gpuarray
-
-    return gpuarray.empty_like(source_array)
-
-
 def _equation_for_method(equation_name, equations):
     matches = [
         equation
@@ -2447,9 +1641,7 @@ def _equation_for_method(equation_name, equations):
     return matches[0]
 
 
-def _neighbor_context_for_info(
-    evaluator, info, stream, h_reduce_scratch, workspace, traversal_mode
-):
+def _neighbor_context_for_info(evaluator, info, stream, h_reduce_scratch, workspace):
     dest = info["dest"]
     src = info["src"]
     assert dest is src
@@ -2457,56 +1649,7 @@ def _neighbor_context_for_info(
     lower, upper, periodic = _neighbor_context_bounds_and_periodicity(nnps)
     radius_scale = np.float32(nnps.radius_scale)
     nreal = dest.get_number_of_particles(True)
-    if traversal_mode in ("hbucket", "hbucket_source_parallel"):
-        fixed_h_min = _hbucket_fixed_hmin(nnps)
-        if fixed_h_min is not None:
-            return _hbucket_neighbor_context_for_info(
-                evaluator, info, stream, workspace, fixed_h_min
-            )
-        return build_fused_cuda_hbucket_context_with_workspace(
-            dest.gpu.x.dev,
-            dest.gpu.y.dev,
-            dest.gpu.z.dev,
-            dest.gpu.h.dev,
-            nreal,
-            lower,
-            upper,
-            periodic,
-            radius_scale,
-            _hbucket_bucket_count(),
-            stream,
-            workspace,
-            h_reduce_scratch,
-        )
-    cell_size = np.float32(nnps.domain.manager.cell_size)
-    cell_counts = cell_counts_from_cell_size(lower, upper, cell_size)
-    return build_fused_cuda_context_with_workspace(
-        dest.gpu.x.dev,
-        dest.gpu.y.dev,
-        dest.gpu.z.dev,
-        dest.gpu.h.dev,
-        nreal,
-        lower,
-        upper,
-        periodic,
-        radius_scale,
-        cell_counts,
-        stream,
-        _pair_cluster_size(),
-        workspace,
-        traversal_mode == "cluster",
-    )
-
-
-def _hbucket_neighbor_context_for_info(evaluator, info, stream, workspace, fixed_h_min):
-    dest = info["dest"]
-    src = info["src"]
-    assert dest is src
-    nnps = evaluator.nnps
-    lower, upper, periodic = _neighbor_context_bounds_and_periodicity(nnps)
-    radius_scale = np.float32(nnps.radius_scale)
-    nreal = dest.get_number_of_particles(True)
-    return build_fused_cuda_hbucket_context_with_fixed_hmin(
+    return build_fused_cuda_hbucket_context_with_workspace(
         dest.gpu.x.dev,
         dest.gpu.y.dev,
         dest.gpu.z.dev,
@@ -2519,7 +1662,7 @@ def _hbucket_neighbor_context_for_info(evaluator, info, stream, workspace, fixed
         _hbucket_bucket_count(),
         stream,
         workspace,
-        fixed_h_min,
+        h_reduce_scratch,
     )
 
 

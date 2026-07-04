@@ -17,6 +17,8 @@ import sys
 from tempfile import mkdtemp
 import time
 
+from compyle.config import get_config
+
 from pysph.solver.application import Application
 from pysph.solver.solver import Solver
 from pysph.solver.utils import get_free_port
@@ -65,8 +67,16 @@ class TestApplication(TestCase):
     def setUp(self):
         self.output_dir = mkdtemp()
         self.app = MockApp(output_dir=self.output_dir)
+        config = get_config()
+        self._old_use_cuda = config.use_cuda
+        self._old_use_opencl = config.use_opencl
+        self._old_use_fused_cuda = getattr(config, 'use_fused_cuda', False)
 
     def tearDown(self):
+        config = get_config()
+        config.use_cuda = self._old_use_cuda
+        config.use_opencl = self._old_use_opencl
+        config.use_fused_cuda = self._old_use_fused_cuda
         if sys.platform.startswith('win'):
             try:
                 shutil.rmtree(self.output_dir)
@@ -103,6 +113,39 @@ class TestApplication(TestCase):
         self.assertEqual(expected, app.testarg, error_message)
         # No interfaces should be started by default.
         self.assertEqual(len(app._interfaces), 0)
+
+    def test_cuda_fused_defaults_to_hbucket_nnps(self):
+        app = self.app
+        app.set_args(['--cuda', '--fused'])
+
+        app._parse_command_line(force=True)
+
+        self.assertEqual(app.options.nnps, 'hbucket')
+
+    def test_cuda_fused_sets_global_config(self):
+        app = self.app
+        app.set_args(['--cuda', '--fused'])
+        app._parse_command_line(force=True)
+
+        app._configure_global_config()
+
+        config = get_config()
+        self.assertTrue(config.use_cuda)
+        self.assertTrue(config.use_fused_cuda)
+
+    def test_fused_rejects_non_hbucket_nnps(self):
+        app = self.app
+        app.set_args(['--cuda', '--fused', '--nnps', 'gpu_octree'])
+
+        with self.assertRaises(SystemExit):
+            app._parse_command_line(force=True)
+
+    def test_hbucket_requires_fused_cuda(self):
+        app = self.app
+        app.set_args(['--cuda', '--nnps', 'hbucket'])
+
+        with self.assertRaises(SystemExit):
+            app._parse_command_line(force=True)
 
     def test_output_dir_when_moved_and_read_info_called(self):
         # Given

@@ -2,7 +2,6 @@
 
 import ast
 import inspect
-import os
 import textwrap
 from dataclasses import dataclass
 
@@ -388,189 +387,12 @@ def generate_resident_hbucket_pair_window_outline_from_equations(
     )
 
 
-def generate_hbucket_old_state_pair_window_outline_from_equations(
-    plan_id: str,
-    stages: tuple[StageNode, ...],
-    equations_by_stage: tuple[tuple[object, ...], ...],
-    precompute: CudaPairPrecompute,
-    prelude_methods: tuple[MethodDeps, ...],
-    old_state_methods: tuple[MethodDeps, ...],
-    old_state_fields: tuple[str, ...],
-) -> FusedKernelOutline:
-    """Return one h-bucket pair-window outline with one traversal.
-
-    The first stage may contain source-free prelude methods whose writes must be
-    visible as source reads in the second stage. The old-state methods read
-    fields that the second stage overwrites, so those reads are redirected to
-    snapshot arrays.
-    """
-    assert len(stages) == 2
-    assert len(equations_by_stage) == 2
-    assert prelude_methods
-    assert old_state_methods
-    assert old_state_fields
-    known_types = _cuda_known_types_for_stage_window(
-        stages, equations_by_stage, (precompute, precompute)
-    )
-    equations = _unique_equations(equations_by_stage)
-    group = CUDAGroup(list(equations))
-    wrapper_source = group.get_equation_wrappers(known_types)
-    calls_by_stage = tuple(
-        _cuda_equation_calls_for_stage(
-            stage, equations_for_stage, known_types, precompute.symbols
-        )
-        for stage, equations_for_stage in zip(stages, equations_by_stage)
-    )
-    calls_by_stage = (
-        _old_state_equation_calls(
-            calls_by_stage[0],
-            stages[0].methods,
-            old_state_methods,
-            old_state_fields,
-        ),
-        calls_by_stage[1],
-    )
-    return _generate_hbucket_old_state_pair_window_outline_with_equation_calls(
-        plan_id,
-        stages,
-        wrapper_source,
-        precompute,
-        calls_by_stage,
-        prelude_methods,
-        old_state_fields,
-    )
-
-
-def hbucket_old_state_pair_window_argument_names(
-    stages: tuple[StageNode, ...],
-    equations_by_stage: tuple[tuple[object, ...], ...],
-    precompute: CudaPairPrecompute,
-    prelude_methods: tuple[MethodDeps, ...],
-    old_state_methods: tuple[MethodDeps, ...],
-    old_state_fields: tuple[str, ...],
-) -> tuple[str, ...]:
-    """Return extra argument names for an old-state single-pass h-bucket window."""
-    assert len(stages) == 2
-    assert len(equations_by_stage) == 2
-    assert prelude_methods
-    assert old_state_methods
-    assert old_state_fields
-    known_types = _cuda_known_types_for_stage_window(
-        stages, equations_by_stage, (precompute, precompute)
-    )
-    equations = _unique_equations(equations_by_stage)
-    group = CUDAGroup(list(equations))
-    group.get_equation_wrappers(known_types)
-    calls_by_stage = tuple(
-        _cuda_equation_calls_for_stage(
-            stage, equations_for_stage, known_types, precompute.symbols
-        )
-        for stage, equations_for_stage in zip(stages, equations_by_stage)
-    )
-    calls_by_stage = (
-        _old_state_equation_calls(
-            calls_by_stage[0],
-            stages[0].methods,
-            old_state_methods,
-            old_state_fields,
-        ),
-        calls_by_stage[1],
-    )
-    declarations = _unique_argument_declarations(
-        _precompute_argument_declarations(precompute),
-        _equation_call_arguments(calls_by_stage[0]),
-        _equation_call_arguments(calls_by_stage[1]),
-    )
-    return tuple(_kernel_argument_name(declaration) for declaration in declarations)
-
-
-def generate_hbucket_old_state_pair_stage_outline_from_equations(
-    plan_id: str,
-    stages: tuple[StageNode, ...],
-    equations_by_stage: tuple[tuple[object, ...], ...],
-    precompute: CudaPairPrecompute,
-    old_state_methods: tuple[MethodDeps, ...],
-    old_state_fields: tuple[str, ...],
-) -> FusedKernelOutline:
-    """Return one normal h-bucket kernel for two stages with old-state reads."""
-    assert len(stages) == 2
-    assert len(equations_by_stage) == 2
-    assert old_state_methods
-    assert old_state_fields
-    known_types = _cuda_known_types_for_stage_window(
-        stages, equations_by_stage, (precompute, precompute)
-    )
-    equations = _unique_equations(equations_by_stage)
-    group = CUDAGroup(list(equations))
-    wrapper_source = group.get_equation_wrappers(known_types)
-    calls_by_stage = tuple(
-        _cuda_equation_calls_for_stage(
-            stage, equations_for_stage, known_types, precompute.symbols
-        )
-        for stage, equations_for_stage in zip(stages, equations_by_stage)
-    )
-    calls_by_stage = (
-        _old_state_equation_calls(
-            calls_by_stage[0],
-            stages[0].methods,
-            old_state_methods,
-            old_state_fields,
-        ),
-        calls_by_stage[1],
-    )
-    return _generate_hbucket_old_state_pair_stage_outline_with_equation_calls(
-        plan_id, stages, wrapper_source, precompute, calls_by_stage
-    )
-
-
-def hbucket_old_state_pair_stage_argument_names(
-    stages: tuple[StageNode, ...],
-    equations_by_stage: tuple[tuple[object, ...], ...],
-    precompute: CudaPairPrecompute,
-    old_state_methods: tuple[MethodDeps, ...],
-    old_state_fields: tuple[str, ...],
-) -> tuple[str, ...]:
-    """Return extra argument names for a normal old-state h-bucket stage."""
-    assert len(stages) == 2
-    assert len(equations_by_stage) == 2
-    assert old_state_methods
-    assert old_state_fields
-    known_types = _cuda_known_types_for_stage_window(
-        stages, equations_by_stage, (precompute, precompute)
-    )
-    equations = _unique_equations(equations_by_stage)
-    group = CUDAGroup(list(equations))
-    group.get_equation_wrappers(known_types)
-    calls_by_stage = tuple(
-        _cuda_equation_calls_for_stage(
-            stage, equations_for_stage, known_types, precompute.symbols
-        )
-        for stage, equations_for_stage in zip(stages, equations_by_stage)
-    )
-    calls_by_stage = (
-        _old_state_equation_calls(
-            calls_by_stage[0],
-            stages[0].methods,
-            old_state_methods,
-            old_state_fields,
-        ),
-        calls_by_stage[1],
-    )
-    declarations = _unique_argument_declarations(
-        _precompute_argument_declarations(precompute),
-        _equation_call_arguments(calls_by_stage[0]),
-        _equation_call_arguments(calls_by_stage[1]),
-    )
-    return tuple(_kernel_argument_name(declaration) for declaration in declarations)
-
-
 def generate_hbucket_source_inline_pair_window_outline_from_equations(
     plan_id: str,
     stages: tuple[StageNode, ...],
     equations_by_stage: tuple[tuple[object, ...], ...],
     precomputes: tuple[CudaPairPrecompute, ...],
     source_inline_methods: tuple[MethodDeps, ...],
-    old_source_fields: tuple[str, ...],
 ) -> FusedKernelOutline:
     """Return one h-bucket pair-window outline with source-local prep values."""
     assert len(stages) == 2
@@ -597,9 +419,7 @@ def generate_hbucket_source_inline_pair_window_outline_from_equations(
         )
     )
     calls_by_stage = (
-        _old_source_equation_calls(
-            calls_by_stage[0], stages[0].methods, old_source_fields
-        ),
+        calls_by_stage[0],
         _source_inline_equation_calls(
             calls_by_stage[1], stages[1].methods, source_inline_fields
         ),
@@ -612,7 +432,6 @@ def generate_hbucket_source_inline_pair_window_outline_from_equations(
         calls_by_stage,
         source_inline_methods,
         source_inline_fields,
-        old_source_fields,
     )
 
 
@@ -640,7 +459,6 @@ def hbucket_source_inline_pair_window_argument_names(
     equations_by_stage: tuple[tuple[object, ...], ...],
     precomputes: tuple[CudaPairPrecompute, ...],
     source_inline_methods: tuple[MethodDeps, ...],
-    old_source_fields: tuple[str, ...],
 ) -> tuple[str, ...]:
     """Return extra argument names for a source-inline h-bucket window."""
     assert len(stages) == 2
@@ -663,9 +481,7 @@ def hbucket_source_inline_pair_window_argument_names(
         )
     )
     calls_by_stage = (
-        _old_source_equation_calls(
-            calls_by_stage[0], stages[0].methods, old_source_fields
-        ),
+        calls_by_stage[0],
         _source_inline_equation_calls(
             calls_by_stage[1], stages[1].methods, source_inline_fields
         ),
@@ -674,10 +490,7 @@ def hbucket_source_inline_pair_window_argument_names(
     precompute_declarations = tuple(
         declaration
         for declarations in (
-            _old_source_argument_declarations(
-                _precompute_argument_declarations(precomputes[0]),
-                old_source_fields,
-            ),
+            _precompute_argument_declarations(precomputes[0]),
             _precompute_argument_declarations(precomputes[1]),
         )
         for declaration in declarations
@@ -1094,154 +907,6 @@ def _generate_resident_hbucket_pair_window_outline_with_equation_calls(
     return FusedKernelOutline(name=name, source=source)
 
 
-def _generate_hbucket_old_state_pair_window_outline_with_equation_calls(
-    plan_id: str,
-    stages: tuple[StageNode, ...],
-    wrapper_source: str,
-    precompute: CudaPairPrecompute,
-    calls_by_stage: tuple[tuple[CudaEquationMethodCall, ...], ...],
-    prelude_methods: tuple[MethodDeps, ...],
-    old_state_fields: tuple[str, ...],
-) -> FusedKernelOutline:
-    assert len(stages) == 2
-    left, right = stages
-    assert left.kind is StageKind.PAIR_RATE
-    assert right.kind is StageKind.PAIR_RATE
-    assert left.dest == right.dest
-    assert left.sources == right.sources
-    left_pair_methods = tuple(
-        method for method in left.methods if method not in prelude_methods
-    )
-    left_pre_methods, left_loop_methods, left_post_methods = _pair_segment_methods(
-        left_pair_methods
-    )
-    right_pre_methods, right_loop_methods, right_post_methods = _pair_segment_methods(
-        right.methods
-    )
-    prelude_lines = _grid_stride_call_lines(prelude_methods, calls_by_stage[0])
-    pre_loop_lines = _grid_stride_call_lines(
-        left_pre_methods + right_pre_methods,
-        calls_by_stage[0] + calls_by_stage[1],
-    )
-    loop_lines = _direct_pair_equation_call_lines(
-        left_loop_methods + right_loop_methods,
-        calls_by_stage[0] + calls_by_stage[1],
-    )
-    post_loop_lines = _grid_stride_call_lines(
-        left_post_methods + right_post_methods,
-        calls_by_stage[0] + calls_by_stage[1],
-    )
-    traversal_lines = _hbucket_pair_neighbor_traversal_lines(
-        _direct_pair_precompute_lines(precompute), (), loop_lines
-    )
-    name = f"fused_{plan_id}_{left.dest}_hbucket_old_state_pair_window"
-    stage_lines = [
-        "    cooperative_groups::grid_group grid = cooperative_groups::this_grid();",
-        "    for (int dst = blockIdx.x * blockDim.x + threadIdx.x; "
-        "dst < n; dst += blockDim.x * gridDim.x) {",
-        *prelude_lines,
-        "    }",
-        "    grid.sync();",
-        "    for (int dst = blockIdx.x * blockDim.x + threadIdx.x; "
-        "dst < n; dst += blockDim.x * gridDim.x) {",
-        *pre_loop_lines,
-        *tuple(f"    {line}" for line in traversal_lines),
-        *post_loop_lines,
-        "    }",
-    ]
-    arguments = hbucket_context_argument_declarations() + _unique_argument_declarations(
-        _precompute_argument_declarations(precompute),
-        _equation_call_arguments(calls_by_stage[0]),
-        _equation_call_arguments(calls_by_stage[1]),
-    )
-    fp32_wrapper_source = _force_cuda_source_fp32(wrapper_source)
-    source = "\n".join(
-        (
-            "#include <cooperative_groups.h>",
-            'extern "C" {',
-            _FUSED_CUDA_COMPYLE_PREAMBLE,
-            _DIRECT_PAIR_HELPERS,
-            precompute.helper_source,
-            fp32_wrapper_source,
-            f"__global__ void {name}(",
-            _argument_block(arguments),
-            ")",
-            "{",
-            *stage_lines,
-            "}",
-            "}",
-        )
-    )
-    assert old_state_fields
-    return FusedKernelOutline(name=name, source=source)
-
-
-def _generate_hbucket_old_state_pair_stage_outline_with_equation_calls(
-    plan_id: str,
-    stages: tuple[StageNode, ...],
-    wrapper_source: str,
-    precompute: CudaPairPrecompute,
-    calls_by_stage: tuple[tuple[CudaEquationMethodCall, ...], ...],
-) -> FusedKernelOutline:
-    assert len(stages) == 2
-    left, right = stages
-    assert left.kind is StageKind.PAIR_RATE
-    assert right.kind is StageKind.PAIR_RATE
-    assert left.dest == right.dest
-    assert left.sources == right.sources
-    left_pre_methods, left_loop_methods, left_post_methods = _pair_segment_methods(
-        left.methods
-    )
-    right_pre_methods, right_loop_methods, right_post_methods = _pair_segment_methods(
-        right.methods
-    )
-    pre_loop_lines = _grid_stride_call_lines(
-        left_pre_methods + right_pre_methods,
-        calls_by_stage[0] + calls_by_stage[1],
-    )
-    loop_lines = _direct_pair_equation_call_lines(
-        left_loop_methods + right_loop_methods,
-        calls_by_stage[0] + calls_by_stage[1],
-    )
-    post_loop_lines = _grid_stride_call_lines(
-        left_post_methods + right_post_methods,
-        calls_by_stage[0] + calls_by_stage[1],
-    )
-    traversal_lines = _hbucket_pair_neighbor_traversal_lines(
-        _direct_pair_precompute_lines(precompute), (), loop_lines
-    )
-    name = f"fused_{plan_id}_{left.dest}_hbucket_old_state_pair_stage"
-    arguments = hbucket_context_argument_declarations() + _unique_argument_declarations(
-        _precompute_argument_declarations(precompute),
-        _equation_call_arguments(calls_by_stage[0]),
-        _equation_call_arguments(calls_by_stage[1]),
-    )
-    fp32_wrapper_source = _force_cuda_source_fp32(wrapper_source)
-    source = "\n".join(
-        (
-            'extern "C" {',
-            _FUSED_CUDA_COMPYLE_PREAMBLE,
-            _DIRECT_PAIR_HELPERS,
-            precompute.helper_source,
-            fp32_wrapper_source,
-            f"__global__ void {name}(",
-            _argument_block(arguments),
-            ")",
-            "{",
-            "    int dst = blockIdx.x * blockDim.x + threadIdx.x;",
-            "    if (dst >= n) {",
-            "        return;",
-            "    }",
-            *pre_loop_lines,
-            *traversal_lines,
-            *post_loop_lines,
-            "}",
-            "}",
-        )
-    )
-    return FusedKernelOutline(name=name, source=source)
-
-
 def _generate_hbucket_source_inline_pair_window_outline_with_equation_calls(
     plan_id: str,
     stages: tuple[StageNode, ...],
@@ -1250,7 +915,6 @@ def _generate_hbucket_source_inline_pair_window_outline_with_equation_calls(
     calls_by_stage: tuple[tuple[CudaEquationMethodCall, ...], ...],
     source_inline_methods: tuple[MethodDeps, ...],
     source_inline_fields: tuple[str, ...],
-    old_source_fields: tuple[str, ...],
 ) -> FusedKernelOutline:
     assert len(stages) == 2
     name = f"fused_{plan_id}_{stages[0].dest}_hbucket_source_inline_pair_window"
@@ -1259,7 +923,7 @@ def _generate_hbucket_source_inline_pair_window_outline_with_equation_calls(
         source_inline_methods, calls_by_stage[0], source_local_fields
     )
     first_segment_lines = _hbucket_source_inline_first_segment_lines(
-        stages[0], calls_by_stage[0], precomputes[0], old_source_fields
+        stages[0], calls_by_stage[0], precomputes[0]
     )
     second_segment_lines = _hbucket_pair_segment_lines_with_source_inline(
         stages[1],
@@ -1271,10 +935,7 @@ def _generate_hbucket_source_inline_pair_window_outline_with_equation_calls(
     precompute_declarations = tuple(
         declaration
         for declarations in (
-            _old_source_argument_declarations(
-                _precompute_argument_declarations(precomputes[0]),
-                old_source_fields,
-            ),
+            _precompute_argument_declarations(precomputes[0]),
             _precompute_argument_declarations(precomputes[1]),
         )
         for declaration in declarations
@@ -1803,7 +1464,7 @@ def launch_cluster_pair_kernel_with_context(
 ) -> PairLaunchConfig:
     """Launch a generated sorted-cell cluster pair kernel."""
     kernel = module.get_function(kernel_name)
-    cluster_size = _pair_cluster_size()
+    cluster_size = 64
     kernel(
         _kernel_arg(context.x),
         _kernel_arg(context.y),
@@ -1996,18 +1657,8 @@ def launch_hbucket_source_parallel_pair_kernel_with_context(
     )
 
 
-def _direct_pair_block_size() -> int:
-    if "PYSPH_FUSED_PAIR_BLOCK_SIZE" in os.environ:
-        block_size = int(os.environ["PYSPH_FUSED_PAIR_BLOCK_SIZE"])
-        assert block_size in (64, 128, 256)
-        return block_size
-    return 256
-
-
 def _pair_block_size_for_count(n: int) -> int:
-    if "PYSPH_FUSED_PAIR_BLOCK_SIZE" in os.environ:
-        return _direct_pair_block_size()
-    full_block_size = _direct_pair_block_size()
+    full_block_size = 256
     full_particle_blocks = (int(n) + full_block_size - 1) // full_block_size
     if full_particle_blocks < _cuda_multiprocessor_count():
         return 128
@@ -2019,28 +1670,6 @@ def _cuda_multiprocessor_count() -> int:
 
     device = cuda.Context.get_device()
     return int(device.get_attribute(cuda.device_attribute.MULTIPROCESSOR_COUNT))
-
-
-def _pair_cluster_size() -> int:
-    if "PYSPH_FUSED_PAIR_CLUSTER_SIZE" in os.environ:
-        cluster_size = int(os.environ["PYSPH_FUSED_PAIR_CLUSTER_SIZE"])
-        assert cluster_size in (32, 64, 128)
-        return cluster_size
-    return 64
-
-
-def pair_traversal_mode() -> str:
-    if "PYSPH_FUSED_PAIR_TRAVERSAL" in os.environ:
-        mode = os.environ["PYSPH_FUSED_PAIR_TRAVERSAL"]
-        assert mode in (
-            "direct",
-            "cluster",
-            "source_parallel",
-            "hbucket",
-            "hbucket_source_parallel",
-        )
-        return mode
-    return "direct"
 
 
 def build_cuda_equation_struct_argument(equation, stream: object) -> object:
@@ -2296,36 +1925,18 @@ def _hbucket_pair_segment_lines(
     return tuple(lines)
 
 
-def _hbucket_pair_segment_lines_with_old_source(
-    stage: StageNode,
-    calls: tuple[CudaEquationMethodCall, ...],
-    precompute_lines: tuple[str, ...],
-    old_source_fields: tuple[str, ...],
-) -> tuple[str, ...]:
-    return _hbucket_pair_segment_lines(
-        stage,
-        calls,
-        _replace_old_source_reads(precompute_lines, old_source_fields),
-    )
-
-
 def _hbucket_source_inline_first_segment_lines(
     stage: StageNode,
     calls: tuple[CudaEquationMethodCall, ...],
     precompute: CudaPairPrecompute,
-    old_source_fields: tuple[str, ...],
 ) -> tuple[str, ...]:
     if stage.kind is StageKind.POINTWISE:
-        assert old_source_fields == ()
         return tuple(
             line.replace("                                        ", "    ")
             for line in _direct_pair_equation_call_lines(stage, calls)
         )
-    return _hbucket_pair_segment_lines_with_old_source(
-        stage,
-        calls,
-        _direct_pair_precompute_lines(precompute),
-        old_source_fields,
+    return _hbucket_pair_segment_lines(
+        stage, calls, _direct_pair_precompute_lines(precompute)
     )
 
 
@@ -3334,134 +2945,6 @@ def _replace_source_inline_reads(lines, fields):
     return tuple(
         _source_inline_replace_source_reads_with_slots(line, fields) for line in lines
     )
-
-
-def _old_source_equation_calls(
-    calls: tuple[CudaEquationMethodCall, ...],
-    methods: tuple[MethodDeps, ...],
-    fields: tuple[str, ...],
-) -> tuple[CudaEquationMethodCall, ...]:
-    rewritten = []
-    for call, method in zip(calls, methods):
-        active_fields = tuple(field for field in fields if field in method.source_reads)
-        if not active_fields:
-            rewritten.append(call)
-        else:
-            rewritten.append(
-                CudaEquationMethodCall(
-                    equation_name=call.equation_name,
-                    method_kind=call.method_kind,
-                    function_name=call.function_name,
-                    argument_declarations=_old_source_argument_declarations(
-                        call.argument_declarations, active_fields
-                    ),
-                    arguments=_old_source_call_arguments(call.arguments, active_fields),
-                )
-            )
-    return tuple(rewritten)
-
-
-def _old_state_equation_calls(
-    calls: tuple[CudaEquationMethodCall, ...],
-    methods: tuple[MethodDeps, ...],
-    old_state_methods: tuple[MethodDeps, ...],
-    fields: tuple[str, ...],
-) -> tuple[CudaEquationMethodCall, ...]:
-    rewritten = []
-    old_state_method_set = frozenset(old_state_methods)
-    for call, method in zip(calls, methods):
-        active_fields = tuple(
-            field
-            for field in fields
-            if method in old_state_method_set
-            and (field in method.dest_reads or field in method.source_reads)
-        )
-        if not active_fields:
-            rewritten.append(call)
-        else:
-            rewritten.append(
-                CudaEquationMethodCall(
-                    equation_name=call.equation_name,
-                    method_kind=call.method_kind,
-                    function_name=call.function_name,
-                    argument_declarations=_old_state_argument_declarations(
-                        call.argument_declarations, active_fields
-                    ),
-                    arguments=_old_state_call_arguments(call.arguments, active_fields),
-                )
-            )
-    return tuple(rewritten)
-
-
-def _old_state_argument_declarations(
-    declarations: tuple[str, ...], fields: tuple[str, ...]
-) -> tuple[str, ...]:
-    return tuple(
-        _old_state_argument_declaration(declaration, fields)
-        for declaration in declarations
-    )
-
-
-def _old_state_argument_declaration(declaration: str, fields: tuple[str, ...]) -> str:
-    name = declaration.split()[-1]
-    if len(name) > 2 and name[:2] in ("d_", "s_") and name[2:] in fields:
-        return declaration.replace(name, f"{name[:2]}old_{name[2:]}")
-    return declaration
-
-
-def _old_state_call_arguments(
-    arguments: tuple[str, ...], fields: tuple[str, ...]
-) -> tuple[str, ...]:
-    rewritten = []
-    for argument in arguments:
-        if (
-            len(argument) > 2
-            and argument[:2] in ("d_", "s_")
-            and argument[2:] in fields
-        ):
-            rewritten.append(f"{argument[:2]}old_{argument[2:]}")
-        else:
-            rewritten.append(argument)
-    return tuple(rewritten)
-
-
-def _old_source_argument_declarations(
-    declarations: tuple[str, ...], fields: tuple[str, ...]
-) -> tuple[str, ...]:
-    return tuple(
-        _old_source_argument_declaration(declaration, fields)
-        for declaration in declarations
-    )
-
-
-def _old_source_argument_declaration(declaration: str, fields: tuple[str, ...]) -> str:
-    field = _source_inline_declaration_field(declaration)
-    if field in fields:
-        return declaration.replace(f"s_{field}", f"s_old_{field}")
-    return declaration
-
-
-def _old_source_call_arguments(
-    arguments: tuple[str, ...], fields: tuple[str, ...]
-) -> tuple[str, ...]:
-    rewritten = []
-    for argument in arguments:
-        if argument.startswith("s_") and argument[2:] in fields:
-            rewritten.append(f"s_old_{argument[2:]}")
-        else:
-            rewritten.append(argument)
-    return tuple(rewritten)
-
-
-def _replace_old_source_reads(lines: tuple[str, ...], fields: tuple[str, ...]):
-    return tuple(_old_source_replace_source_reads(line, fields) for line in lines)
-
-
-def _old_source_replace_source_reads(line: str, fields: tuple[str, ...]) -> str:
-    for field in fields:
-        line = line.replace(f"s_{field}[s_idx]", f"s_old_{field}[s_idx]")
-        line = line.replace(f"s_{field}[src]", f"s_old_{field}[src]")
-    return line
 
 
 def _source_inline_equation_calls(
