@@ -1,6 +1,5 @@
 """Tests for the generic fused CUDA neighbor metadata contract."""
 
-import os
 import sys
 import types
 import numpy as np
@@ -67,6 +66,18 @@ class RecordingModule:
 
     def get_function(self, name):
         return RecordingKernel(name, self.calls)
+
+
+def require_cuda():
+    pytest.importorskip("pycuda")
+    try:
+        import pycuda.autoinit  # noqa: F401
+        import pycuda.driver as cuda
+    except Exception as exc:
+        pytest.skip("CUDA is not available: %s" % exc)
+    if cuda.Device.count() == 0:
+        pytest.skip("CUDA device is not available")
+    return cuda
 
 
 def test_cell_counts_from_hmax_uses_radius_scale_and_minimum_one_cell():
@@ -187,8 +198,8 @@ def test_hbucket_context_declares_bucketed_device_metadata():
         bucket_count=4,
         cell_width=np.array([0.25, 0.25, 1.0], dtype=np.float32),
         stream=object(),
-        bucket_h_max=FakeDeviceArray("float32"),
-        cell_bucket_h_max=FakeDeviceArray("float32"),
+        bucket_h_max_bits=FakeDeviceArray("uint32"),
+        cell_bucket_h_max_bits=FakeDeviceArray("uint32"),
         sorted_ids=FakeDeviceArray("int32"),
         cell_bucket_starts=FakeDeviceArray("int32"),
         cell_bucket_counts=FakeDeviceArray("int32"),
@@ -202,7 +213,7 @@ def test_hbucket_context_declares_bucketed_device_metadata():
     assert context.timing_total_ms == 0.11
 
 
-def test_hbucket_builder_uses_combined_metadata_helper_kernels(monkeypatch):
+def test_hbucket_builder_uses_device_hmax_bits_without_materialization(monkeypatch):
     calls = []
     scan_calls = []
     pycuda_module = types.ModuleType("pycuda")
@@ -248,12 +259,60 @@ def test_hbucket_builder_uses_combined_metadata_helper_kernels(monkeypatch):
     assert kernel_names == [
         "fused_reset_hbucket_metadata",
         "fused_compute_hbucket_ids_counts_xyz",
-        "fused_hbucket_bits_to_float",
         "fused_scatter_hbucket_sorted_particles",
     ]
     assert len(scan_calls) == 1
     assert context.bucket_count == 4
     assert context.cell_count_tuple == (5, 5, 5)
+    assert context.bucket_h_max_bits.dtype == np.uint32
+    assert context.cell_bucket_h_max_bits.dtype == np.uint32
+
+
+def test_hbucket_workspace_reuses_reference_hmin(monkeypatch):
+    hmins = []
+    reduce_calls = []
+
+    def fake_reduce_min_float(array, n, stream, scratch):
+        reduce_calls.append((array, n, stream, scratch))
+        return np.float32(0.1)
+
+    def fake_build(*args):
+        hmins.append(args[-1])
+        return object()
+
+    monkeypatch.setattr(fused_nnps, "reduce_min_float", fake_reduce_min_float)
+    monkeypatch.setattr(
+        fused_nnps, "_build_fused_cuda_hbucket_context_from_hmin", fake_build
+    )
+    workspace = FusedCudaNeighborWorkspace()
+    h = FakeSizedDeviceArray(8, np.float32)
+
+    for _ in range(2):
+        build_fused_cuda_hbucket_context_with_workspace(
+            FakeSizedDeviceArray(8, np.float32),
+            FakeSizedDeviceArray(8, np.float32),
+            FakeSizedDeviceArray(8, np.float32),
+            h,
+            8,
+            np.array([0.0, 0.0, 0.0], dtype=np.float32),
+            np.array([1.0, 1.0, 1.0], dtype=np.float32),
+            np.array([True, True, True], dtype=np.bool_),
+            np.float32(2.0),
+            4,
+            object(),
+            workspace,
+            [],
+        )
+
+    assert len(reduce_calls) == 1
+    assert hmins == [np.float32(0.1), np.float32(0.1)]
+
+
+def test_cuda_event_timing_is_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("PYSPH_PROFILE_CUDA_EVENTS", raising=False)
+
+    assert fused_nnps._event_pair(object()) == (None, None)
+    assert fused_nnps._finish_event(None, None, object()) == 0.0
 
 
 def test_hbucket_work_counter_launches_exact_traversal_kernel(monkeypatch):
@@ -289,8 +348,8 @@ def test_hbucket_work_counter_launches_exact_traversal_kernel(monkeypatch):
         bucket_count=4,
         cell_width=np.array([0.2, 0.2, 0.2], dtype=np.float32),
         stream=stream,
-        bucket_h_max=FakeSizedDeviceArray(4, np.float32),
-        cell_bucket_h_max=FakeSizedDeviceArray(500, np.float32),
+        bucket_h_max_bits=FakeSizedDeviceArray(4, np.uint32),
+        cell_bucket_h_max_bits=FakeSizedDeviceArray(500, np.uint32),
         sorted_ids=FakeSizedDeviceArray(8, np.int32),
         cell_bucket_starts=FakeSizedDeviceArray(500, np.int32),
         cell_bucket_counts=FakeSizedDeviceArray(500, np.int32),
@@ -312,12 +371,7 @@ def test_hbucket_work_counter_launches_exact_traversal_kernel(monkeypatch):
 
 
 def test_cuda_builder_creates_no_csr_sorted_cell_and_cluster_metadata():
-    if "PYSPH_TEST_CUDA_FUSED_NNPS" not in os.environ:
-        pytest.skip("set PYSPH_TEST_CUDA_FUSED_NNPS=1 to run CUDA fused NNPS tests")
-    pytest.importorskip("pycuda")
-
-    import pycuda.autoinit  # noqa: F401
-    import pycuda.driver as cuda
+    cuda = require_cuda()
     import pycuda.gpuarray as gpuarray
 
     stream = cuda.Stream()
@@ -370,12 +424,7 @@ def test_cuda_builder_creates_no_csr_sorted_cell_and_cluster_metadata():
 
 
 def test_cuda_builder_reports_actual_cluster_total():
-    if "PYSPH_TEST_CUDA_FUSED_NNPS" not in os.environ:
-        pytest.skip("set PYSPH_TEST_CUDA_FUSED_NNPS=1 to run CUDA fused NNPS tests")
-    pytest.importorskip("pycuda")
-
-    import pycuda.autoinit  # noqa: F401
-    import pycuda.driver as cuda
+    cuda = require_cuda()
     import pycuda.gpuarray as gpuarray
 
     stream = cuda.Stream()
@@ -411,12 +460,7 @@ def test_cuda_builder_reports_actual_cluster_total():
 
 
 def test_cuda_convergence_flag_resets_and_reads_from_device():
-    if "PYSPH_TEST_CUDA_FUSED_NNPS" not in os.environ:
-        pytest.skip("set PYSPH_TEST_CUDA_FUSED_NNPS=1 to run CUDA fused NNPS tests")
-    pytest.importorskip("pycuda")
-
-    import pycuda.autoinit  # noqa: F401
-    import pycuda.driver as cuda
+    cuda = require_cuda()
 
     stream = cuda.Stream()
     flag = create_fused_cuda_convergence_flag(stream)
@@ -429,12 +473,7 @@ def test_cuda_convergence_flag_resets_and_reads_from_device():
 
 
 def test_cuda_reduce_max_float_reads_device_value():
-    if "PYSPH_TEST_CUDA_FUSED_NNPS" not in os.environ:
-        pytest.skip("set PYSPH_TEST_CUDA_FUSED_NNPS=1 to run CUDA fused NNPS tests")
-    pytest.importorskip("pycuda")
-
-    import pycuda.autoinit  # noqa: F401
-    import pycuda.driver as cuda
+    cuda = require_cuda()
     import pycuda.gpuarray as gpuarray
 
     stream = cuda.Stream()
@@ -449,12 +488,7 @@ def test_cuda_reduce_max_float_reads_device_value():
 
 
 def test_cuda_reduce_min_float_reads_device_value():
-    if "PYSPH_TEST_CUDA_FUSED_NNPS" not in os.environ:
-        pytest.skip("set PYSPH_TEST_CUDA_FUSED_NNPS=1 to run CUDA fused NNPS tests")
-    pytest.importorskip("pycuda")
-
-    import pycuda.autoinit  # noqa: F401
-    import pycuda.driver as cuda
+    cuda = require_cuda()
     import pycuda.gpuarray as gpuarray
 
     stream = cuda.Stream()
@@ -469,12 +503,7 @@ def test_cuda_reduce_min_float_reads_device_value():
 
 
 def test_cuda_wrap_periodic_xyz_updates_device_coordinates():
-    if "PYSPH_TEST_CUDA_FUSED_NNPS" not in os.environ:
-        pytest.skip("set PYSPH_TEST_CUDA_FUSED_NNPS=1 to run CUDA fused NNPS tests")
-    pytest.importorskip("pycuda")
-
-    import pycuda.autoinit  # noqa: F401
-    import pycuda.driver as cuda
+    cuda = require_cuda()
     import pycuda.gpuarray as gpuarray
 
     stream = cuda.Stream()
@@ -515,12 +544,7 @@ def test_cuda_wrap_periodic_xyz_updates_device_coordinates():
 
 
 def test_cuda_context_neighbor_count_matches_periodic_bruteforce():
-    if "PYSPH_TEST_CUDA_FUSED_NNPS" not in os.environ:
-        pytest.skip("set PYSPH_TEST_CUDA_FUSED_NNPS=1 to run CUDA fused NNPS tests")
-    pytest.importorskip("pycuda")
-
-    import pycuda.autoinit  # noqa: F401
-    import pycuda.driver as cuda
+    cuda = require_cuda()
     import pycuda.gpuarray as gpuarray
 
     lower = np.array([0.0, 0.0, 0.0], dtype=np.float32)
@@ -564,12 +588,7 @@ def test_cuda_context_neighbor_count_matches_periodic_bruteforce():
 
 
 def test_cuda_context_workspace_reuses_buffers_without_cluster_metadata():
-    if "PYSPH_TEST_CUDA_FUSED_NNPS" not in os.environ:
-        pytest.skip("set PYSPH_TEST_CUDA_FUSED_NNPS=1 to run CUDA fused NNPS tests")
-    pytest.importorskip("pycuda")
-
-    import pycuda.autoinit  # noqa: F401
-    import pycuda.driver as cuda
+    cuda = require_cuda()
     import pycuda.gpuarray as gpuarray
 
     lower = np.array([0.0, 0.0, 0.0], dtype=np.float32)
@@ -639,12 +658,7 @@ def test_cuda_context_workspace_reuses_buffers_without_cluster_metadata():
 
 
 def test_cuda_hbucket_context_neighbor_count_matches_variable_h_bruteforce():
-    if "PYSPH_TEST_CUDA_FUSED_NNPS" not in os.environ:
-        pytest.skip("set PYSPH_TEST_CUDA_FUSED_NNPS=1 to run CUDA fused NNPS tests")
-    pytest.importorskip("pycuda")
-
-    import pycuda.autoinit  # noqa: F401
-    import pycuda.driver as cuda
+    cuda = require_cuda()
     import pycuda.gpuarray as gpuarray
 
     lower = np.array([0.0, 0.0, 0.0], dtype=np.float32)
@@ -688,4 +702,73 @@ def test_cuda_hbucket_context_neighbor_count_matches_variable_h_bruteforce():
 
     assert context.bucket_count == 4
     assert context.cell_count_tuple == (10, 10, 10)
+    np.testing.assert_array_equal(gpu_counts, np.asarray(expected, dtype=np.int32))
+
+
+def test_cuda_hbucket_cached_hmin_remains_correct_when_h_shrinks():
+    cuda = require_cuda()
+    import pycuda.gpuarray as gpuarray
+
+    lower = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    upper = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+    periodic = np.array([True, True, True], dtype=np.bool_)
+    xyz = np.array(
+        [
+            [0.01, 0.0, 0.0],
+            [0.99, 0.0, 0.0],
+            [0.50, 0.0, 0.0],
+            [0.25, 0.25, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    stream = cuda.Stream()
+    workspace = FusedCudaNeighborWorkspace()
+    d_x = gpuarray.to_gpu_async(xyz[:, 0], stream=stream)
+    d_y = gpuarray.to_gpu_async(xyz[:, 1], stream=stream)
+    d_z = gpuarray.to_gpu_async(xyz[:, 2], stream=stream)
+    d_h = gpuarray.to_gpu_async(np.full(4, 0.10, dtype=np.float32), stream=stream)
+
+    build_fused_cuda_hbucket_context_with_workspace(
+        d_x,
+        d_y,
+        d_z,
+        d_h,
+        4,
+        lower,
+        upper,
+        periodic,
+        np.float32(2.0),
+        4,
+        stream,
+        workspace,
+        [],
+    )
+    h = np.array([0.05, 0.10, 0.20, 0.05], dtype=np.float32)
+    d_h.set_async(h, stream=stream)
+    context = build_fused_cuda_hbucket_context_with_workspace(
+        d_x,
+        d_y,
+        d_z,
+        d_h,
+        4,
+        lower,
+        upper,
+        periodic,
+        np.float32(2.0),
+        4,
+        stream,
+        workspace,
+        [],
+    )
+
+    gpu_counts = count_neighbors_from_hbucket_context(context).get_async(stream=stream)
+    stream.synchronize()
+    expected = [
+        brute_force_neighbor_indices(
+            xyz, h, lower, upper, periodic, np.float32(2.0), np.int32(index)
+        ).size
+        for index in range(4)
+    ]
+
+    assert context.cell_count_tuple == (5, 5, 5)
     np.testing.assert_array_equal(gpu_counts, np.asarray(expected, dtype=np.int32))

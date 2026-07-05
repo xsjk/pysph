@@ -396,36 +396,6 @@ __global__ void fused_compute_cell_ids_counts_xyz(
 	    }
 	}
 
-	__global__ void fused_bucket_bits_to_float_hbucket(
-	    const unsigned int *bucket_h_max_bits,
-	    int bucket_count,
-	    float *bucket_h_max
-	)
-	{
-	    int i = blockIdx.x * blockDim.x + threadIdx.x;
-	    if (i < bucket_count) {
-	        bucket_h_max[i] = __uint_as_float(bucket_h_max_bits[i]);
-	    }
-	}
-
-	__global__ void fused_hbucket_bits_to_float(
-	    const unsigned int *bucket_h_max_bits,
-	    const unsigned int *cell_bucket_h_max_bits,
-	    int bucket_count,
-	    int flat_total,
-	    float *bucket_h_max,
-	    float *cell_bucket_h_max
-	)
-	{
-	    int i = blockIdx.x * blockDim.x + threadIdx.x;
-	    if (i < bucket_count) {
-	        bucket_h_max[i] = __uint_as_float(bucket_h_max_bits[i]);
-	    }
-	    if (i < flat_total) {
-	        cell_bucket_h_max[i] = __uint_as_float(cell_bucket_h_max_bits[i]);
-	    }
-	}
-
 	__global__ void fused_scatter_hbucket_sorted_particles(
 	    int n,
 	    int total_cells,
@@ -613,7 +583,7 @@ __global__ void fused_last_cluster_total(
 	    float cell_width_x,
 	    float cell_width_y,
 	    float cell_width_z,
-	    const float *bucket_h_max,
+	    const unsigned int *bucket_h_max_bits,
 	    const int *cell_bucket_counts,
 	    const int *cell_bucket_starts,
 	    const int *sorted_ids,
@@ -630,7 +600,7 @@ __global__ void fused_last_cluster_total(
 	    float dst_h = h[dst];
 	    int count = 0;
 	    for (int bucket = 0; bucket < bucket_count; ++bucket) {
-	        float bucket_h = bucket_h_max[bucket];
+	        float bucket_h = __uint_as_float(bucket_h_max_bits[bucket]);
 	        if (bucket_h <= 0.0f) {
 	            continue;
 	        }
@@ -750,8 +720,8 @@ __global__ void fused_last_cluster_total(
 	    float cell_width_x,
 	    float cell_width_y,
 	    float cell_width_z,
-	    const float *bucket_h_max,
-	    const float *cell_bucket_h_max,
+	    const unsigned int *bucket_h_max_bits,
+	    const unsigned int *cell_bucket_h_max_bits,
 	    const int *cell_bucket_counts,
 	    const int *cell_bucket_starts,
 	    const int *sorted_ids,
@@ -775,7 +745,7 @@ __global__ void fused_last_cluster_total(
 	    int candidates = 0;
 	    int neighbors = 0;
 	    for (int bucket = 0; bucket < bucket_count; ++bucket) {
-	        float bucket_h = bucket_h_max[bucket];
+	        float bucket_h = __uint_as_float(bucket_h_max_bits[bucket]);
 	        if (bucket_h <= 0.0f) {
 	            continue;
 	        }
@@ -815,7 +785,7 @@ __global__ void fused_last_cluster_total(
 	                    }
 	                    int cell = fused_linear_cell(cx, cy, cz, nx, ny);
 	                    int flat = bucket * total_cells + cell;
-	                    float cell_bucket_h = cell_bucket_h_max[flat];
+	                    float cell_bucket_h = __uint_as_float(cell_bucket_h_max_bits[flat]);
 	                    if (cell_bucket_h <= 0.0f) {
 	                        continue;
 	                    }
@@ -994,8 +964,8 @@ class FusedCudaHBucketNeighborContext:
     bucket_count: int
     cell_width: np.ndarray
     stream: object
-    bucket_h_max: object
-    cell_bucket_h_max: object
+    bucket_h_max_bits: object
+    cell_bucket_h_max_bits: object
     sorted_ids: object
     cell_bucket_starts: object
     cell_bucket_counts: object
@@ -1021,8 +991,8 @@ class FusedCudaHBucketNeighborContext:
         assert self.y.dtype == np.float32
         assert self.z.dtype == np.float32
         assert self.h.dtype == np.float32
-        assert self.bucket_h_max.dtype == np.float32
-        assert self.cell_bucket_h_max.dtype == np.float32
+        assert self.bucket_h_max_bits.dtype == np.uint32
+        assert self.cell_bucket_h_max_bits.dtype == np.uint32
         assert self.sorted_ids.dtype == np.int32
         assert self.cell_bucket_starts.dtype == np.int32
         assert self.cell_bucket_counts.dtype == np.int32
@@ -1043,8 +1013,8 @@ class FusedCudaHBucketNeighborContext:
         return all(
             hasattr(array, "gpudata")
             for array in (
-                self.bucket_h_max,
-                self.cell_bucket_h_max,
+                self.bucket_h_max_bits,
+                self.cell_bucket_h_max_bits,
                 self.sorted_ids,
                 self.cell_bucket_starts,
                 self.cell_bucket_counts,
@@ -1083,9 +1053,8 @@ class FusedCudaNeighborWorkspace:
         self.hbucket_particle_bucket = None
         self.hbucket_particle_local_index = None
         self.hbucket_bucket_h_max_bits = None
-        self.hbucket_bucket_h_max = None
         self.hbucket_cell_bucket_h_max_bits = None
-        self.hbucket_cell_bucket_h_max = None
+        self.hbucket_h_min_ref = None
 
     def ensure_base(self, n: int, total_cells: int) -> None:
         import pycuda.gpuarray as gpuarray
@@ -1130,14 +1099,8 @@ class FusedCudaNeighborWorkspace:
         self.hbucket_bucket_h_max_bits = _ensure_gpu_array(
             self.hbucket_bucket_h_max_bits, bucket_count, np.uint32
         )
-        self.hbucket_bucket_h_max = _ensure_gpu_array(
-            self.hbucket_bucket_h_max, bucket_count, np.float32
-        )
         self.hbucket_cell_bucket_h_max_bits = _ensure_gpu_array(
             self.hbucket_cell_bucket_h_max_bits, flat_total, np.uint32
-        )
-        self.hbucket_cell_bucket_h_max = _ensure_gpu_array(
-            self.hbucket_cell_bucket_h_max, flat_total, np.float32
         )
 
 
@@ -1325,7 +1288,9 @@ def build_fused_cuda_hbucket_context_with_workspace(
     h_reduce_scratch: list[object],
 ) -> FusedCudaHBucketNeighborContext:
     """Build h-bucket sorted-cell context using reusable device buffers."""
-    h_min = reduce_min_float(h, n, stream, h_reduce_scratch)
+    if workspace.hbucket_h_min_ref is None:
+        workspace.hbucket_h_min_ref = reduce_min_float(h, n, stream, h_reduce_scratch)
+    h_min = workspace.hbucket_h_min_ref
     return _build_fused_cuda_hbucket_context_from_hmin(
         x,
         y,
@@ -1389,16 +1354,13 @@ def _build_fused_cuda_hbucket_context_from_hmin(
     d_particle_bucket = workspace.hbucket_particle_bucket
     d_particle_local_index = workspace.hbucket_particle_local_index
     d_bucket_h_max_bits = workspace.hbucket_bucket_h_max_bits
-    d_bucket_h_max = workspace.hbucket_bucket_h_max
     d_cell_bucket_h_max_bits = workspace.hbucket_cell_bucket_h_max_bits
-    d_cell_bucket_h_max = workspace.hbucket_cell_bucket_h_max
     cuda.memcpy_htod_async(_device_ptr(d_lower), np.ascontiguousarray(lower), stream)
     cuda.memcpy_htod_async(_device_ptr(d_upper), np.ascontiguousarray(upper), stream)
 
     kernels = _module()
     reset_hbucket_metadata = kernels.get_function("fused_reset_hbucket_metadata")
     compute_ids_counts = kernels.get_function("fused_compute_hbucket_ids_counts_xyz")
-    hbucket_bits_to_float = kernels.get_function("fused_hbucket_bits_to_float")
     scatter_sorted = kernels.get_function("fused_scatter_hbucket_sorted_particles")
 
     start, stop = _event_pair(stream)
@@ -1437,17 +1399,6 @@ def _build_fused_cuda_hbucket_context_from_hmin(
         stream=stream,
     )
     _scan_int32(d_cell_bucket_counts, d_cell_bucket_starts, stream)
-    hbucket_bits_to_float(
-        _device_ptr(d_bucket_h_max_bits),
-        _device_ptr(d_cell_bucket_h_max_bits),
-        np.int32(bucket_count),
-        np.int32(flat_total),
-        _device_ptr(d_bucket_h_max),
-        _device_ptr(d_cell_bucket_h_max),
-        block=(256, 1, 1),
-        grid=_grid_size(flat_total),
-        stream=stream,
-    )
     scatter_sorted(
         np.int32(n),
         np.int32(total_cells),
@@ -1476,8 +1427,8 @@ def _build_fused_cuda_hbucket_context_from_hmin(
         bucket_count=bucket_count,
         cell_width=cell_width,
         stream=stream,
-        bucket_h_max=d_bucket_h_max,
-        cell_bucket_h_max=d_cell_bucket_h_max,
+        bucket_h_max_bits=d_bucket_h_max_bits,
+        cell_bucket_h_max_bits=d_cell_bucket_h_max_bits,
         sorted_ids=d_sorted_ids,
         cell_bucket_starts=d_cell_bucket_starts,
         cell_bucket_counts=d_cell_bucket_counts,
@@ -1556,7 +1507,7 @@ def count_neighbors_from_hbucket_context(
         np.float32(context.cell_width[0]),
         np.float32(context.cell_width[1]),
         np.float32(context.cell_width[2]),
-        _device_ptr(context.bucket_h_max),
+        _device_ptr(context.bucket_h_max_bits),
         _device_ptr(context.cell_bucket_counts),
         _device_ptr(context.cell_bucket_starts),
         _device_ptr(context.sorted_ids),
@@ -1603,8 +1554,8 @@ def count_hbucket_traversal_work_from_context(
         np.float32(context.cell_width[0]),
         np.float32(context.cell_width[1]),
         np.float32(context.cell_width[2]),
-        _device_ptr(context.bucket_h_max),
-        _device_ptr(context.cell_bucket_h_max),
+        _device_ptr(context.bucket_h_max_bits),
+        _device_ptr(context.cell_bucket_h_max_bits),
         _device_ptr(context.cell_bucket_counts),
         _device_ptr(context.cell_bucket_starts),
         _device_ptr(context.sorted_ids),
@@ -1906,6 +1857,8 @@ def _device_ptr(array: object) -> object:
 
 
 def _event_pair(stream: object) -> tuple[object, object]:
+    if not _profile_cuda_events_enabled():
+        return None, None
     import pycuda.driver as cuda
 
     start = cuda.Event()
@@ -1915,12 +1868,19 @@ def _event_pair(stream: object) -> tuple[object, object]:
 
 
 def _finish_event(start: object, stop: object, stream: object) -> float:
-    stop.record(stream)
-    if "PYSPH_PROFILE_CUDA_EVENTS" not in os.environ:
+    if start is None:
         return 0.0
-    assert os.environ["PYSPH_PROFILE_CUDA_EVENTS"] == "1"
+    stop.record(stream)
     stop.synchronize()
     return float(stop.time_since(start))
+
+
+def _profile_cuda_events_enabled() -> bool:
+    value = os.environ.get("PYSPH_PROFILE_CUDA_EVENTS")
+    if value is None:
+        return False
+    assert value == "1"
+    return True
 
 
 def _scan_int32(input_array: object, output_array: object, stream: object) -> None:

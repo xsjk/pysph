@@ -1,6 +1,5 @@
 """Tests for generic fused CUDA kernel planning."""
 
-import os
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -73,8 +72,6 @@ from pysph.sph.tests.fused_cuda_codegen_equations import (
     CopyAcceleration,
     PreserveThenSetDensity,
     PrepPressure,
-    ReadDestAndSourceAcceleration,
-    ReadSourceAcceleration,
     SetDensity,
 )
 from pysph.sph.tests.fused_cuda_codegen_equations import (
@@ -88,6 +85,18 @@ from pysph.sph.tests.fused_cuda_codegen_equations import (
     InitializeTimeStepCandidate,
     PressureAcceleration,
 )
+
+
+def require_cuda():
+    pytest.importorskip("pycuda")
+    try:
+        import pycuda.autoinit  # noqa: F401
+        import pycuda.driver as cuda
+    except Exception as exc:
+        pytest.skip("CUDA is not available: %s" % exc)
+    if cuda.Device.count() == 0:
+        pytest.skip("CUDA device is not available")
+    return cuda
 
 
 def _deps(equation_name, method_kind):
@@ -943,8 +952,8 @@ def test_hbucket_pair_outline_uses_bucketed_cell_ranges():
         cubic_spline_wij_precompute(np.int32(1)),
     )
 
-    assert "bucket_h_max" in outline.source
-    assert "cell_bucket_h_max" in outline.source
+    assert "bucket_h_max_bits" in outline.source
+    assert "cell_bucket_h_max_bits" in outline.source
     assert "cell_bucket_counts" in outline.source
     assert "cell_bucket_starts" in outline.source
     assert "for (int bucket = 0; bucket < bucket_count; ++bucket)" in outline.source
@@ -1010,11 +1019,14 @@ def test_hbucket_source_parallel_outline_uses_bucketed_lane_ranges():
         CudaPairPrecompute(symbols=frozenset(), helper_source="", lines=()),
     )
 
-    assert "bucket_h_max" in outline.source
-    assert "cell_bucket_h_max" in outline.source
+    assert "bucket_h_max_bits" in outline.source
+    assert "cell_bucket_h_max_bits" in outline.source
     assert "cell_bucket_counts" in outline.source
     assert "float dst_x = x[dst];" in outline.source
-    assert "float cell_bucket_h = cell_bucket_h_max[flat];" in outline.source
+    assert (
+        "float cell_bucket_h = __uint_as_float(cell_bucket_h_max_bits[flat]);"
+        in outline.source
+    )
     assert "fused_codegen_in_support_xyz_cached" in outline.source
     assert "for (int pos = begin + lane; pos < end; pos += 32)" in outline.source
     assert "__shfl_down_sync" in outline.source
@@ -1061,8 +1073,8 @@ def test_hbucket_pair_launch_uses_bucket_context_stream_and_grid(monkeypatch):
         total_cells=14,
         bucket_count=4,
         cell_width=np.array([1.0 / 7.0, 0.5, 1.0], dtype=np.float32),
-        bucket_h_max=FakeGpuArray(),
-        cell_bucket_h_max=FakeGpuArray(),
+        bucket_h_max_bits=FakeGpuArray(),
+        cell_bucket_h_max_bits=FakeGpuArray(),
         cell_bucket_counts=FakeGpuArray(),
         cell_bucket_starts=FakeGpuArray(),
         sorted_ids=FakeGpuArray(),
@@ -1149,8 +1161,8 @@ def test_hbucket_source_parallel_launch_uses_bucket_context_stream_and_warp_grid
         total_cells=14,
         bucket_count=4,
         cell_width=np.array([1.0 / 7.0, 0.5, 1.0], dtype=np.float32),
-        bucket_h_max=FakeGpuArray(),
-        cell_bucket_h_max=FakeGpuArray(),
+        bucket_h_max_bits=FakeGpuArray(),
+        cell_bucket_h_max_bits=FakeGpuArray(),
         cell_bucket_counts=FakeGpuArray(),
         cell_bucket_starts=FakeGpuArray(),
         sorted_ids=FakeGpuArray(),
@@ -3064,12 +3076,7 @@ def test_gradient_h_pair_precompute_does_not_require_unused_arrays():
 
 
 def test_cuda_wrapper_call_pair_kernel_matches_periodic_bruteforce():
-    if "PYSPH_TEST_CUDA_FUSED_CODEGEN" not in os.environ:
-        pytest.skip("set PYSPH_TEST_CUDA_FUSED_CODEGEN=1 to run CUDA codegen tests")
-    pytest.importorskip("pycuda")
-
-    import pycuda.autoinit  # noqa: F401
-    import pycuda.driver as cuda
+    cuda = require_cuda()
     import pycuda.gpuarray as gpuarray
     from pycuda.compiler import SourceModule
 
@@ -3145,12 +3152,7 @@ def test_cuda_wrapper_call_pair_kernel_matches_periodic_bruteforce():
 
 
 def test_cuda_source_parallel_pair_add_mass_matches_periodic_bruteforce():
-    if "PYSPH_TEST_CUDA_FUSED_CODEGEN" not in os.environ:
-        pytest.skip("set PYSPH_TEST_CUDA_FUSED_CODEGEN=1 to run CUDA codegen tests")
-    pytest.importorskip("pycuda")
-
-    import pycuda.autoinit  # noqa: F401
-    import pycuda.driver as cuda
+    cuda = require_cuda()
     import pycuda.gpuarray as gpuarray
     from pycuda.compiler import SourceModule
 
@@ -3221,12 +3223,7 @@ def test_cuda_source_parallel_pair_add_mass_matches_periodic_bruteforce():
 
 
 def test_cuda_source_parallel_pair_sum_and_max_match_periodic_bruteforce():
-    if "PYSPH_TEST_CUDA_FUSED_CODEGEN" not in os.environ:
-        pytest.skip("set PYSPH_TEST_CUDA_FUSED_CODEGEN=1 to run CUDA codegen tests")
-    pytest.importorskip("pycuda")
-
-    import pycuda.autoinit  # noqa: F401
-    import pycuda.driver as cuda
+    cuda = require_cuda()
     import pycuda.gpuarray as gpuarray
     from pycuda.compiler import SourceModule
 
@@ -3314,12 +3311,7 @@ def test_cuda_source_parallel_pair_sum_and_max_match_periodic_bruteforce():
 
 
 def test_cuda_pair_stage_runs_initialize_loop_and_post_loop_in_one_kernel():
-    if "PYSPH_TEST_CUDA_FUSED_CODEGEN" not in os.environ:
-        pytest.skip("set PYSPH_TEST_CUDA_FUSED_CODEGEN=1 to run CUDA codegen tests")
-    pytest.importorskip("pycuda")
-
-    import pycuda.autoinit  # noqa: F401
-    import pycuda.driver as cuda
+    cuda = require_cuda()
     import pycuda.gpuarray as gpuarray
     from pycuda.compiler import SourceModule
 
@@ -3397,12 +3389,7 @@ def test_cuda_pair_stage_runs_initialize_loop_and_post_loop_in_one_kernel():
 
 
 def test_cuda_cubic_gradient_h_kernel_matches_cubic_bruteforce():
-    if "PYSPH_TEST_CUDA_FUSED_CODEGEN" not in os.environ:
-        pytest.skip("set PYSPH_TEST_CUDA_FUSED_CODEGEN=1 to run CUDA codegen tests")
-    pytest.importorskip("pycuda")
-
-    import pycuda.autoinit  # noqa: F401
-    import pycuda.driver as cuda
+    cuda = require_cuda()
     import pycuda.gpuarray as gpuarray
     from pycuda.compiler import SourceModule
     from pysph.base.kernels import CubicSpline
@@ -3483,12 +3470,7 @@ def test_cuda_cubic_gradient_h_kernel_matches_cubic_bruteforce():
 
 
 def test_cuda_pointwise_wrapper_call_kernel_matches_numpy_copy():
-    if "PYSPH_TEST_CUDA_FUSED_CODEGEN" not in os.environ:
-        pytest.skip("set PYSPH_TEST_CUDA_FUSED_CODEGEN=1 to run CUDA codegen tests")
-    pytest.importorskip("pycuda")
-
-    import pycuda.autoinit  # noqa: F401
-    import pycuda.driver as cuda
+    cuda = require_cuda()
     import pycuda.gpuarray as gpuarray
     from pycuda.compiler import SourceModule
 
@@ -3522,12 +3504,7 @@ def test_cuda_pointwise_wrapper_call_kernel_matches_numpy_copy():
 
 
 def test_cuda_pointwise_isothermal_eos_with_struct_matches_numpy():
-    if "PYSPH_TEST_CUDA_FUSED_CODEGEN" not in os.environ:
-        pytest.skip("set PYSPH_TEST_CUDA_FUSED_CODEGEN=1 to run CUDA codegen tests")
-    pytest.importorskip("pycuda")
-
-    import pycuda.autoinit  # noqa: F401
-    import pycuda.driver as cuda
+    cuda = require_cuda()
     import pycuda.gpuarray as gpuarray
     from pycuda.compiler import SourceModule
 
@@ -3563,12 +3540,7 @@ def test_cuda_pointwise_isothermal_eos_with_struct_matches_numpy():
 
 
 def test_cuda_generated_density_eos_rate_chain_matches_cubic_bruteforce():
-    if "PYSPH_TEST_CUDA_FUSED_CODEGEN" not in os.environ:
-        pytest.skip("set PYSPH_TEST_CUDA_FUSED_CODEGEN=1 to run CUDA codegen tests")
-    pytest.importorskip("pycuda")
-
-    import pycuda.autoinit  # noqa: F401
-    import pycuda.driver as cuda
+    cuda = require_cuda()
     import pycuda.gpuarray as gpuarray
     from pycuda.compiler import SourceModule
     from pysph.base.kernels import CubicSpline
@@ -3698,12 +3670,7 @@ def test_cuda_generated_density_eos_rate_chain_matches_cubic_bruteforce():
 
 
 def test_cuda_summation_density_wij_kernel_matches_cubic_bruteforce():
-    if "PYSPH_TEST_CUDA_FUSED_CODEGEN" not in os.environ:
-        pytest.skip("set PYSPH_TEST_CUDA_FUSED_CODEGEN=1 to run CUDA codegen tests")
-    pytest.importorskip("pycuda")
-
-    import pycuda.autoinit  # noqa: F401
-    import pycuda.driver as cuda
+    cuda = require_cuda()
     import pycuda.gpuarray as gpuarray
     from pycuda.compiler import SourceModule
     from pysph.base.kernels import CubicSpline
@@ -3802,12 +3769,7 @@ def test_cuda_summation_density_wij_kernel_matches_cubic_bruteforce():
 
 
 def test_cuda_cubic_gradient_kernel_matches_cubic_bruteforce():
-    if "PYSPH_TEST_CUDA_FUSED_CODEGEN" not in os.environ:
-        pytest.skip("set PYSPH_TEST_CUDA_FUSED_CODEGEN=1 to run CUDA codegen tests")
-    pytest.importorskip("pycuda")
-
-    import pycuda.autoinit  # noqa: F401
-    import pycuda.driver as cuda
+    cuda = require_cuda()
     import pycuda.gpuarray as gpuarray
     from pycuda.compiler import SourceModule
     from pysph.base.kernels import CubicSpline
@@ -3901,12 +3863,7 @@ def test_cuda_cubic_gradient_kernel_matches_cubic_bruteforce():
 
 
 def test_cuda_summation_density_wij_kernel_matches_quintic_bruteforce():
-    if "PYSPH_TEST_CUDA_FUSED_CODEGEN" not in os.environ:
-        pytest.skip("set PYSPH_TEST_CUDA_FUSED_CODEGEN=1 to run CUDA codegen tests")
-    pytest.importorskip("pycuda")
-
-    import pycuda.autoinit  # noqa: F401
-    import pycuda.driver as cuda
+    cuda = require_cuda()
     import pycuda.gpuarray as gpuarray
     from pycuda.compiler import SourceModule
     from pysph.base.kernels import QuinticSpline
@@ -4005,12 +3962,7 @@ def test_cuda_summation_density_wij_kernel_matches_quintic_bruteforce():
 
 
 def test_cuda_quintic_gradient_kernel_matches_quintic_bruteforce():
-    if "PYSPH_TEST_CUDA_FUSED_CODEGEN" not in os.environ:
-        pytest.skip("set PYSPH_TEST_CUDA_FUSED_CODEGEN=1 to run CUDA codegen tests")
-    pytest.importorskip("pycuda")
-
-    import pycuda.autoinit  # noqa: F401
-    import pycuda.driver as cuda
+    cuda = require_cuda()
     import pycuda.gpuarray as gpuarray
     from pycuda.compiler import SourceModule
     from pysph.base.kernels import QuinticSpline
