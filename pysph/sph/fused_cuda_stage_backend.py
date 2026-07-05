@@ -7,7 +7,7 @@ import numpy as np
 
 from pysph.base.fused_cuda_nnps import (
     FusedCudaNeighborWorkspace,
-    build_fused_cuda_hbucket_context_with_workspace,
+    build_fused_cuda_neighbor_context_with_workspace,
     create_fused_cuda_convergence_flag,
     read_fused_cuda_convergence_flag,
     reset_fused_cuda_convergence_flag,
@@ -18,18 +18,17 @@ from pysph.sph.fused_cuda_codegen import (
     cubic_spline_pair_precompute_for_symbols,
     generate_hbucket_pair_stage_outline_from_equations,
     generate_hbucket_pair_stage_outline_from_equations_with_convergence_flag,
-    generate_sorted_hbucket_pair_stage_outline_from_equations,
+    generate_sorted_cell_pair_stage_outline_from_equations,
     PairLaunchConfig,
     generate_pointwise_stage_outline_from_equations,
     launch_hbucket_pair_kernel_with_context,
-    launch_sorted_hbucket_pair_kernel_with_context,
+    launch_sorted_cell_pair_kernel_with_context,
     launch_pointwise_kernel,
     precompute_argument_names,
     quintic_spline_pair_precompute_for_symbols,
 )
 from pysph.sph.fused_cuda_stage_plan import (
     StageKind,
-    resident_rhs_windows,
 )
 
 
@@ -43,10 +42,6 @@ class FusedCudaStageBackend:
             self.covered_stage_groups,
             self.stage_group_by_plan_index,
         ) = _stage_group_mapping(helper)
-        (
-            self.resident_window_by_group,
-            self.resident_window_covered_groups,
-        ) = _resident_window_mapping(helper, self.stage_group_by_plan_index)
         self.has_device_convergence = _has_device_convergence(helper)
         self.launched_groups = set()
         self.device_convergence_skip_groups = set()
@@ -85,21 +80,11 @@ class FusedCudaStageBackend:
         stage_group = info["stage_group"]
         if stage_group in self.device_convergence_skip_groups:
             return True
-        if stage_group in self.resident_window_covered_groups:
-            return True
         if stage_group in self.covered_stage_groups:
             return True
         if stage_group not in self.stage_by_group:
             return False
         if stage_group in self.launched_groups:
-            return True
-        if stage_group in self.resident_window_by_group:
-            self._launch_resident_window(
-                evaluator,
-                self.resident_window_by_group[stage_group],
-                extra_args,
-            )
-            self.launched_groups.add(stage_group)
             return True
         stage = self.stage_by_group[stage_group]
         self._launch_stage(evaluator, stage, info, extra_args)
@@ -117,12 +102,6 @@ class FusedCudaStageBackend:
 
     def _launch_stage(self, evaluator, stage, info, extra_args):
         raise NotImplementedError("subclasses must launch the fused CUDA stage")
-
-    def _launch_resident_window(self, evaluator, stage_indices, extra_args):
-        for stage_index in stage_indices:
-            info = self._kernel_info_for_plan_stage_index(stage_index)
-            stage = self.helper.cuda_stage_plan.stages[stage_index]
-            self._launch_stage(evaluator, stage, info, extra_args)
 
     def _launch_device_convergence_super_stage(
         self, evaluator, info, extra_args, t, dt
@@ -282,8 +261,8 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
             if convergence_field is not None:
                 stage_args = (self.device_convergence_flag,) + stage_args
             self._record_pair_launch(traversal)
-            if traversal == "sorted_hbucket":
-                launch_config = launch_sorted_hbucket_pair_kernel_with_context(
+            if traversal == "sorted_cell":
+                launch_config = launch_sorted_cell_pair_kernel_with_context(
                     module, outline.name, context, stage_args
                 )
             else:
@@ -471,8 +450,8 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
         if outline_key in self.outlines:
             return self.outlines[outline_key]
         if stage.kind in (StageKind.PAIR_DENSITY, StageKind.PAIR_RATE):
-            if traversal == "sorted_hbucket":
-                outline = generate_sorted_hbucket_pair_stage_outline_from_equations(
+            if traversal == "sorted_cell":
+                outline = generate_sorted_cell_pair_stage_outline_from_equations(
                     "cuda_eval", stage, equations, precompute, convergence_field
                 )
             elif convergence_field is None:
@@ -545,26 +524,6 @@ def _has_device_convergence(helper):
     )
 
 
-def _resident_window_mapping(helper, stage_group_by_plan_index):
-    window_by_group = {}
-    covered_groups = set()
-    for window in resident_rhs_windows(helper.cuda_stage_plan):
-        stage_indices = tuple(
-            index
-            for index in window.stage_indices
-            if index in stage_group_by_plan_index
-        )
-        if len(stage_indices) <= 1:
-            continue
-        if len(stage_indices) != len(window.stage_indices):
-            continue
-        first_group = stage_group_by_plan_index[stage_indices[0]]
-        window_by_group[first_group] = stage_indices
-        for stage_index in stage_indices[1:]:
-            covered_groups.add(stage_group_by_plan_index[stage_index])
-    return window_by_group, covered_groups
-
-
 def _neighbor_context_key(info):
     return (id(info["dest"]), id(info["src"]))
 
@@ -601,13 +560,13 @@ def _stage_can_use_pointwise_kernel(stage):
 
 
 def _pair_traversal_for_stage(context):
-    if _stage_can_use_sorted_hbucket(context):
-        return "sorted_hbucket"
+    if _stage_uses_sorted_cell_context(context):
+        return "sorted_cell"
     return "hbucket"
 
 
-def _stage_can_use_sorted_hbucket(context):
-    return context.bucket_count == 1
+def _stage_uses_sorted_cell_context(context):
+    return hasattr(context, "cell_particle_counts")
 
 
 class _CudaStageTimer:
@@ -797,7 +756,7 @@ def _neighbor_context_for_info(evaluator, info, stream, h_reduce_scratch, worksp
     lower, upper, periodic = _neighbor_context_bounds_and_periodicity(nnps)
     radius_scale = np.float32(nnps.radius_scale)
     nreal = dest.get_number_of_particles(True)
-    return build_fused_cuda_hbucket_context_with_workspace(
+    return build_fused_cuda_neighbor_context_with_workspace(
         dest.gpu.x.dev,
         dest.gpu.y.dev,
         dest.gpu.z.dev,

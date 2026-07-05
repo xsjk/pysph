@@ -432,61 +432,6 @@ __global__ void fused_compute_cell_ids_counts_xyz(
 	    }
 	}
 
-__global__ void fused_cluster_counts_from_cells(
-    int total_cells,
-    const int *cell_counts,
-    int cluster_size,
-    int *cell_cluster_count
-)
-{
-    int cell = blockIdx.x * blockDim.x + threadIdx.x;
-    if (cell < total_cells) {
-        int count = cell_counts[cell];
-        cell_cluster_count[cell] = (count + cluster_size - 1) / cluster_size;
-    }
-}
-
-__global__ void fused_fill_destination_clusters(
-    int total_cells,
-    int cluster_size,
-    const int *cell_counts,
-    const int *cell_starts,
-    const int *cell_cluster_start,
-    int *cluster_cell,
-    int *cluster_begin,
-    int *cluster_count
-)
-{
-    int cell = blockIdx.x * blockDim.x + threadIdx.x;
-    if (cell >= total_cells) {
-        return;
-    }
-    int count = cell_counts[cell];
-    int clusters = (count + cluster_size - 1) / cluster_size;
-    int first_cluster = cell_cluster_start[cell];
-    for (int local = 0; local < clusters; ++local) {
-        int cluster = first_cluster + local;
-        int live = count - local * cluster_size;
-        if (live > cluster_size) {
-            live = cluster_size;
-        }
-        cluster_cell[cluster] = cell;
-        cluster_begin[cluster] = cell_starts[cell] + local * cluster_size;
-        cluster_count[cluster] = live;
-    }
-}
-
-__global__ void fused_last_cluster_total(
-    int total_cells,
-    const int *cell_cluster_start,
-    const int *cell_cluster_count,
-    int *cluster_total
-)
-{
-    int last = total_cells - 1;
-    cluster_total[0] = cell_cluster_start[last] + cell_cluster_count[last];
-}
-
 	__global__ void fused_count_neighbors_from_context(
     const float *x,
     const float *y,
@@ -892,14 +837,10 @@ class FusedCudaNeighborContext:
     search_radius_cells: np.int32
     cell_counts: np.ndarray
     total_cells: int
-    cluster_total: int
     stream: object
     sorted_ids: object
     cell_starts: object
     cell_particle_counts: object
-    cluster_cell: object
-    cluster_begin: object
-    cluster_count: object
     timings_ms: tuple[tuple[str, float], ...]
 
     def __post_init__(self):
@@ -912,7 +853,6 @@ class FusedCudaNeighborContext:
         assert self.search_radius_cells >= np.int32(1)
         assert self.cell_counts.dtype == np.int32
         assert self.total_cells == int(np.prod(self.cell_counts))
-        assert self.cluster_total > 0
         assert self.lower.shape == (3,)
         assert self.upper.shape == (3,)
         assert self.periodic.shape == (3,)
@@ -924,9 +864,6 @@ class FusedCudaNeighborContext:
         assert self.sorted_ids.dtype == np.int32
         assert self.cell_starts.dtype == np.int32
         assert self.cell_particle_counts.dtype == np.int32
-        assert self.cluster_cell.dtype == np.int32
-        assert self.cluster_begin.dtype == np.int32
-        assert self.cluster_count.dtype == np.int32
 
     @property
     def materializes_csr(self):
@@ -947,9 +884,6 @@ class FusedCudaNeighborContext:
                 self.sorted_ids,
                 self.cell_starts,
                 self.cell_particle_counts,
-                self.cluster_cell,
-                self.cluster_begin,
-                self.cluster_count,
             )
         )
 
@@ -1061,9 +995,6 @@ class FusedCudaNeighborWorkspace:
         self.sorted_ids = None
         self.particle_cell = None
         self.particle_local_index = None
-        self.cluster_cell = None
-        self.cluster_begin = None
-        self.cluster_count = None
         self.hbucket_cell_bucket_counts = None
         self.hbucket_cell_bucket_starts = None
         self.hbucket_sorted_ids = None
@@ -1076,8 +1007,6 @@ class FusedCudaNeighborWorkspace:
         self.hbucket_h_max_ref = None
 
     def ensure_base(self, n: int, total_cells: int) -> None:
-        import pycuda.gpuarray as gpuarray
-
         self.lower = _ensure_gpu_array(self.lower, 3, np.float32)
         self.upper = _ensure_gpu_array(self.upper, 3, np.float32)
         self.cell_particle_counts = _ensure_gpu_array(
@@ -1089,10 +1018,6 @@ class FusedCudaNeighborWorkspace:
         self.particle_local_index = _ensure_gpu_array(
             self.particle_local_index, n, np.int32
         )
-        if self.cluster_cell is None:
-            self.cluster_cell = gpuarray.empty((1,), np.int32)
-            self.cluster_begin = gpuarray.empty((1,), np.int32)
-            self.cluster_count = gpuarray.empty((1,), np.int32)
 
     def ensure_hbucket(self, n: int, flat_total: int, bucket_count: int) -> None:
         self.lower = _ensure_gpu_array(self.lower, 3, np.float32)
@@ -1123,7 +1048,7 @@ class FusedCudaNeighborWorkspace:
         )
 
 
-def build_fused_cuda_context_from_device_arrays(
+def build_fused_cuda_cell_context_with_workspace(
     x: object,
     y: object,
     z: object,
@@ -1133,12 +1058,13 @@ def build_fused_cuda_context_from_device_arrays(
     upper: np.ndarray,
     periodic: np.ndarray,
     radius_scale: np.float32,
-    cell_counts: np.ndarray,
+    h_max: np.float32,
     stream: object,
-    cluster_size: int,
+    workspace: FusedCudaNeighborWorkspace,
 ) -> FusedCudaNeighborContext:
-    """Build a no-CSR sorted-cell context from PySPH-style device arrays."""
-    workspace = FusedCudaNeighborWorkspace()
+    """Build a fixed-stencil sorted-cell context from maximum smoothing length."""
+    assert isinstance(h_max, np.float32)
+    cell_counts = cell_counts_from_hmax(lower, upper, h_max, radius_scale)
     return build_fused_cuda_context_with_workspace(
         x,
         y,
@@ -1151,9 +1077,7 @@ def build_fused_cuda_context_from_device_arrays(
         radius_scale,
         cell_counts,
         stream,
-        cluster_size,
         workspace,
-        True,
     )
 
 
@@ -1169,9 +1093,7 @@ def build_fused_cuda_context_with_workspace(
     radius_scale: np.float32,
     cell_counts: np.ndarray,
     stream: object,
-    cluster_size: int,
     workspace: FusedCudaNeighborWorkspace,
-    build_cluster_metadata: bool,
 ) -> FusedCudaNeighborContext:
     """Build sorted-cell context using caller-owned reusable device buffers."""
     _ensure_cuda_context()
@@ -1185,7 +1107,6 @@ def build_fused_cuda_context_with_workspace(
     assert periodic.dtype == np.bool_
     assert isinstance(radius_scale, np.float32)
     assert cell_counts.dtype == np.int32
-    assert cluster_size > 0
 
     import pycuda.driver as cuda
 
@@ -1243,29 +1164,6 @@ def build_fused_cuda_context_with_workspace(
         stream=stream,
     )
     build_cells_ms = _finish_event(start, stop, stream)
-    if build_cluster_metadata:
-        cluster_context = _build_cluster_metadata(
-            total_cells,
-            n,
-            cluster_size,
-            d_cell_particle_counts,
-            d_cell_starts,
-            stream,
-        )
-        cluster_total = cluster_context.cluster_total
-        cluster_cell = cluster_context.cluster_cell
-        cluster_begin = cluster_context.cluster_begin
-        cluster_count = cluster_context.cluster_count
-        timings_ms = (
-            ("build_cells_ms", build_cells_ms),
-            ("cluster_ranges_ms", cluster_context.cluster_ranges_ms),
-        )
-    else:
-        cluster_total = 1
-        cluster_cell = workspace.cluster_cell
-        cluster_begin = workspace.cluster_begin
-        cluster_count = workspace.cluster_count
-        timings_ms = (("build_cells_ms", build_cells_ms),)
     return FusedCudaNeighborContext(
         n=n,
         x=x,
@@ -1279,15 +1177,61 @@ def build_fused_cuda_context_with_workspace(
         search_radius_cells=np.int32(1),
         cell_counts=cell_counts,
         total_cells=total_cells,
-        cluster_total=cluster_total,
         stream=stream,
         sorted_ids=d_sorted_ids,
         cell_starts=d_cell_starts,
         cell_particle_counts=d_cell_particle_counts,
-        cluster_cell=cluster_cell,
-        cluster_begin=cluster_begin,
-        cluster_count=cluster_count,
-        timings_ms=timings_ms,
+        timings_ms=(("build_cells_ms", build_cells_ms),),
+    )
+
+
+def build_fused_cuda_neighbor_context_with_workspace(
+    x: object,
+    y: object,
+    z: object,
+    h: object,
+    n: int,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    periodic: np.ndarray,
+    radius_scale: np.float32,
+    bucket_count: int,
+    stream: object,
+    workspace: FusedCudaNeighborWorkspace,
+    h_reduce_scratch: list[object],
+) -> FusedCudaNeighborContext | FusedCudaHBucketNeighborContext:
+    """Build the fastest fused CUDA neighbor context for current h variation."""
+    h_min, h_max = _cached_h_bounds(h, n, stream, workspace, h_reduce_scratch)
+    active_bucket_count = _effective_hbucket_count(bucket_count, h_min, h_max)
+    if active_bucket_count == 1:
+        return build_fused_cuda_cell_context_with_workspace(
+            x,
+            y,
+            z,
+            h,
+            n,
+            lower,
+            upper,
+            periodic,
+            radius_scale,
+            h_max,
+            stream,
+            workspace,
+        )
+    return _build_fused_cuda_hbucket_context_from_hmin(
+        x,
+        y,
+        z,
+        h,
+        n,
+        lower,
+        upper,
+        periodic,
+        radius_scale,
+        active_bucket_count,
+        stream,
+        workspace,
+        h_min,
     )
 
 
@@ -1307,12 +1251,7 @@ def build_fused_cuda_hbucket_context_with_workspace(
     h_reduce_scratch: list[object],
 ) -> FusedCudaHBucketNeighborContext:
     """Build h-bucket sorted-cell context using reusable device buffers."""
-    if workspace.hbucket_h_min_ref is None:
-        workspace.hbucket_h_min_ref = reduce_min_float(h, n, stream, h_reduce_scratch)
-    if workspace.hbucket_h_max_ref is None:
-        workspace.hbucket_h_max_ref = reduce_max_float(h, n, stream, h_reduce_scratch)
-    h_min = workspace.hbucket_h_min_ref
-    h_max = workspace.hbucket_h_max_ref
+    h_min, h_max = _cached_h_bounds(h, n, stream, workspace, h_reduce_scratch)
     active_bucket_count = _effective_hbucket_count(bucket_count, h_min, h_max)
     return _build_fused_cuda_hbucket_context_from_hmin(
         x,
@@ -1329,6 +1268,22 @@ def build_fused_cuda_hbucket_context_with_workspace(
         workspace,
         h_min,
     )
+
+
+def _cached_h_bounds(
+    h: object,
+    n: int,
+    stream: object,
+    workspace: FusedCudaNeighborWorkspace,
+    h_reduce_scratch: list[object],
+) -> tuple[np.float32, np.float32]:
+    if workspace.hbucket_h_min_ref is None:
+        workspace.hbucket_h_min_ref = reduce_min_float(h, n, stream, h_reduce_scratch)
+    if workspace.hbucket_h_max_ref is None:
+        workspace.hbucket_h_max_ref = reduce_max_float(h, n, stream, h_reduce_scratch)
+    h_min = workspace.hbucket_h_min_ref
+    h_max = workspace.hbucket_h_max_ref
+    return h_min, h_max
 
 
 def _effective_hbucket_count(
@@ -1784,94 +1739,6 @@ def cell_counts_from_cell_size(
     return np.maximum(counts, np.ones((3,), dtype=np.int32)).astype(np.int32)
 
 
-@dataclass(frozen=True)
-class _ClusterMetadata:
-    cluster_total: int
-    cluster_cell: object
-    cluster_begin: object
-    cluster_count: object
-    cluster_ranges_ms: float
-
-
-def _build_cluster_metadata(
-    total_cells: int,
-    n: int,
-    cluster_size: int,
-    cell_counts: object,
-    cell_starts: object,
-    stream: object,
-) -> _ClusterMetadata:
-    import pycuda.gpuarray as gpuarray
-    import pycuda.driver as cuda
-
-    d_cell_cluster_count = gpuarray.empty((total_cells,), np.int32)
-    d_cell_cluster_start = gpuarray.empty((total_cells,), np.int32)
-    d_cluster_total = gpuarray.empty((1,), np.int32)
-    d_cluster_cell = gpuarray.empty((n,), np.int32)
-    d_cluster_begin = gpuarray.empty((n,), np.int32)
-    d_cluster_count = gpuarray.empty((n,), np.int32)
-
-    kernels = _module()
-    reset_int = kernels.get_function("fused_reset_int")
-    cluster_counts = kernels.get_function("fused_cluster_counts_from_cells")
-    fill_clusters = kernels.get_function("fused_fill_destination_clusters")
-    last_cluster_total = kernels.get_function("fused_last_cluster_total")
-
-    start, stop = _event_pair(stream)
-    reset_int(
-        _device_ptr(d_cluster_count),
-        np.int32(n),
-        block=(256, 1, 1),
-        grid=_grid_size(n),
-        stream=stream,
-    )
-    cluster_counts(
-        np.int32(total_cells),
-        _device_ptr(cell_counts),
-        np.int32(cluster_size),
-        _device_ptr(d_cell_cluster_count),
-        block=(256, 1, 1),
-        grid=_grid_size(total_cells),
-        stream=stream,
-    )
-    _scan_int32(d_cell_cluster_count, d_cell_cluster_start, stream)
-    fill_clusters(
-        np.int32(total_cells),
-        np.int32(cluster_size),
-        _device_ptr(cell_counts),
-        _device_ptr(cell_starts),
-        _device_ptr(d_cell_cluster_start),
-        _device_ptr(d_cluster_cell),
-        _device_ptr(d_cluster_begin),
-        _device_ptr(d_cluster_count),
-        block=(256, 1, 1),
-        grid=_grid_size(total_cells),
-        stream=stream,
-    )
-    last_cluster_total(
-        np.int32(total_cells),
-        _device_ptr(d_cell_cluster_start),
-        _device_ptr(d_cell_cluster_count),
-        _device_ptr(d_cluster_total),
-        block=(1, 1, 1),
-        grid=(1, 1, 1),
-        stream=stream,
-    )
-    cluster_ranges_ms = _finish_event(start, stop, stream)
-    host_cluster_total = np.empty((1,), dtype=np.int32)
-    cuda.memcpy_dtoh_async(host_cluster_total, _device_ptr(d_cluster_total), stream)
-    stream.synchronize()
-    cluster_total = int(host_cluster_total[0])
-    assert cluster_total > 0
-    return _ClusterMetadata(
-        cluster_total=cluster_total,
-        cluster_cell=d_cluster_cell,
-        cluster_begin=d_cluster_begin,
-        cluster_count=d_cluster_count,
-        cluster_ranges_ms=cluster_ranges_ms,
-    )
-
-
 def _ensure_cuda_context() -> None:
     import pycuda.autoinit
     import pycuda.driver as cuda
@@ -1922,9 +1789,9 @@ def _finish_event(start: object, stop: object, stream: object) -> float:
 
 
 def _profile_cuda_events_enabled() -> bool:
-    value = os.environ.get("PYSPH_PROFILE_CUDA_EVENTS")
-    if value is None:
+    if "PYSPH_PROFILE_CUDA_EVENTS" not in os.environ:
         return False
+    value = os.environ["PYSPH_PROFILE_CUDA_EVENTS"]
     assert value == "1"
     return True
 

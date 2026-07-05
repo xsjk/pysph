@@ -1,8 +1,6 @@
 """Generic fused CUDA kernel planning helpers."""
 
-import ast
 import inspect
-import textwrap
 from dataclasses import dataclass
 
 import numpy as np
@@ -31,16 +29,6 @@ class FusedKernelOutline:
 
     name: str
     source: str
-
-
-@dataclass(frozen=True)
-class CudaInlineMethodBody:
-    """CUDA statements lowered from one PySPH equation method."""
-
-    equation_name: str
-    method_kind: MethodKind
-    argument_declarations: tuple[str, ...]
-    lines: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -146,7 +134,7 @@ def launch_budget_for_specs(specs: tuple[FusedKernelSpec, ...]) -> FusedLaunchBu
 def generate_fused_kernel_outline(plan_id: str, stage: StageNode) -> FusedKernelOutline:
     """Return a stable, non-executable fused kernel outline for one stage."""
     if _stage_uses_neighbors(stage):
-        return generate_direct_pair_loop_outline(plan_id, stage)
+        return _generate_pair_comment_outline(plan_id, stage)
     name = fused_kernel_name(plan_id, stage)
     method_lines = [
         f"    // {method.equation_name}.{method.method_kind.value}"
@@ -163,6 +151,27 @@ def generate_fused_kernel_outline(plan_id: str, stage: StageNode) -> FusedKernel
     return FusedKernelOutline(name=name, source=source)
 
 
+def _generate_pair_comment_outline(
+    plan_id: str, stage: StageNode
+) -> FusedKernelOutline:
+    """Return a compact pair-stage outline for launch-budget reporting."""
+    name = fused_kernel_name(plan_id, stage)
+    method_lines = [
+        f"    // {method.equation_name}.{method.method_kind.value}"
+        for method in stage.methods
+    ]
+    source = "\n".join(
+        (
+            f'extern "C" __global__ void {name}(void)',
+            "{",
+            "    // sorted_cell/hbucket pair traversal",
+            *method_lines,
+            "}",
+        )
+    )
+    return FusedKernelOutline(name=name, source=source)
+
+
 def generate_pointwise_kernel_outline_with_equation_calls(
     plan_id: str,
     stage: StageNode,
@@ -172,7 +181,7 @@ def generate_pointwise_kernel_outline_with_equation_calls(
     """Return a pointwise CUDA outline using generated equation wrappers."""
     assert _stage_can_use_pointwise_kernel(stage)
     name = fused_kernel_name(plan_id, stage)
-    method_lines = _direct_pair_equation_call_lines(stage, calls)
+    method_lines = _equation_call_lines(stage, calls)
     arguments = ("int n",) + _equation_call_arguments(calls)
     fp32_wrapper_source = _force_cuda_source_fp32(wrapper_source)
     source = "\n".join(
@@ -199,67 +208,14 @@ def generate_pointwise_kernel_outline_with_equation_calls(
     return FusedKernelOutline(name=name, source=source)
 
 
-def generate_direct_pair_loop_outline(
-    plan_id: str, stage: StageNode
-) -> FusedKernelOutline:
-    """Return a destination-owned direct pair-loop CUDA outline."""
-    return _generate_direct_pair_loop_outline(plan_id, stage, ())
-
-
-def generate_direct_pair_loop_outline_with_inline_bodies(
-    plan_id: str, stage: StageNode, bodies: tuple[CudaInlineMethodBody, ...]
-) -> FusedKernelOutline:
-    """Return a direct pair-loop CUDA outline with lowered equation bodies."""
-    return _generate_direct_pair_loop_outline(plan_id, stage, bodies)
-
-
-def generate_direct_pair_loop_outline_with_equation_calls(
-    plan_id: str,
-    stage: StageNode,
-    wrapper_source: str,
-    calls: tuple[CudaEquationMethodCall, ...],
-) -> FusedKernelOutline:
-    """Return a direct pair-loop CUDA outline using generated equation wrappers."""
-    precompute = CudaPairPrecompute(symbols=frozenset(), helper_source="", lines=())
-    return _generate_direct_pair_loop_outline_with_equation_calls(
-        plan_id, stage, wrapper_source, precompute, calls, None
-    )
-
-
-def generate_direct_pair_loop_outline_with_equation_calls_and_precompute(
-    plan_id: str,
-    stage: StageNode,
-    wrapper_source: str,
-    precompute: CudaPairPrecompute,
-    calls: tuple[CudaEquationMethodCall, ...],
-) -> FusedKernelOutline:
-    """Return a direct pair-loop CUDA outline with wrapper calls and precompute."""
-    return _generate_direct_pair_loop_outline_with_equation_calls(
-        plan_id, stage, wrapper_source, precompute, calls, None
-    )
-
-
-def generate_direct_pair_loop_outline_with_convergence_flag(
-    plan_id: str,
-    stage: StageNode,
-    wrapper_source: str,
-    precompute: CudaPairPrecompute,
-    calls: tuple[CudaEquationMethodCall, ...],
-    convergence_field: str,
-) -> FusedKernelOutline:
-    """Return a direct pair-loop outline that clears a device convergence flag."""
-    return _generate_direct_pair_loop_outline_with_equation_calls(
-        plan_id, stage, wrapper_source, precompute, calls, convergence_field
-    )
-
-
-def generate_direct_pair_stage_outline_from_equations(
+def generate_sorted_cell_pair_stage_outline_from_equations(
     plan_id: str,
     stage: StageNode,
     equations: tuple[object, ...],
     precompute: CudaPairPrecompute,
+    convergence_field: str | None,
 ) -> FusedKernelOutline:
-    """Return a direct pair outline generated from PySPH equations."""
+    """Return a sorted fixed-stencil cell pair outline."""
     assert _stage_uses_neighbors(stage)
     known_types = _cuda_known_types_for_stage(stage, equations, precompute.symbols)
     group = CUDAGroup(list(equations))
@@ -267,66 +223,7 @@ def generate_direct_pair_stage_outline_from_equations(
     calls = _cuda_equation_calls_for_stage(
         stage, equations, known_types, precompute.symbols
     )
-    return generate_direct_pair_loop_outline_with_equation_calls_and_precompute(
-        plan_id, stage, wrapper_source, precompute, calls
-    )
-
-
-def generate_direct_pair_stage_outline_from_equations_with_convergence_flag(
-    plan_id: str,
-    stage: StageNode,
-    equations: tuple[object, ...],
-    precompute: CudaPairPrecompute,
-    convergence_field: str,
-) -> FusedKernelOutline:
-    """Return a direct pair outline that clears a device convergence flag."""
-    assert _stage_uses_neighbors(stage)
-    known_types = _cuda_known_types_for_stage(stage, equations, precompute.symbols)
-    group = CUDAGroup(list(equations))
-    wrapper_source = group.get_equation_wrappers(known_types)
-    calls = _cuda_equation_calls_for_stage(
-        stage, equations, known_types, precompute.symbols
-    )
-    return generate_direct_pair_loop_outline_with_convergence_flag(
-        plan_id, stage, wrapper_source, precompute, calls, convergence_field
-    )
-
-
-def generate_cluster_pair_stage_outline_from_equations(
-    plan_id: str,
-    stage: StageNode,
-    equations: tuple[object, ...],
-    precompute: CudaPairPrecompute,
-) -> FusedKernelOutline:
-    """Return a sorted-cell cluster pair outline generated from PySPH equations."""
-    assert _stage_uses_neighbors(stage)
-    known_types = _cuda_known_types_for_stage(stage, equations, precompute.symbols)
-    group = CUDAGroup(list(equations))
-    wrapper_source = group.get_equation_wrappers(known_types)
-    calls = _cuda_equation_calls_for_stage(
-        stage, equations, known_types, precompute.symbols
-    )
-    return _generate_cluster_pair_loop_outline_with_equation_calls(
-        plan_id, stage, wrapper_source, precompute, calls, None
-    )
-
-
-def generate_cluster_pair_stage_outline_from_equations_with_convergence_flag(
-    plan_id: str,
-    stage: StageNode,
-    equations: tuple[object, ...],
-    precompute: CudaPairPrecompute,
-    convergence_field: str,
-) -> FusedKernelOutline:
-    """Return a cluster pair outline that clears a device convergence flag."""
-    assert _stage_uses_neighbors(stage)
-    known_types = _cuda_known_types_for_stage(stage, equations, precompute.symbols)
-    group = CUDAGroup(list(equations))
-    wrapper_source = group.get_equation_wrappers(known_types)
-    calls = _cuda_equation_calls_for_stage(
-        stage, equations, known_types, precompute.symbols
-    )
-    return _generate_cluster_pair_loop_outline_with_equation_calls(
+    return _generate_sorted_cell_pair_loop_outline_with_equation_calls(
         plan_id, stage, wrapper_source, precompute, calls, convergence_field
     )
 
@@ -347,26 +244,6 @@ def generate_hbucket_pair_stage_outline_from_equations(
     )
     return _generate_hbucket_pair_loop_outline_with_equation_calls(
         plan_id, stage, wrapper_source, precompute, calls, None
-    )
-
-
-def generate_sorted_hbucket_pair_stage_outline_from_equations(
-    plan_id: str,
-    stage: StageNode,
-    equations: tuple[object, ...],
-    precompute: CudaPairPrecompute,
-    convergence_field: str | None,
-) -> FusedKernelOutline:
-    """Return a sorted single-bucket h-bucket pair outline."""
-    assert _stage_uses_neighbors(stage)
-    known_types = _cuda_known_types_for_stage(stage, equations, precompute.symbols)
-    group = CUDAGroup(list(equations))
-    wrapper_source = group.get_equation_wrappers(known_types)
-    calls = _cuda_equation_calls_for_stage(
-        stage, equations, known_types, precompute.symbols
-    )
-    return _generate_sorted_hbucket_pair_loop_outline_with_equation_calls(
-        plan_id, stage, wrapper_source, precompute, calls, convergence_field
     )
 
 
@@ -416,7 +293,7 @@ def _stage_can_use_pointwise_kernel(stage: StageNode) -> bool:
     return False
 
 
-def _generate_direct_pair_loop_outline_with_equation_calls(
+def _generate_sorted_cell_pair_loop_outline_with_equation_calls(
     plan_id: str,
     stage: StageNode,
     wrapper_source: str,
@@ -426,10 +303,9 @@ def _generate_direct_pair_loop_outline_with_equation_calls(
 ) -> FusedKernelOutline:
     assert _stage_uses_neighbors(stage)
     name = fused_kernel_name(plan_id, stage)
-    precompute_lines = _direct_pair_precompute_lines(precompute)
-    segment_lines = _direct_pair_segment_lines(stage, calls, precompute_lines)
+    segment_lines = _sorted_cell_pair_segment_lines(stage, calls, precompute)
     arguments = (
-        fused_context_argument_declarations()
+        sorted_cell_context_argument_declarations()
         + _convergence_flag_argument_declarations(convergence_field)
         + _unique_argument_declarations(
             _precompute_argument_declarations(precompute),
@@ -442,73 +318,18 @@ def _generate_direct_pair_loop_outline_with_equation_calls(
         (
             'extern "C" {',
             _FUSED_CUDA_COMPYLE_PREAMBLE,
-            _DIRECT_PAIR_HELPERS,
+            _PAIR_TRAVERSAL_HELPERS,
             precompute.helper_source,
             fp32_wrapper_source,
             f"__global__ void {name}(",
             _argument_block(arguments),
             ")",
             "{",
-            "    int dst = blockIdx.x * blockDim.x + threadIdx.x;",
-            "    if (dst >= n) {",
+            "    int order = blockIdx.x * blockDim.x + threadIdx.x;",
+            "    if (order >= n) {",
             "        return;",
             "    }",
-            *segment_lines,
-            *convergence_flag_lines,
-            "}",
-            "}",
-        )
-    )
-    return FusedKernelOutline(name=name, source=source)
-
-
-def _generate_cluster_pair_loop_outline_with_equation_calls(
-    plan_id: str,
-    stage: StageNode,
-    wrapper_source: str,
-    precompute: CudaPairPrecompute,
-    calls: tuple[CudaEquationMethodCall, ...],
-    convergence_field: str | None,
-) -> FusedKernelOutline:
-    assert _stage_uses_neighbors(stage)
-    name = fused_kernel_name(plan_id, stage)
-    precompute_lines = _direct_pair_precompute_lines(precompute)
-    segment_lines = _cluster_pair_segment_lines(stage, calls, precompute_lines)
-    arguments = (
-        cluster_context_argument_declarations()
-        + _convergence_flag_argument_declarations(convergence_field)
-        + _unique_argument_declarations(
-            _precompute_argument_declarations(precompute),
-            _equation_call_arguments(calls),
-        )
-    )
-    convergence_flag_lines = _convergence_flag_lines(convergence_field)
-    fp32_wrapper_source = _force_cuda_source_fp32(wrapper_source)
-    source = "\n".join(
-        (
-            'extern "C" {',
-            _FUSED_CUDA_COMPYLE_PREAMBLE,
-            _DIRECT_PAIR_HELPERS,
-            precompute.helper_source,
-            fp32_wrapper_source,
-            f"__global__ void {name}(",
-            _argument_block(arguments),
-            ")",
-            "{",
-            "    int dst_cluster = blockIdx.x;",
-            "    if (dst_cluster >= cluster_total) {",
-            "        return;",
-            "    }",
-            "    int lane = threadIdx.x;",
-            "    if (lane >= cluster_count[dst_cluster]) {",
-            "        return;",
-            "    }",
-            "    int cell0 = cluster_cell[dst_cluster];",
-            "    int base_cz = cell0 / (nx * ny);",
-            "    int rem = cell0 - base_cz * nx * ny;",
-            "    int base_cy = rem / nx;",
-            "    int base_cx = rem - base_cy * nx;",
-            "    int dst = sorted_ids[cluster_begin[dst_cluster] + lane];",
+            "    int dst = sorted_ids[order];",
             *segment_lines,
             *convergence_flag_lines,
             "}",
@@ -543,7 +364,7 @@ def _generate_hbucket_pair_loop_outline_with_equation_calls(
         (
             'extern "C" {',
             _FUSED_CUDA_COMPYLE_PREAMBLE,
-            _DIRECT_PAIR_HELPERS,
+            _PAIR_TRAVERSAL_HELPERS,
             precompute.helper_source,
             fp32_wrapper_source,
             f"__global__ void {name}(",
@@ -554,52 +375,6 @@ def _generate_hbucket_pair_loop_outline_with_equation_calls(
             "    if (dst >= n) {",
             "        return;",
             "    }",
-            *segment_lines,
-            *convergence_flag_lines,
-            "}",
-            "}",
-        )
-    )
-    return FusedKernelOutline(name=name, source=source)
-
-
-def _generate_sorted_hbucket_pair_loop_outline_with_equation_calls(
-    plan_id: str,
-    stage: StageNode,
-    wrapper_source: str,
-    precompute: CudaPairPrecompute,
-    calls: tuple[CudaEquationMethodCall, ...],
-    convergence_field: str | None,
-) -> FusedKernelOutline:
-    assert _stage_uses_neighbors(stage)
-    name = f"{fused_kernel_name(plan_id, stage)}_sorted"
-    segment_lines = _sorted_hbucket_pair_segment_lines(stage, calls, precompute)
-    arguments = (
-        hbucket_context_argument_declarations()
-        + _convergence_flag_argument_declarations(convergence_field)
-        + _unique_argument_declarations(
-            _precompute_argument_declarations(precompute),
-            _equation_call_arguments(calls),
-        )
-    )
-    convergence_flag_lines = _convergence_flag_lines(convergence_field)
-    fp32_wrapper_source = _hbucket_pair_wrapper_source(wrapper_source, stage)
-    source = "\n".join(
-        (
-            'extern "C" {',
-            _FUSED_CUDA_COMPYLE_PREAMBLE,
-            _DIRECT_PAIR_HELPERS,
-            precompute.helper_source,
-            fp32_wrapper_source,
-            f"__global__ void {name}(",
-            _argument_block(arguments),
-            ")",
-            "{",
-            "    int rank = blockIdx.x * blockDim.x + threadIdx.x;",
-            "    if (rank >= n || bucket_count != 1) {",
-            "        return;",
-            "    }",
-            "    int dst = sorted_ids[rank];",
             *segment_lines,
             *convergence_flag_lines,
             "}",
@@ -1038,13 +813,13 @@ def _quintic_spline_pair_lines(
     return tuple(lines)
 
 
-def launch_direct_pair_kernel_with_context(
+def launch_sorted_cell_pair_kernel_with_context(
     module: object,
     kernel_name: str,
     context: object,
     extra_args: tuple[object, ...],
 ) -> PairLaunchConfig:
-    """Launch a generated direct pair kernel with a fused neighbor context."""
+    """Launch a generated sorted fixed-stencil cell pair kernel."""
     kernel = module.get_function(kernel_name)
     block_size = _pair_block_size_for_count(context.n)
     grid_x = (context.n + block_size - 1) // block_size
@@ -1077,59 +852,10 @@ def launch_direct_pair_kernel_with_context(
         stream=context.stream,
     )
     return PairLaunchConfig(
-        traversal="direct",
+        traversal="sorted_cell",
         n=int(context.n),
         block_size=int(block_size),
         grid_x=int(grid_x),
-    )
-
-
-def launch_cluster_pair_kernel_with_context(
-    module: object,
-    kernel_name: str,
-    context: object,
-    extra_args: tuple[object, ...],
-) -> PairLaunchConfig:
-    """Launch a generated sorted-cell cluster pair kernel."""
-    kernel = module.get_function(kernel_name)
-    cluster_size = 64
-    kernel(
-        _kernel_arg(context.x),
-        _kernel_arg(context.y),
-        _kernel_arg(context.z),
-        _kernel_arg(context.h),
-        np.int32(context.n),
-        np.float32(context.lower[0]),
-        np.float32(context.upper[0]),
-        np.float32(context.lower[1]),
-        np.float32(context.upper[1]),
-        np.float32(context.lower[2]),
-        np.float32(context.upper[2]),
-        np.int32(context.periodic[0]),
-        np.int32(context.periodic[1]),
-        np.int32(context.periodic[2]),
-        context.radius_scale,
-        np.int32(context.search_radius_cells),
-        np.int32(context.cell_counts[0]),
-        np.int32(context.cell_counts[1]),
-        np.int32(context.cell_counts[2]),
-        _kernel_arg(context.cell_particle_counts),
-        _kernel_arg(context.cell_starts),
-        _kernel_arg(context.sorted_ids),
-        np.int32(context.cluster_total),
-        _kernel_arg(context.cluster_cell),
-        _kernel_arg(context.cluster_begin),
-        _kernel_arg(context.cluster_count),
-        *tuple(_kernel_arg(arg) for arg in extra_args),
-        block=(cluster_size, 1, 1),
-        grid=(context.cluster_total, 1, 1),
-        stream=context.stream,
-    )
-    return PairLaunchConfig(
-        traversal="cluster",
-        n=int(context.n),
-        block_size=int(cluster_size),
-        grid_x=int(context.cluster_total),
     )
 
 
@@ -1185,59 +911,6 @@ def launch_hbucket_pair_kernel_with_context(
     )
 
 
-def launch_sorted_hbucket_pair_kernel_with_context(
-    module: object,
-    kernel_name: str,
-    context: object,
-    extra_args: tuple[object, ...],
-) -> PairLaunchConfig:
-    """Launch a generated sorted single-bucket h-bucket pair kernel."""
-    assert context.bucket_count == 1
-    kernel = module.get_function(kernel_name)
-    block_size = _pair_block_size_for_count(context.n)
-    grid_x = (int(context.n) + block_size - 1) // block_size
-    kernel(
-        _kernel_arg(context.x),
-        _kernel_arg(context.y),
-        _kernel_arg(context.z),
-        _kernel_arg(context.h),
-        np.int32(context.n),
-        np.float32(context.lower[0]),
-        np.float32(context.upper[0]),
-        np.float32(context.lower[1]),
-        np.float32(context.upper[1]),
-        np.float32(context.lower[2]),
-        np.float32(context.upper[2]),
-        np.int32(context.periodic[0]),
-        np.int32(context.periodic[1]),
-        np.int32(context.periodic[2]),
-        context.radius_scale,
-        np.int32(context.cell_counts[0]),
-        np.int32(context.cell_counts[1]),
-        np.int32(context.cell_counts[2]),
-        np.int32(context.total_cells),
-        np.int32(context.bucket_count),
-        np.float32(context.cell_width[0]),
-        np.float32(context.cell_width[1]),
-        np.float32(context.cell_width[2]),
-        _kernel_arg(context.bucket_h_max_bits),
-        _kernel_arg(context.cell_bucket_h_max_bits),
-        _kernel_arg(context.cell_bucket_counts),
-        _kernel_arg(context.cell_bucket_starts),
-        _kernel_arg(context.sorted_ids),
-        *tuple(_kernel_arg(arg) for arg in extra_args),
-        block=(block_size, 1, 1),
-        grid=(grid_x, 1, 1),
-        stream=context.stream,
-    )
-    return PairLaunchConfig(
-        traversal="sorted_hbucket",
-        n=int(context.n),
-        block_size=int(block_size),
-        grid_x=int(grid_x),
-    )
-
-
 def _pair_block_size_for_count(n: int) -> int:
     full_block_size = 256
     full_particle_blocks = (int(n) + full_block_size - 1) // full_block_size
@@ -1285,184 +958,37 @@ def launch_pointwise_kernel(
     )
 
 
-def lower_equation_method_to_cuda(equation, method_name):
-    """Lower a simple PySPH equation method body to CUDA statements."""
-    assert hasattr(equation, method_name)
-    method = getattr(equation, method_name)
-    method_kind = MethodKind(method_name)
-    source = textwrap.dedent(inspect.getsource(method))
-    tree = ast.parse(source)
-    function = _first_function(tree)
-    args = inspect.getfullargspec(method).args
-    written_arrays = _written_array_names(function)
-    declarations = _cuda_method_argument_declarations(args, written_arrays)
-    lines = []
-    for statement in function.body:
-        lines.extend(_lower_statement(statement))
-    return CudaInlineMethodBody(
-        equation_name=equation.__class__.__name__,
-        method_kind=method_kind,
-        argument_declarations=declarations,
-        lines=tuple(lines),
-    )
-
-
-def _generate_direct_pair_loop_outline(
-    plan_id: str, stage: StageNode, bodies: tuple[CudaInlineMethodBody, ...]
-) -> FusedKernelOutline:
-    """Return a destination-owned direct pair-loop CUDA outline."""
-    assert _stage_uses_neighbors(stage)
-    name = fused_kernel_name(plan_id, stage)
-    method_lines = _direct_pair_method_lines(stage, bodies)
-    arguments = fused_context_argument_declarations() + _inline_argument_declarations(
-        bodies
-    )
-    source = "\n".join(
-        (
-            'extern "C" {',
-            _DIRECT_PAIR_HELPERS,
-            f"__global__ void {name}(",
-            _argument_block(arguments),
-            ")",
-            "{",
-            "    int dst = blockIdx.x * blockDim.x + threadIdx.x;",
-            "    if (dst >= n) {",
-            "        return;",
-            "    }",
-            "    int base_cx = fused_codegen_clamp_cell(x[dst], xmin, xmax, nx);",
-            "    int base_cy = fused_codegen_clamp_cell(y[dst], ymin, ymax, ny);",
-            "    int base_cz = fused_codegen_clamp_cell(z[dst], zmin, zmax, nz);",
-            "    for (int oz = -search_radius_cells; oz <= search_radius_cells; ++oz) {",
-            "        if (!fused_codegen_valid_offset(oz, nz)) {",
-            "            continue;",
-            "        }",
-            "        int cz = 0;",
-            "        if (!fused_codegen_neighbor_cell(base_cz, oz, nz, periodic_z, &cz)) {",
-            "            continue;",
-            "        }",
-            "        for (int oy = -search_radius_cells; oy <= search_radius_cells; ++oy) {",
-            "            if (!fused_codegen_valid_offset(oy, ny)) {",
-            "                continue;",
-            "            }",
-            "            int cy = 0;",
-            "            if (!fused_codegen_neighbor_cell(base_cy, oy, ny, periodic_y, &cy)) {",
-            "                continue;",
-            "            }",
-            "            for (int ox = -search_radius_cells; ox <= search_radius_cells; ++ox) {",
-            "                if (!fused_codegen_valid_offset(ox, nx)) {",
-            "                    continue;",
-            "                }",
-            "                int cx = 0;",
-            "                if (!fused_codegen_neighbor_cell(base_cx, ox, nx, periodic_x, &cx)) {",
-            "                    continue;",
-            "                }",
-            "                int cell = fused_codegen_linear_cell(cx, cy, cz, nx, ny);",
-            "                int begin = cell_starts[cell];",
-            "                int end = begin + cell_counts[cell];",
-            "                for (int pos = begin; pos < end; ++pos) {",
-            "                    int src = sorted_ids[pos];",
-            "                    if (fused_codegen_in_support_xyz(",
-            "                        dst, src, x, y, z, h, xmin, xmax, ymin, ymax,",
-            "                        zmin, zmax, periodic_x, periodic_y, periodic_z,",
-            "                        radius_scale",
-            "                    )) {",
-            *method_lines,
-            "                    }",
-            "                }",
-            "            }",
-            "        }",
-            "    }",
-            "}",
-            "}",
-        )
-    )
-    return FusedKernelOutline(name=name, source=source)
-
-
-def _direct_pair_method_lines(
-    stage: StageNode, bodies: tuple[CudaInlineMethodBody, ...]
-) -> tuple[str, ...]:
-    if len(bodies) == 0:
-        return tuple(
-            f"                                        // {method.equation_name}.{method.method_kind.value}"
-            for method in stage.methods
-        )
-    lines = []
-    for method in stage.methods:
-        body = _body_for_method(method.equation_name, method.method_kind, bodies)
-        for line in body.lines:
-            lines.append(f"                                        {line}")
-    return tuple(lines)
-
-
-def _body_for_method(
-    equation_name: str,
-    method_kind: MethodKind,
-    bodies: tuple[CudaInlineMethodBody, ...],
-) -> CudaInlineMethodBody:
-    matches = [
-        body
-        for body in bodies
-        if body.equation_name == equation_name and body.method_kind is method_kind
-    ]
-    assert len(matches) == 1
-    return matches[0]
-
-
-def _inline_argument_declarations(
-    bodies: tuple[CudaInlineMethodBody, ...],
-) -> tuple[str, ...]:
-    declarations = []
-    for body in bodies:
-        for declaration in body.argument_declarations:
-            if declaration not in declarations:
-                declarations.append(declaration)
-    return tuple(declarations)
-
-
-def _direct_pair_segment_lines(
+def _sorted_cell_pair_segment_lines(
     stage: StageNode,
     calls: tuple[CudaEquationMethodCall, ...],
-    precompute_lines: tuple[str, ...],
+    precompute: CudaPairPrecompute,
 ) -> tuple[str, ...]:
     lines = []
     for methods in _stage_method_segments(stage):
         pre_methods, loop_methods, post_methods = _pair_segment_methods(methods)
-        pre_loop_method_lines = _direct_pair_equation_call_lines(pre_methods, calls)
-        loop_method_lines = _direct_pair_equation_call_lines(loop_methods, calls)
-        post_loop_method_lines = _direct_pair_equation_call_lines(post_methods, calls)
+        reduction_methods = _local_reduction_methods_for_segment(loop_methods)
+        reduced_fields = _local_reduction_fields(reduction_methods)
+        pre_loop_method_lines = _equation_call_lines(pre_methods, calls)
+        if reduction_methods:
+            loop_method_lines = _local_reduction_pair_loop_call_lines(
+                loop_methods, calls, reduction_methods
+            )
+        else:
+            loop_method_lines = _equation_call_lines(loop_methods, calls)
+        post_loop_method_lines = _equation_call_lines(post_methods, calls)
         lines.extend(
             line.replace("                                        ", "    ")
             for line in pre_loop_method_lines
         )
+        lines.extend(_local_reduction_initialization_lines(reduced_fields))
         lines.extend(
-            _direct_pair_neighbor_traversal_lines(precompute_lines, loop_method_lines)
+            _sorted_cell_pair_neighbor_traversal_lines(
+                _hbucket_pair_precompute_lines(precompute),
+                precompute,
+                loop_method_lines,
+            )
         )
-        lines.extend(
-            line.replace("                                        ", "    ")
-            for line in post_loop_method_lines
-        )
-    return tuple(lines)
-
-
-def _cluster_pair_segment_lines(
-    stage: StageNode,
-    calls: tuple[CudaEquationMethodCall, ...],
-    precompute_lines: tuple[str, ...],
-) -> tuple[str, ...]:
-    lines = []
-    for methods in _stage_method_segments(stage):
-        pre_methods, loop_methods, post_methods = _pair_segment_methods(methods)
-        pre_loop_method_lines = _direct_pair_equation_call_lines(pre_methods, calls)
-        loop_method_lines = _direct_pair_equation_call_lines(loop_methods, calls)
-        post_loop_method_lines = _direct_pair_equation_call_lines(post_methods, calls)
-        lines.extend(
-            line.replace("                                        ", "    ")
-            for line in pre_loop_method_lines
-        )
-        lines.extend(
-            _cluster_pair_neighbor_traversal_lines(precompute_lines, loop_method_lines)
-        )
+        lines.extend(_local_reduction_commit_lines(reduced_fields))
         lines.extend(
             line.replace("                                        ", "    ")
             for line in post_loop_method_lines
@@ -1480,14 +1006,14 @@ def _hbucket_pair_segment_lines(
         pre_methods, loop_methods, post_methods = _pair_segment_methods(methods)
         reduction_methods = _local_reduction_methods_for_segment(loop_methods)
         reduced_fields = _local_reduction_fields(reduction_methods)
-        pre_loop_method_lines = _direct_pair_equation_call_lines(pre_methods, calls)
+        pre_loop_method_lines = _equation_call_lines(pre_methods, calls)
         if reduction_methods:
             loop_method_lines = _local_reduction_pair_loop_call_lines(
                 loop_methods, calls, reduction_methods
             )
         else:
-            loop_method_lines = _direct_pair_equation_call_lines(loop_methods, calls)
-        post_loop_method_lines = _direct_pair_equation_call_lines(post_methods, calls)
+            loop_method_lines = _equation_call_lines(loop_methods, calls)
+        post_loop_method_lines = _equation_call_lines(post_methods, calls)
         lines.extend(
             line.replace("                                        ", "    ")
             for line in pre_loop_method_lines
@@ -1495,44 +1021,6 @@ def _hbucket_pair_segment_lines(
         lines.extend(_local_reduction_initialization_lines(reduced_fields))
         lines.extend(
             _hbucket_pair_neighbor_traversal_lines(
-                _hbucket_pair_precompute_lines(precompute),
-                precompute,
-                loop_method_lines,
-            )
-        )
-        lines.extend(_local_reduction_commit_lines(reduced_fields))
-        lines.extend(
-            line.replace("                                        ", "    ")
-            for line in post_loop_method_lines
-        )
-    return tuple(lines)
-
-
-def _sorted_hbucket_pair_segment_lines(
-    stage: StageNode,
-    calls: tuple[CudaEquationMethodCall, ...],
-    precompute: CudaPairPrecompute,
-) -> tuple[str, ...]:
-    lines = []
-    for methods in _stage_method_segments(stage):
-        pre_methods, loop_methods, post_methods = _pair_segment_methods(methods)
-        reduction_methods = _local_reduction_methods_for_segment(loop_methods)
-        reduced_fields = _local_reduction_fields(reduction_methods)
-        pre_loop_method_lines = _direct_pair_equation_call_lines(pre_methods, calls)
-        if reduction_methods:
-            loop_method_lines = _local_reduction_pair_loop_call_lines(
-                loop_methods, calls, reduction_methods
-            )
-        else:
-            loop_method_lines = _direct_pair_equation_call_lines(loop_methods, calls)
-        post_loop_method_lines = _direct_pair_equation_call_lines(post_methods, calls)
-        lines.extend(
-            line.replace("                                        ", "    ")
-            for line in pre_loop_method_lines
-        )
-        lines.extend(_local_reduction_initialization_lines(reduced_fields))
-        lines.extend(
-            _single_bucket_hbucket_pair_neighbor_traversal_lines(
                 _hbucket_pair_precompute_lines(precompute),
                 precompute,
                 loop_method_lines,
@@ -1578,14 +1066,19 @@ def _pair_segment_methods(methods: tuple[object, ...]):
     return tuple(pre_methods), tuple(loop_methods), tuple(post_methods)
 
 
-def _direct_pair_neighbor_traversal_lines(
+def _sorted_cell_pair_neighbor_traversal_lines(
     precompute_lines: tuple[str, ...],
+    precompute: CudaPairPrecompute,
     loop_method_lines: tuple[str, ...],
 ) -> tuple[str, ...]:
     traversal_lines = (
-        "    int base_cx = fused_codegen_clamp_cell(x[dst], xmin, xmax, nx);",
-        "    int base_cy = fused_codegen_clamp_cell(y[dst], ymin, ymax, ny);",
-        "    int base_cz = fused_codegen_clamp_cell(z[dst], zmin, zmax, nz);",
+        "    float dst_x = x[dst];",
+        "    float dst_y = y[dst];",
+        "    float dst_z = z[dst];",
+        "    float dst_h = h[dst];",
+        "    int base_cx = fused_codegen_clamp_cell(dst_x, xmin, xmax, nx);",
+        "    int base_cy = fused_codegen_clamp_cell(dst_y, ymin, ymax, ny);",
+        "    int base_cz = fused_codegen_clamp_cell(dst_z, zmin, zmax, nz);",
         "    for (int oz = -search_radius_cells; oz <= search_radius_cells; ++oz) {",
         "        if (!fused_codegen_valid_offset(oz, nz)) {",
         "            continue;",
@@ -1615,63 +1108,21 @@ def _direct_pair_neighbor_traversal_lines(
         "                int end = begin + cell_counts[cell];",
         "                for (int pos = begin; pos < end; ++pos) {",
         "                    int src = sorted_ids[pos];",
-        "                    if (fused_codegen_in_support_xyz(",
-        "                        dst, src, x, y, z, h, xmin, xmax, ymin, ymax,",
-        "                        zmin, zmax, periodic_x, periodic_y, periodic_z,",
-        "                        radius_scale",
-        "                    )) {",
-        *precompute_lines,
-        *loop_method_lines,
-        "                    }",
-        "                }",
-        "            }",
-        "        }",
-        "    }",
-    )
-    return ("    {", *tuple(f"    {line}" for line in traversal_lines), "    }")
-
-
-def _cluster_pair_neighbor_traversal_lines(
-    precompute_lines: tuple[str, ...],
-    loop_method_lines: tuple[str, ...],
-) -> tuple[str, ...]:
-    traversal_lines = (
-        "    for (int oz = -search_radius_cells; oz <= search_radius_cells; ++oz) {",
-        "        if (!fused_codegen_valid_offset(oz, nz)) {",
-        "            continue;",
-        "        }",
-        "        int cz = 0;",
-        "        if (!fused_codegen_neighbor_cell(base_cz, oz, nz, periodic_z, &cz)) {",
-        "            continue;",
-        "        }",
-        "        for (int oy = -search_radius_cells; oy <= search_radius_cells; ++oy) {",
-        "            if (!fused_codegen_valid_offset(oy, ny)) {",
-        "                continue;",
-        "            }",
-        "            int cy = 0;",
-        "            if (!fused_codegen_neighbor_cell(base_cy, oy, ny, periodic_y, &cy)) {",
-        "                continue;",
-        "            }",
-        "            for (int ox = -search_radius_cells; ox <= search_radius_cells; ++ox) {",
-        "                if (!fused_codegen_valid_offset(ox, nx)) {",
-        "                    continue;",
-        "                }",
-        "                int cx = 0;",
-        "                if (!fused_codegen_neighbor_cell(base_cx, ox, nx, periodic_x, &cx)) {",
-        "                    continue;",
-        "                }",
-        "                int cell = fused_codegen_linear_cell(cx, cy, cz, nx, ny);",
-        "                int begin = cell_starts[cell];",
-        "                int end = begin + cell_counts[cell];",
-        "                for (int pos = begin; pos < end; ++pos) {",
-        "                    int src = sorted_ids[pos];",
-        "                    if (fused_codegen_in_support_xyz(",
-        "                        dst, src, x, y, z, h, xmin, xmax, ymin, ymax,",
-        "                        zmin, zmax, periodic_x, periodic_y, periodic_z,",
-        "                        radius_scale",
-        "                    )) {",
-        *precompute_lines,
-        *loop_method_lines,
+        *_hbucket_pair_support_lines(precompute, "                    "),
+        *tuple(
+            line.replace(
+                "                                        ",
+                "                        ",
+            )
+            for line in precompute_lines
+        ),
+        *tuple(
+            line.replace(
+                "                                        ",
+                "                        ",
+            )
+            for line in loop_method_lines
+        ),
         "                    }",
         "                }",
         "            }",
@@ -1778,90 +1229,7 @@ def _hbucket_pair_neighbor_traversal_lines(
     return ("    {", *tuple(f"    {line}" for line in traversal_lines), "    }")
 
 
-def _single_bucket_hbucket_pair_neighbor_traversal_lines(
-    precompute_lines: tuple[str, ...],
-    precompute: CudaPairPrecompute,
-    loop_method_lines: tuple[str, ...],
-) -> tuple[str, ...]:
-    traversal_lines = (
-        "    float dst_x = x[dst];",
-        "    float dst_y = y[dst];",
-        "    float dst_z = z[dst];",
-        "    float dst_h = h[dst];",
-        "    int base_cx = fused_codegen_clamp_cell(dst_x, xmin, xmax, nx);",
-        "    int base_cy = fused_codegen_clamp_cell(dst_y, ymin, ymax, ny);",
-        "    int base_cz = fused_codegen_clamp_cell(dst_z, zmin, zmax, nz);",
-        "    float bucket_h = __uint_as_float(bucket_h_max_bits[0]);",
-        "    float bucket_support = radius_scale * fmaxf(dst_h, bucket_h);",
-        "    int max_x = (int)ceilf(bucket_support / cell_width_x);",
-        "    int max_y = (int)ceilf(bucket_support / cell_width_y);",
-        "    int max_z = (int)ceilf(bucket_support / cell_width_z);",
-        "    int full_x = periodic_x && nx <= 2 * max_x + 1;",
-        "    int full_y = periodic_y && ny <= 2 * max_y + 1;",
-        "    int full_z = periodic_z && nz <= 2 * max_z + 1;",
-        "    int loops_x = full_x ? nx : 2 * max_x + 1;",
-        "    int loops_y = full_y ? ny : 2 * max_y + 1;",
-        "    int loops_z = full_z ? nz : 2 * max_z + 1;",
-        "    for (int iz = 0; iz < loops_z; ++iz) {",
-        "        int cz = iz;",
-        "        if (!full_z && !fused_codegen_neighbor_cell(base_cz, iz - max_z, nz, periodic_z, &cz)) {",
-        "            continue;",
-        "        }",
-        "        for (int iy = 0; iy < loops_y; ++iy) {",
-        "            int cy = iy;",
-        "            if (!full_y && !fused_codegen_neighbor_cell(base_cy, iy - max_y, ny, periodic_y, &cy)) {",
-        "                continue;",
-        "            }",
-        "            for (int ix = 0; ix < loops_x; ++ix) {",
-        "                int cx = ix;",
-        "                if (!full_x && !fused_codegen_neighbor_cell(base_cx, ix - max_x, nx, periodic_x, &cx)) {",
-        "                    continue;",
-        "                }",
-        "                int cell = fused_codegen_linear_cell(cx, cy, cz, nx, ny);",
-        "                int count = cell_bucket_counts[cell];",
-        "                if (count <= 0) {",
-        "                    continue;",
-        "                }",
-        "                float cell_bucket_h = __uint_as_float(cell_bucket_h_max_bits[cell]);",
-        "                float cell_support = radius_scale * fmaxf(dst_h, cell_bucket_h);",
-        "                float cell_support2 = cell_support * cell_support;",
-        "                float cell_distance2 = fused_codegen_cell_distance2_to_particle(",
-        "                    cell, nx, ny, dst_x, dst_y, dst_z, xmin, xmax,",
-        "                    ymin, ymax, zmin, zmax, periodic_x, periodic_y,",
-        "                    periodic_z, cell_width_x, cell_width_y, cell_width_z",
-        "                );",
-        "                if (cell_distance2 > cell_support2) {",
-        "                    continue;",
-        "                }",
-        "                int begin = cell_bucket_starts[cell];",
-        "                int end = begin + count;",
-        "                for (int pos = begin; pos < end; ++pos) {",
-        "                    int src = sorted_ids[pos];",
-        *_hbucket_pair_support_lines(precompute, "                    "),
-        *tuple(
-            line.replace(
-                "                                        ",
-                "                        ",
-            )
-            for line in precompute_lines
-        ),
-        *tuple(
-            line.replace(
-                "                                        ",
-                "                        ",
-            )
-            for line in loop_method_lines
-        ),
-        "                    }",
-        "                }",
-        "            }",
-        "        }",
-        "    }",
-    )
-    return ("    {", *tuple(f"    {line}" for line in traversal_lines), "    }")
-
-
-def _direct_pair_equation_call_lines(
+def _equation_call_lines(
     methods_or_stage: object,
     calls: tuple[CudaEquationMethodCall, ...],
     method_filter=None,
@@ -1890,7 +1258,7 @@ def _grid_stride_call_lines(
 ) -> tuple[str, ...]:
     return tuple(
         line.replace("                                        ", "        ")
-        for line in _direct_pair_equation_call_lines(methods, calls)
+        for line in _equation_call_lines(methods, calls)
     )
 
 
@@ -2016,12 +1384,6 @@ def _is_pair_post_loop_method(method: object) -> bool:
 
 def _is_source_free_method(method: object) -> bool:
     return not bool(method.sources)
-
-
-def _direct_pair_precompute_lines(precompute: CudaPairPrecompute) -> tuple[str, ...]:
-    return tuple(
-        f"                                        {line}" for line in precompute.lines
-    )
 
 
 def _hbucket_pair_precompute_lines(
@@ -2353,8 +1715,8 @@ def _kernel_arg(arg):
     return arg
 
 
-def fused_context_argument_declarations() -> tuple[str, ...]:
-    """Return the CUDA argument ABI consumed by fused direct pair loops."""
+def sorted_cell_context_argument_declarations() -> tuple[str, ...]:
+    """Return the CUDA argument ABI consumed by sorted fixed-cell pair loops."""
     return (
         "const float *x",
         "const float *y",
@@ -2378,16 +1740,6 @@ def fused_context_argument_declarations() -> tuple[str, ...]:
         "const int *cell_counts",
         "const int *cell_starts",
         "const int *sorted_ids",
-    )
-
-
-def cluster_context_argument_declarations() -> tuple[str, ...]:
-    """Return the CUDA argument ABI consumed by fused cluster pair loops."""
-    return fused_context_argument_declarations() + (
-        "int cluster_total",
-        "const int *cluster_cell",
-        "const int *cluster_begin",
-        "const int *cluster_count",
     )
 
 
@@ -2433,114 +1785,11 @@ def _stage_uses_neighbors(stage: StageNode) -> bool:
     return stage.kind in (StageKind.PAIR_DENSITY, StageKind.PAIR_RATE)
 
 
-def _first_function(tree):
-    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
-    assert functions
-    return functions[0]
-
-
-def _written_array_names(function):
-    names = []
-    for node in ast.walk(function):
-        if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Store):
-            assert isinstance(node.value, ast.Name)
-            name = node.value.id
-            assert _is_array_name(name)
-            if name not in names:
-                names.append(name)
-    return tuple(names)
-
-
-def _cuda_method_argument_declarations(args, written_arrays):
-    declarations = []
-    ignored = {"self", "d_idx", "s_idx"}
-    for arg in args:
-        if arg in ignored:
-            continue
-        assert _is_array_name(arg)
-        assert not (arg.startswith("s_") and arg in written_arrays)
-        if arg in written_arrays:
-            declarations.append(f"float *{arg}")
-        else:
-            declarations.append(f"const float *{arg}")
-    return tuple(declarations)
-
-
-def _lower_statement(statement):
-    if isinstance(statement, ast.Assign):
-        assert len(statement.targets) == 1
-        target = _lower_subscript(statement.targets[0])
-        value = _lower_expr(statement.value)
-        return (f"{target} = {value};",)
-    if isinstance(statement, ast.AugAssign):
-        target = _lower_subscript(statement.target)
-        operator = _lower_aug_operator(statement.op)
-        value = _lower_expr(statement.value)
-        return (f"{target} {operator}= {value};",)
-    assert False
-
-
-def _lower_expr(expression):
-    if isinstance(expression, ast.Subscript):
-        return _lower_subscript(expression)
-    if isinstance(expression, ast.Name):
-        return _lower_name(expression.id)
-    if isinstance(expression, ast.Constant):
-        return _lower_constant(expression.value)
-    assert False
-
-
-def _lower_subscript(expression):
-    assert isinstance(expression, ast.Subscript)
-    assert isinstance(expression.value, ast.Name)
-    name = expression.value.id
-    assert _is_array_name(name)
-    index = _lower_index(expression.slice)
-    return f"{name}[{index}]"
-
-
-def _lower_index(expression):
-    if isinstance(expression, ast.Name):
-        return _lower_name(expression.id)
-    if isinstance(expression, ast.Constant):
-        assert isinstance(expression.value, int)
-        return str(expression.value)
-    assert False
-
-
-def _lower_name(name):
-    if name == "d_idx":
-        return "dst"
-    if name == "s_idx":
-        return "src"
-    assert False
-
-
-def _lower_constant(value):
-    if isinstance(value, float):
-        return f"{value:g}f"
-    if isinstance(value, int):
-        return str(value)
-    assert False
-
-
-def _lower_aug_operator(operator):
-    if isinstance(operator, ast.Add):
-        return "+"
-    if isinstance(operator, ast.Sub):
-        return "-"
-    if isinstance(operator, ast.Mult):
-        return "*"
-    if isinstance(operator, ast.Div):
-        return "/"
-    assert False
-
-
 def _is_array_name(name):
     return name.startswith("d_") or name.startswith("s_")
 
 
-_DIRECT_PAIR_HELPERS = r"""
+_PAIR_TRAVERSAL_HELPERS = r"""
 __device__ int fused_codegen_clamp_cell(float value, float lower, float upper, int count)
 {
     float span = upper - lower;

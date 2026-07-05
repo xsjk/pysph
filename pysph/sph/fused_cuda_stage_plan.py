@@ -63,40 +63,6 @@ class MethodDeps:
 
 
 @dataclass(frozen=True)
-class PairReductionMethod:
-    """Pair-loop reduction contract for source-parallel CUDA lowering."""
-
-    equation_name: str
-    method_kind: MethodKind
-    dest: str
-    sources: tuple[str, ...]
-    dest_reduction_writes: frozenset[str]
-    dest_max_reduction_writes: frozenset[str]
-    unsupported_reasons: tuple[str, ...]
-
-    @property
-    def supported(self):
-        """Return whether the loop can be split across CUDA threads safely."""
-        return self.unsupported_reasons == ()
-
-
-@dataclass(frozen=True)
-class PairReductionStage:
-    """Stage-level reduction contract for source-parallel CUDA lowering."""
-
-    kind: StageKind
-    dest: str
-    sources: tuple[str, ...]
-    methods: tuple[PairReductionMethod, ...]
-    unsupported_reasons: tuple[str, ...]
-
-    @property
-    def supported(self):
-        """Return whether all threaded pair loops in this stage are reductions."""
-        return self.unsupported_reasons == ()
-
-
-@dataclass(frozen=True)
 class DeviceConvergencePolicy:
     """Device convergence contract for one iterative fused stage."""
 
@@ -159,85 +125,6 @@ class CudaStagePlan:
         return "\n".join(lines)
 
 
-@dataclass(frozen=True)
-class ResidentRhsWindow:
-    """Contiguous RHS stages that can share resident CUDA metadata."""
-
-    dest: str
-    stage_indices: tuple[int, ...]
-    stage_kinds: tuple[StageKind, ...]
-    neighbor_build_count: int
-    rhs_core_kernel_count: int
-    control_kernel_count: int
-    planned_launch_count: int
-    materializes_csr: bool
-    uses_device_metadata: bool
-
-
-def resident_rhs_windows(plan):
-    """Return resident metadata windows for a fused CUDA stage plan."""
-    windows = []
-    current = []
-    current_dest = None
-    metadata_invalidated = False
-    for index, stage in enumerate(plan.stages):
-        assert stage.kind is not StageKind.HOST_BOUNDARY
-        if _starts_new_resident_window(
-            current, current_dest, metadata_invalidated, stage
-        ):
-            windows.append(_resident_rhs_window(plan, tuple(current)))
-            current = []
-            metadata_invalidated = False
-        if not current:
-            current_dest = stage.dest
-        current.append(index)
-        if _stage_invalidates_neighbor_metadata(stage):
-            metadata_invalidated = True
-    if current:
-        windows.append(_resident_rhs_window(plan, tuple(current)))
-    return tuple(windows)
-
-
-def _starts_new_resident_window(current, current_dest, metadata_invalidated, stage):
-    if not current:
-        return False
-    if stage.dest != current_dest:
-        return True
-    return metadata_invalidated and _stage_uses_neighbor_metadata(stage)
-
-
-def _resident_rhs_window(plan, stage_indices):
-    stage_kinds = tuple(plan.stages[index].kind for index in stage_indices)
-    neighbor_build_count = 0
-    if any(_stage_kind_uses_neighbor_metadata(kind) for kind in stage_kinds):
-        neighbor_build_count = 1
-    control_kernel_count = sum(
-        1 for kind in stage_kinds if kind is StageKind.DEVICE_CONVERGENCE
-    )
-    rhs_core_kernel_count = len(stage_kinds) - control_kernel_count
-    return ResidentRhsWindow(
-        dest=plan.stages[stage_indices[0]].dest,
-        stage_indices=stage_indices,
-        stage_kinds=stage_kinds,
-        neighbor_build_count=neighbor_build_count,
-        rhs_core_kernel_count=rhs_core_kernel_count,
-        control_kernel_count=control_kernel_count,
-        planned_launch_count=(
-            neighbor_build_count + rhs_core_kernel_count + control_kernel_count
-        ),
-        materializes_csr=False,
-        uses_device_metadata=neighbor_build_count > 0,
-    )
-
-
-def _stage_uses_neighbor_metadata(stage):
-    return _stage_kind_uses_neighbor_metadata(stage.kind)
-
-
-def _stage_kind_uses_neighbor_metadata(kind):
-    return kind in (StageKind.PAIR_DENSITY, StageKind.PAIR_RATE)
-
-
 def _format_convergence_policy(policy):
     if policy is None:
         return ""
@@ -291,69 +178,6 @@ def analyze_equation_method(equation, method_name):
         dest_reduction_writes=dest_reduction_writes,
         dest_max_reduction_writes=dest_max_reduction_writes,
         dest_reduction_reads=dest_reduction_reads,
-    )
-
-
-def analyze_pair_reduction_method(equation, method_name):
-    """Return whether one equation method is a destination additive pair loop."""
-    assert _has_overloaded_method(equation, method_name)
-    method = getattr(equation, method_name)
-    method_kind = MethodKind(method_name)
-    source = textwrap.dedent(inspect.getsource(method))
-    tree = ast.parse(source)
-    function = _first_function(tree)
-    sources = equation.sources if equation.sources is not None else ()
-    collector = _PairReductionCollector()
-    collector.visit_function_body(function)
-    unsupported = _pair_reduction_unsupported_reasons(method_kind, sources, collector)
-    if (
-        not collector.dest_reduction_writes
-        and not collector.dest_max_reduction_writes
-        and not unsupported
-        and method_kind is MethodKind.LOOP
-        and sources
-    ):
-        unsupported.append("no destination reduction")
-    return PairReductionMethod(
-        equation_name=equation.__class__.__name__,
-        method_kind=method_kind,
-        dest=equation.dest,
-        sources=tuple(sources),
-        dest_reduction_writes=frozenset(collector.dest_reduction_writes),
-        dest_max_reduction_writes=frozenset(collector.dest_max_reduction_writes),
-        unsupported_reasons=tuple(sorted(set(unsupported))),
-    )
-
-
-def analyze_pair_reduction_stage(stage, equations):
-    """Return whether a pair stage can use source-parallel additive lowering."""
-    if stage.kind not in (StageKind.PAIR_DENSITY, StageKind.PAIR_RATE):
-        return PairReductionStage(
-            kind=stage.kind,
-            dest=stage.dest,
-            sources=stage.sources,
-            methods=(),
-            unsupported_reasons=("non-pair stage",),
-        )
-    methods = []
-    unsupported = []
-    for method in stage.methods:
-        if method.method_kind is MethodKind.LOOP and method.sources:
-            equation = _equation_for_method_name(method.equation_name, equations)
-            analysis = analyze_pair_reduction_method(equation, method.method_kind.value)
-            methods.append(analysis)
-            for reason in analysis.unsupported_reasons:
-                unsupported.append(
-                    f"{method.equation_name}.{method.method_kind.value}: {reason}"
-                )
-    if not methods:
-        unsupported.append("no pair loop")
-    return PairReductionStage(
-        kind=stage.kind,
-        dest=stage.dest,
-        sources=stage.sources,
-        methods=tuple(methods),
-        unsupported_reasons=tuple(sorted(set(unsupported))),
     )
 
 
@@ -852,16 +676,6 @@ def _first_equation(group):
     equations = _flatten_equations(group)
     assert equations
     return equations[0]
-
-
-def _equation_for_method_name(equation_name, equations):
-    matches = [
-        equation
-        for equation in equations
-        if equation.__class__.__name__ == equation_name
-    ]
-    assert len(matches) == 1
-    return matches[0]
 
 
 def _flatten_equations(group):

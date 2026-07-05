@@ -1,37 +1,37 @@
-"""Tests for the generic fused CUDA neighbor metadata contract."""
+"""Tests for fused CUDA neighbor metadata."""
 
 import sys
 import types
+
 import numpy as np
 import pytest
 
 import pysph.base.fused_cuda_nnps as fused_nnps
 from pysph.base.fused_cuda_nnps import (
     FusedCudaHBucketNeighborContext,
-    FusedCudaNeighborWorkspace,
     FusedCudaNeighborContext,
-    build_fused_cuda_hbucket_context_with_workspace,
-    build_fused_cuda_context_from_device_arrays,
-    build_fused_cuda_context_with_workspace,
-    cell_counts_from_cell_size,
+    FusedCudaNeighborWorkspace,
     brute_force_neighbor_indices,
+    build_fused_cuda_cell_context_with_workspace,
+    build_fused_cuda_context_with_workspace,
+    build_fused_cuda_hbucket_context_with_workspace,
+    build_fused_cuda_neighbor_context_with_workspace,
+    cell_counts_from_cell_size,
     cell_counts_from_hmax,
     count_hbucket_traversal_work_from_context,
-    count_neighbors_from_hbucket_context,
     count_neighbors_from_context,
+    count_neighbors_from_hbucket_context,
     create_fused_cuda_convergence_flag,
     minimum_image_delta,
-    reduce_min_float,
-    reduce_max_float,
     read_fused_cuda_convergence_flag,
+    reduce_max_float,
+    reduce_min_float,
     reset_fused_cuda_convergence_flag,
     wrap_periodic_xyz,
 )
 
 
 class FakeDeviceArray:
-    """Small stand-in for a PyCUDA/Compyle device array."""
-
     def __init__(self, dtype_name):
         self.dtype = np.dtype(dtype_name)
         self.gpudata = object()
@@ -39,8 +39,6 @@ class FakeDeviceArray:
 
 
 class FakeSizedDeviceArray:
-    """Device-array stand-in with the dtype and shape used by workspace tests."""
-
     def __init__(self, size, dtype):
         self.dtype = np.dtype(dtype)
         self.shape = (size,)
@@ -48,8 +46,6 @@ class FakeSizedDeviceArray:
 
 
 class RecordingKernel:
-    """Record CUDA kernel launches without needing a CUDA context."""
-
     def __init__(self, name, calls):
         self.name = name
         self.calls = calls
@@ -59,8 +55,6 @@ class RecordingKernel:
 
 
 class RecordingModule:
-    """Small SourceModule stand-in returning recording kernels by name."""
-
     def __init__(self, calls):
         self.calls = calls
 
@@ -78,6 +72,14 @@ def require_cuda():
     if cuda.Device.count() == 0:
         pytest.skip("CUDA device is not available")
     return cuda
+
+
+def _bounds():
+    return (
+        np.array([0.0, 0.0, 0.0], dtype=np.float32),
+        np.array([1.0, 1.0, 1.0], dtype=np.float32),
+        np.array([True, True, True], dtype=np.bool_),
+    )
 
 
 def test_cell_counts_from_hmax_uses_radius_scale_and_minimum_one_cell():
@@ -104,9 +106,7 @@ def test_cell_counts_from_cell_size_uses_minimum_one_cell():
 
 
 def test_minimum_image_delta_matches_pysph_xij_direction():
-    lower = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-    upper = np.array([1.0, 1.0, 1.0], dtype=np.float32)
-    periodic = np.array([True, True, True], dtype=np.bool_)
+    lower, upper, periodic = _bounds()
 
     delta = minimum_image_delta(
         np.array([0.01, 0.0, 0.0], dtype=np.float32),
@@ -149,15 +149,6 @@ def test_brute_force_neighbor_indices_use_max_h_and_strict_cutoff():
     np.testing.assert_array_equal(neighbors, np.array([0, 1], dtype=np.int32))
 
 
-def test_hbucket_index_fast_paths_cover_active_bucket_counts():
-    source = fused_nnps.CUDA_SOURCE
-
-    assert "if (bucket_count == 1)" in source
-    assert "return 0;" in source[source.index("if (bucket_count == 1)") :]
-    assert "if (bucket_count == 2)" in source
-    assert "return ratio < 2.0f ? 0 : 1;" in source
-
-
 def test_context_declares_no_csr_and_separate_xyz_device_layout():
     context = FusedCudaNeighborContext(
         n=4,
@@ -169,18 +160,14 @@ def test_context_declares_no_csr_and_separate_xyz_device_layout():
         upper=np.array([1.0, 1.0, 1.0], dtype=np.float32),
         periodic=np.array([True, True, False], dtype=np.bool_),
         radius_scale=np.float32(2.0),
-        cell_counts=np.array([4, 4, 1], dtype=np.int32),
         search_radius_cells=np.int32(1),
+        cell_counts=np.array([4, 4, 1], dtype=np.int32),
         total_cells=16,
-        cluster_total=4,
         stream=object(),
         sorted_ids=FakeDeviceArray("int32"),
         cell_starts=FakeDeviceArray("int32"),
         cell_particle_counts=FakeDeviceArray("int32"),
-        cluster_cell=FakeDeviceArray("int32"),
-        cluster_begin=FakeDeviceArray("int32"),
-        cluster_count=FakeDeviceArray("int32"),
-        timings_ms=(("build_cells_ms", 0.11), ("cluster_ranges_ms", 0.03)),
+        timings_ms=(("build_cells_ms", 0.11),),
     )
 
     assert not context.materializes_csr
@@ -188,7 +175,7 @@ def test_context_declares_no_csr_and_separate_xyz_device_layout():
     assert context.uses_device_metadata
     assert context.cell_count_tuple == (4, 4, 1)
     assert context.search_radius_cells == np.int32(1)
-    assert context.timing_total_ms == 0.14
+    assert context.timing_total_ms == 0.11
 
 
 def test_hbucket_context_declares_bucketed_device_metadata():
@@ -277,31 +264,108 @@ def test_hbucket_builder_uses_device_hmax_bits_without_materialization(monkeypat
     assert context.cell_bucket_h_max_bits.dtype == np.uint32
 
 
-def test_hbucket_workspace_reuses_reference_h_bounds_and_selects_one_bucket(
-    monkeypatch,
-):
-    hmins = []
-    bucket_counts = []
+def test_neighbor_builder_selects_fixed_cell_context_for_low_h_variation(monkeypatch):
+    selected = []
+
+    def fake_cell_context(*args):
+        selected.append(("cell", args[9]))
+        return "cell-context"
+
+    monkeypatch.setattr(
+        fused_nnps,
+        "reduce_min_float",
+        lambda array, n, stream, scratch: np.float32(0.1),
+    )
+    monkeypatch.setattr(
+        fused_nnps,
+        "reduce_max_float",
+        lambda array, n, stream, scratch: np.float32(0.15),
+    )
+    monkeypatch.setattr(
+        fused_nnps, "build_fused_cuda_cell_context_with_workspace", fake_cell_context
+    )
+
+    context = build_fused_cuda_neighbor_context_with_workspace(
+        FakeSizedDeviceArray(8, np.float32),
+        FakeSizedDeviceArray(8, np.float32),
+        FakeSizedDeviceArray(8, np.float32),
+        FakeSizedDeviceArray(8, np.float32),
+        8,
+        np.array([0.0, 0.0, 0.0], dtype=np.float32),
+        np.array([1.0, 1.0, 1.0], dtype=np.float32),
+        np.array([True, True, True], dtype=np.bool_),
+        np.float32(2.0),
+        4,
+        object(),
+        FusedCudaNeighborWorkspace(),
+        [],
+    )
+
+    assert context == "cell-context"
+    assert selected == [("cell", np.float32(0.15))]
+
+
+def test_neighbor_builder_uses_hbucket_context_for_large_h_variation(monkeypatch):
+    selected = []
+
+    def fake_hbucket_context(*args):
+        selected.append((args[9], args[-1]))
+        return "hbucket-context"
+
+    monkeypatch.setattr(
+        fused_nnps,
+        "reduce_min_float",
+        lambda array, n, stream, scratch: np.float32(0.1),
+    )
+    monkeypatch.setattr(
+        fused_nnps,
+        "reduce_max_float",
+        lambda array, n, stream, scratch: np.float32(0.45),
+    )
+    monkeypatch.setattr(
+        fused_nnps, "_build_fused_cuda_hbucket_context_from_hmin", fake_hbucket_context
+    )
+
+    context = build_fused_cuda_neighbor_context_with_workspace(
+        FakeSizedDeviceArray(8, np.float32),
+        FakeSizedDeviceArray(8, np.float32),
+        FakeSizedDeviceArray(8, np.float32),
+        FakeSizedDeviceArray(8, np.float32),
+        8,
+        np.array([0.0, 0.0, 0.0], dtype=np.float32),
+        np.array([1.0, 1.0, 1.0], dtype=np.float32),
+        np.array([True, True, True], dtype=np.bool_),
+        np.float32(2.0),
+        4,
+        object(),
+        FusedCudaNeighborWorkspace(),
+        [],
+    )
+
+    assert context == "hbucket-context"
+    assert selected == [(2, np.float32(0.1))]
+
+
+def test_hbucket_workspace_reuses_reference_h_bounds(monkeypatch):
     reduce_min_calls = []
     reduce_max_calls = []
 
-    def fake_reduce_min_float(array, n, stream, scratch):
-        reduce_min_calls.append((array, n, stream, scratch))
-        return np.float32(0.1)
-
-    def fake_reduce_max_float(array, n, stream, scratch):
-        reduce_max_calls.append((array, n, stream, scratch))
-        return np.float32(0.15)
-
-    def fake_build(*args):
-        bucket_counts.append(args[9])
-        hmins.append(args[-1])
-        return object()
-
-    monkeypatch.setattr(fused_nnps, "reduce_min_float", fake_reduce_min_float)
-    monkeypatch.setattr(fused_nnps, "reduce_max_float", fake_reduce_max_float)
     monkeypatch.setattr(
-        fused_nnps, "_build_fused_cuda_hbucket_context_from_hmin", fake_build
+        fused_nnps,
+        "reduce_min_float",
+        lambda array, n, stream, scratch: reduce_min_calls.append(n) or np.float32(0.1),
+    )
+    monkeypatch.setattr(
+        fused_nnps,
+        "reduce_max_float",
+        lambda array, n, stream, scratch: (
+            reduce_max_calls.append(n) or np.float32(0.45)
+        ),
+    )
+    monkeypatch.setattr(
+        fused_nnps,
+        "_build_fused_cuda_hbucket_context_from_hmin",
+        lambda *args: object(),
     )
     workspace = FusedCudaNeighborWorkspace()
     h = FakeSizedDeviceArray(8, np.float32)
@@ -323,50 +387,8 @@ def test_hbucket_workspace_reuses_reference_h_bounds_and_selects_one_bucket(
             [],
         )
 
-    assert len(reduce_min_calls) == 1
-    assert len(reduce_max_calls) == 1
-    assert bucket_counts == [1, 1]
-    assert hmins == [np.float32(0.1), np.float32(0.1)]
-
-
-def test_hbucket_workspace_caps_effective_bucket_count_to_two(monkeypatch):
-    bucket_counts = []
-
-    def fake_build(*args):
-        bucket_counts.append(args[9])
-        return object()
-
-    monkeypatch.setattr(
-        fused_nnps,
-        "reduce_min_float",
-        lambda array, n, stream, scratch: np.float32(0.1),
-    )
-    monkeypatch.setattr(
-        fused_nnps,
-        "reduce_max_float",
-        lambda array, n, stream, scratch: np.float32(0.45),
-    )
-    monkeypatch.setattr(
-        fused_nnps, "_build_fused_cuda_hbucket_context_from_hmin", fake_build
-    )
-
-    build_fused_cuda_hbucket_context_with_workspace(
-        FakeSizedDeviceArray(8, np.float32),
-        FakeSizedDeviceArray(8, np.float32),
-        FakeSizedDeviceArray(8, np.float32),
-        FakeSizedDeviceArray(8, np.float32),
-        8,
-        np.array([0.0, 0.0, 0.0], dtype=np.float32),
-        np.array([1.0, 1.0, 1.0], dtype=np.float32),
-        np.array([True, True, True], dtype=np.bool_),
-        np.float32(2.0),
-        4,
-        object(),
-        FusedCudaNeighborWorkspace(),
-        [],
-    )
-
-    assert bucket_counts == [2]
+    assert reduce_min_calls == [8]
+    assert reduce_max_calls == [8]
 
 
 def test_cuda_event_timing_is_disabled_by_default(monkeypatch):
@@ -431,7 +453,7 @@ def test_hbucket_work_counter_launches_exact_traversal_kernel(monkeypatch):
     assert calls[0][2]["stream"] is stream
 
 
-def test_cuda_builder_creates_no_csr_sorted_cell_and_cluster_metadata():
+def test_cuda_cell_builder_creates_no_csr_sorted_cell_metadata():
     cuda = require_cuda()
     import pycuda.gpuarray as gpuarray
 
@@ -440,84 +462,226 @@ def test_cuda_builder_creates_no_csr_sorted_cell_and_cluster_metadata():
     y = np.array([0.10, 0.10, 0.90, 0.90], dtype=np.float32)
     z = np.zeros(4, dtype=np.float32)
     h = np.full(4, 0.10, dtype=np.float32)
-    d_x = gpuarray.to_gpu_async(x, stream=stream)
-    d_y = gpuarray.to_gpu_async(y, stream=stream)
-    d_z = gpuarray.to_gpu_async(z, stream=stream)
-    d_h = gpuarray.to_gpu_async(h, stream=stream)
-
-    context = build_fused_cuda_context_from_device_arrays(
-        d_x,
-        d_y,
-        d_z,
-        d_h,
+    lower, upper, periodic = _bounds()
+    context = build_fused_cuda_cell_context_with_workspace(
+        gpuarray.to_gpu_async(x, stream=stream),
+        gpuarray.to_gpu_async(y, stream=stream),
+        gpuarray.to_gpu_async(z, stream=stream),
+        gpuarray.to_gpu_async(h, stream=stream),
         4,
-        np.array([0.0, 0.0, 0.0], dtype=np.float32),
-        np.array([1.0, 1.0, 1.0], dtype=np.float32),
-        np.array([True, True, True], dtype=np.bool_),
+        lower,
+        upper,
+        periodic,
         np.float32(2.0),
-        np.array([2, 2, 1], dtype=np.int32),
+        np.float32(h.max()),
         stream,
-        2,
+        FusedCudaNeighborWorkspace(),
     )
 
-    assert context.search_radius_cells == np.int32(1)
     cell_counts = context.cell_particle_counts.get_async(stream=stream)
-    cell_starts = context.cell_starts.get_async(stream=stream)
     sorted_ids = context.sorted_ids.get_async(stream=stream)
-    cluster_cell = context.cluster_cell.get_async(stream=stream)
-    cluster_begin = context.cluster_begin.get_async(stream=stream)
-    cluster_count = context.cluster_count.get_async(stream=stream)
     stream.synchronize()
 
     assert not context.materializes_csr
     assert context.coordinate_layout == "separate_xyz"
-    assert context.cell_count_tuple == (2, 2, 1)
-    np.testing.assert_array_equal(cell_counts, np.array([1, 1, 1, 1], dtype=np.int32))
-    np.testing.assert_array_equal(cell_starts, np.array([0, 1, 2, 3], dtype=np.int32))
-    np.testing.assert_array_equal(sorted_ids, np.array([0, 1, 2, 3], dtype=np.int32))
-    np.testing.assert_array_equal(
-        cluster_cell[:4], np.array([0, 1, 2, 3], dtype=np.int32)
-    )
-    np.testing.assert_array_equal(
-        cluster_begin[:4], np.array([0, 1, 2, 3], dtype=np.int32)
-    )
-    np.testing.assert_array_equal(cluster_count[:4], np.ones(4, dtype=np.int32))
+    assert context.search_radius_cells == np.int32(1)
+    assert context.cell_count_tuple == (5, 5, 5)
+    assert int(cell_counts.sum()) == 4
+    np.testing.assert_array_equal(np.sort(sorted_ids), np.arange(4, dtype=np.int32))
 
 
-def test_cuda_builder_reports_actual_cluster_total():
+def test_cuda_context_workspace_reuses_cell_buffers():
     cuda = require_cuda()
     import pycuda.gpuarray as gpuarray
 
+    lower, upper, periodic = _bounds()
+    xyz = np.array(
+        [
+            [0.01, 0.0, 0.0],
+            [0.99, 0.0, 0.0],
+            [0.50, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    h = np.full(3, 0.10, dtype=np.float32)
     stream = cuda.Stream()
-    x = np.array([0.10, 0.20, 0.30, 0.40], dtype=np.float32)
-    y = np.array([0.10, 0.20, 0.30, 0.40], dtype=np.float32)
-    z = np.zeros(4, dtype=np.float32)
-    h = np.full(4, 0.10, dtype=np.float32)
-    d_x = gpuarray.to_gpu_async(x, stream=stream)
-    d_y = gpuarray.to_gpu_async(y, stream=stream)
-    d_z = gpuarray.to_gpu_async(z, stream=stream)
-    d_h = gpuarray.to_gpu_async(h, stream=stream)
+    workspace = FusedCudaNeighborWorkspace()
+    context = build_fused_cuda_context_with_workspace(
+        gpuarray.to_gpu_async(xyz[:, 0], stream=stream),
+        gpuarray.to_gpu_async(xyz[:, 1], stream=stream),
+        gpuarray.to_gpu_async(xyz[:, 2], stream=stream),
+        gpuarray.to_gpu_async(h, stream=stream),
+        3,
+        lower,
+        upper,
+        periodic,
+        np.float32(2.0),
+        np.array([5, 1, 1], dtype=np.int32),
+        stream,
+        workspace,
+    )
+    first_sorted_ids = int(context.sorted_ids.gpudata)
+    first_cell_counts = int(context.cell_particle_counts.gpudata)
+    context = build_fused_cuda_context_with_workspace(
+        context.x,
+        context.y,
+        context.z,
+        context.h,
+        3,
+        lower,
+        upper,
+        periodic,
+        np.float32(2.0),
+        np.array([5, 1, 1], dtype=np.int32),
+        stream,
+        workspace,
+    )
 
-    context = build_fused_cuda_context_from_device_arrays(
+    assert int(context.sorted_ids.gpudata) == first_sorted_ids
+    assert int(context.cell_particle_counts.gpudata) == first_cell_counts
+
+
+def test_cuda_context_neighbor_count_matches_periodic_bruteforce():
+    cuda = require_cuda()
+    import pycuda.gpuarray as gpuarray
+
+    lower, upper, periodic = _bounds()
+    xyz = np.array(
+        [
+            [0.01, 0.0, 0.0],
+            [0.99, 0.0, 0.0],
+            [0.50, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    h = np.full(3, 0.10, dtype=np.float32)
+    stream = cuda.Stream()
+    context = build_fused_cuda_context_with_workspace(
+        gpuarray.to_gpu_async(xyz[:, 0], stream=stream),
+        gpuarray.to_gpu_async(xyz[:, 1], stream=stream),
+        gpuarray.to_gpu_async(xyz[:, 2], stream=stream),
+        gpuarray.to_gpu_async(h, stream=stream),
+        3,
+        lower,
+        upper,
+        periodic,
+        np.float32(2.0),
+        np.array([5, 1, 1], dtype=np.int32),
+        stream,
+        FusedCudaNeighborWorkspace(),
+    )
+
+    gpu_counts = count_neighbors_from_context(context).get_async(stream=stream)
+    stream.synchronize()
+    expected = [
+        brute_force_neighbor_indices(
+            xyz, h, lower, upper, periodic, np.float32(2.0), np.int32(index)
+        ).size
+        for index in range(3)
+    ]
+
+    np.testing.assert_array_equal(gpu_counts, np.asarray(expected, dtype=np.int32))
+
+
+def test_cuda_neighbor_builder_cell_context_matches_hbucket_for_low_h_variation():
+    cuda = require_cuda()
+    import pycuda.gpuarray as gpuarray
+
+    lower, upper, periodic = _bounds()
+    rng = np.random.default_rng(20260705)
+    n = 2048
+    xyz = rng.random((n, 3), dtype=np.float32)
+    h = (0.016 * rng.uniform(1.0, 1.75, n)).astype(np.float32)
+    stream = cuda.Stream()
+    d_x = gpuarray.to_gpu_async(xyz[:, 0], stream=stream)
+    d_y = gpuarray.to_gpu_async(xyz[:, 1], stream=stream)
+    d_z = gpuarray.to_gpu_async(xyz[:, 2], stream=stream)
+    d_h = gpuarray.to_gpu_async(h, stream=stream)
+    cell_context = build_fused_cuda_neighbor_context_with_workspace(
         d_x,
         d_y,
         d_z,
         d_h,
-        4,
-        np.array([0.0, 0.0, 0.0], dtype=np.float32),
-        np.array([1.0, 1.0, 1.0], dtype=np.float32),
-        np.array([True, True, True], dtype=np.bool_),
+        n,
+        lower,
+        upper,
+        periodic,
         np.float32(2.0),
-        np.array([1, 1, 1], dtype=np.int32),
-        stream,
         4,
+        stream,
+        FusedCudaNeighborWorkspace(),
+        [],
+    )
+    hbucket_context = build_fused_cuda_hbucket_context_with_workspace(
+        d_x,
+        d_y,
+        d_z,
+        d_h,
+        n,
+        lower,
+        upper,
+        periodic,
+        np.float32(2.0),
+        4,
+        stream,
+        FusedCudaNeighborWorkspace(),
+        [],
     )
 
-    cluster_count = context.cluster_count.get_async(stream=stream)
+    cell_counts = count_neighbors_from_context(cell_context).get_async(stream=stream)
+    hbucket_counts = count_neighbors_from_hbucket_context(hbucket_context).get_async(
+        stream=stream
+    )
     stream.synchronize()
 
-    assert context.cluster_total == 1
-    assert cluster_count[0] == 4
+    assert isinstance(cell_context, FusedCudaNeighborContext)
+    np.testing.assert_array_equal(cell_counts, hbucket_counts)
+
+
+def test_cuda_hbucket_context_neighbor_count_matches_variable_h_bruteforce():
+    cuda = require_cuda()
+    import pycuda.gpuarray as gpuarray
+
+    lower, upper, periodic = _bounds()
+    xyz = np.array(
+        [
+            [0.01, 0.0, 0.0],
+            [0.99, 0.0, 0.0],
+            [0.50, 0.0, 0.0],
+            [0.25, 0.25, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    h = np.array([0.05, 0.10, 0.20, 0.05], dtype=np.float32)
+    stream = cuda.Stream()
+    context = build_fused_cuda_hbucket_context_with_workspace(
+        gpuarray.to_gpu_async(xyz[:, 0], stream=stream),
+        gpuarray.to_gpu_async(xyz[:, 1], stream=stream),
+        gpuarray.to_gpu_async(xyz[:, 2], stream=stream),
+        gpuarray.to_gpu_async(h, stream=stream),
+        4,
+        lower,
+        upper,
+        periodic,
+        np.float32(2.0),
+        4,
+        stream,
+        FusedCudaNeighborWorkspace(),
+        [],
+    )
+
+    gpu_counts = count_neighbors_from_hbucket_context(context).get_async(stream=stream)
+    stream.synchronize()
+    expected = [
+        brute_force_neighbor_indices(
+            xyz, h, lower, upper, periodic, np.float32(2.0), np.int32(index)
+        ).size
+        for index in range(4)
+    ]
+
+    assert context.bucket_count == 2
+    assert context.cell_count_tuple == (10, 10, 10)
+    np.testing.assert_array_equal(gpu_counts, np.asarray(expected, dtype=np.int32))
 
 
 def test_cuda_convergence_flag_resets_and_reads_from_device():
@@ -602,235 +766,3 @@ def test_cuda_wrap_periodic_xyz_updates_device_coordinates():
     np.testing.assert_allclose(
         z_host, np.array([0.5, 0.6, 0.7], dtype=np.float32), atol=1.0e-6
     )
-
-
-def test_cuda_context_neighbor_count_matches_periodic_bruteforce():
-    cuda = require_cuda()
-    import pycuda.gpuarray as gpuarray
-
-    lower = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-    upper = np.array([1.0, 1.0, 1.0], dtype=np.float32)
-    periodic = np.array([True, True, True], dtype=np.bool_)
-    xyz = np.array(
-        [
-            [0.01, 0.0, 0.0],
-            [0.99, 0.0, 0.0],
-            [0.50, 0.0, 0.0],
-        ],
-        dtype=np.float32,
-    )
-    h = np.full(3, 0.10, dtype=np.float32)
-    stream = cuda.Stream()
-    context = build_fused_cuda_context_from_device_arrays(
-        gpuarray.to_gpu_async(xyz[:, 0], stream=stream),
-        gpuarray.to_gpu_async(xyz[:, 1], stream=stream),
-        gpuarray.to_gpu_async(xyz[:, 2], stream=stream),
-        gpuarray.to_gpu_async(h, stream=stream),
-        3,
-        lower,
-        upper,
-        periodic,
-        np.float32(2.0),
-        np.array([5, 1, 1], dtype=np.int32),
-        stream,
-        2,
-    )
-
-    gpu_counts = count_neighbors_from_context(context).get_async(stream=stream)
-    stream.synchronize()
-    expected = [
-        brute_force_neighbor_indices(
-            xyz, h, lower, upper, periodic, np.float32(2.0), np.int32(index)
-        ).size
-        for index in range(3)
-    ]
-
-    np.testing.assert_array_equal(gpu_counts, np.asarray(expected, dtype=np.int32))
-
-
-def test_cuda_context_workspace_reuses_buffers_without_cluster_metadata():
-    cuda = require_cuda()
-    import pycuda.gpuarray as gpuarray
-
-    lower = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-    upper = np.array([1.0, 1.0, 1.0], dtype=np.float32)
-    periodic = np.array([True, True, True], dtype=np.bool_)
-    xyz = np.array(
-        [
-            [0.01, 0.0, 0.0],
-            [0.99, 0.0, 0.0],
-            [0.50, 0.0, 0.0],
-        ],
-        dtype=np.float32,
-    )
-    h = np.full(3, 0.10, dtype=np.float32)
-    stream = cuda.Stream()
-    workspace = FusedCudaNeighborWorkspace()
-
-    context = build_fused_cuda_context_with_workspace(
-        gpuarray.to_gpu_async(xyz[:, 0], stream=stream),
-        gpuarray.to_gpu_async(xyz[:, 1], stream=stream),
-        gpuarray.to_gpu_async(xyz[:, 2], stream=stream),
-        gpuarray.to_gpu_async(h, stream=stream),
-        3,
-        lower,
-        upper,
-        periodic,
-        np.float32(2.0),
-        np.array([5, 1, 1], dtype=np.int32),
-        stream,
-        2,
-        workspace,
-        False,
-    )
-    first_sorted_ids = int(context.sorted_ids.gpudata)
-    first_cell_counts = int(context.cell_particle_counts.gpudata)
-
-    context = build_fused_cuda_context_with_workspace(
-        context.x,
-        context.y,
-        context.z,
-        context.h,
-        3,
-        lower,
-        upper,
-        periodic,
-        np.float32(2.0),
-        np.array([5, 1, 1], dtype=np.int32),
-        stream,
-        2,
-        workspace,
-        False,
-    )
-    gpu_counts = count_neighbors_from_context(context).get_async(stream=stream)
-    stream.synchronize()
-
-    assert int(context.sorted_ids.gpudata) == first_sorted_ids
-    assert int(context.cell_particle_counts.gpudata) == first_cell_counts
-    assert context.cluster_total == 1
-    assert context.timings_ms == (("build_cells_ms", 0.0),)
-    expected = [
-        brute_force_neighbor_indices(
-            xyz, h, lower, upper, periodic, np.float32(2.0), np.int32(index)
-        ).size
-        for index in range(3)
-    ]
-    np.testing.assert_array_equal(gpu_counts, np.asarray(expected, dtype=np.int32))
-
-
-def test_cuda_hbucket_context_neighbor_count_matches_variable_h_bruteforce():
-    cuda = require_cuda()
-    import pycuda.gpuarray as gpuarray
-
-    lower = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-    upper = np.array([1.0, 1.0, 1.0], dtype=np.float32)
-    periodic = np.array([True, True, True], dtype=np.bool_)
-    xyz = np.array(
-        [
-            [0.01, 0.0, 0.0],
-            [0.99, 0.0, 0.0],
-            [0.50, 0.0, 0.0],
-            [0.25, 0.25, 0.0],
-        ],
-        dtype=np.float32,
-    )
-    h = np.array([0.05, 0.10, 0.20, 0.05], dtype=np.float32)
-    stream = cuda.Stream()
-    context = build_fused_cuda_hbucket_context_with_workspace(
-        gpuarray.to_gpu_async(xyz[:, 0], stream=stream),
-        gpuarray.to_gpu_async(xyz[:, 1], stream=stream),
-        gpuarray.to_gpu_async(xyz[:, 2], stream=stream),
-        gpuarray.to_gpu_async(h, stream=stream),
-        4,
-        lower,
-        upper,
-        periodic,
-        np.float32(2.0),
-        4,
-        stream,
-        FusedCudaNeighborWorkspace(),
-        [],
-    )
-
-    gpu_counts = count_neighbors_from_hbucket_context(context).get_async(stream=stream)
-    stream.synchronize()
-    expected = [
-        brute_force_neighbor_indices(
-            xyz, h, lower, upper, periodic, np.float32(2.0), np.int32(index)
-        ).size
-        for index in range(4)
-    ]
-
-    assert context.bucket_count == 2
-    assert context.cell_count_tuple == (10, 10, 10)
-    np.testing.assert_array_equal(gpu_counts, np.asarray(expected, dtype=np.int32))
-
-
-def test_cuda_hbucket_cached_hmin_remains_correct_when_h_shrinks():
-    cuda = require_cuda()
-    import pycuda.gpuarray as gpuarray
-
-    lower = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-    upper = np.array([1.0, 1.0, 1.0], dtype=np.float32)
-    periodic = np.array([True, True, True], dtype=np.bool_)
-    xyz = np.array(
-        [
-            [0.01, 0.0, 0.0],
-            [0.99, 0.0, 0.0],
-            [0.50, 0.0, 0.0],
-            [0.25, 0.25, 0.0],
-        ],
-        dtype=np.float32,
-    )
-    stream = cuda.Stream()
-    workspace = FusedCudaNeighborWorkspace()
-    d_x = gpuarray.to_gpu_async(xyz[:, 0], stream=stream)
-    d_y = gpuarray.to_gpu_async(xyz[:, 1], stream=stream)
-    d_z = gpuarray.to_gpu_async(xyz[:, 2], stream=stream)
-    d_h = gpuarray.to_gpu_async(np.full(4, 0.10, dtype=np.float32), stream=stream)
-
-    build_fused_cuda_hbucket_context_with_workspace(
-        d_x,
-        d_y,
-        d_z,
-        d_h,
-        4,
-        lower,
-        upper,
-        periodic,
-        np.float32(2.0),
-        4,
-        stream,
-        workspace,
-        [],
-    )
-    h = np.array([0.05, 0.10, 0.20, 0.05], dtype=np.float32)
-    d_h.set_async(h, stream=stream)
-    context = build_fused_cuda_hbucket_context_with_workspace(
-        d_x,
-        d_y,
-        d_z,
-        d_h,
-        4,
-        lower,
-        upper,
-        periodic,
-        np.float32(2.0),
-        4,
-        stream,
-        workspace,
-        [],
-    )
-
-    gpu_counts = count_neighbors_from_hbucket_context(context).get_async(stream=stream)
-    stream.synchronize()
-    expected = [
-        brute_force_neighbor_indices(
-            xyz, h, lower, upper, periodic, np.float32(2.0), np.int32(index)
-        ).size
-        for index in range(4)
-    ]
-
-    assert context.bucket_count == 1
-    assert context.cell_count_tuple == (5, 5, 5)
-    np.testing.assert_array_equal(gpu_counts, np.asarray(expected, dtype=np.int32))

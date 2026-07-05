@@ -7,11 +7,8 @@ from pysph.sph.fused_cuda_stage_plan import (
     StageNode,
     StageKind,
     StrictPlanError,
-    analyze_pair_reduction_stage,
-    analyze_pair_reduction_method,
     analyze_equation_method,
     plan_equation_groups,
-    resident_rhs_windows,
 )
 
 
@@ -244,119 +241,6 @@ def test_ast_dependency_extraction_rejects_source_writes():
     assert deps.unsupported_reasons == ("source write m",)
 
 
-def test_pair_reduction_analysis_accepts_destination_additive_loop():
-    equation = AccumulateEquation(dest="fluid", sources=["fluid"])
-
-    analysis = analyze_pair_reduction_method(equation, "loop")
-
-    assert analysis.supported
-    assert analysis.dest_reduction_writes == frozenset({"au"})
-    assert analysis.dest_max_reduction_writes == frozenset()
-    assert analysis.unsupported_reasons == ()
-
-
-def test_pair_reduction_analysis_accepts_destination_subtractive_loop():
-    equation = SubtractAccumulateEquation(dest="fluid", sources=["fluid"])
-
-    analysis = analyze_pair_reduction_method(equation, "loop")
-
-    assert analysis.supported
-    assert analysis.dest_reduction_writes == frozenset({"au"})
-    assert analysis.dest_max_reduction_writes == frozenset()
-    assert analysis.unsupported_reasons == ()
-
-
-def test_pair_reduction_analysis_accepts_destination_max_loop():
-    equation = PairRateWithTimeStepCandidate(dest="fluid", sources=["fluid"])
-
-    analysis = analyze_pair_reduction_method(equation, "loop")
-
-    assert analysis.supported
-    assert analysis.dest_reduction_writes == frozenset({"au"})
-    assert analysis.dest_max_reduction_writes == frozenset({"dt_cfl"})
-    assert analysis.unsupported_reasons == ()
-
-
-def test_pair_reduction_analysis_rejects_non_reduction_destination_write():
-    equation = OverwritePairEquation(dest="fluid", sources=["fluid"])
-
-    analysis = analyze_pair_reduction_method(equation, "loop")
-
-    assert not analysis.supported
-    assert analysis.dest_reduction_writes == frozenset()
-    assert analysis.dest_max_reduction_writes == frozenset()
-    assert analysis.unsupported_reasons == ("destination assignment au",)
-
-
-def test_pair_reduction_analysis_rejects_source_writes():
-    equation = SourceWriteEquation(dest="fluid", sources=["fluid"])
-
-    analysis = analyze_pair_reduction_method(equation, "loop")
-
-    assert not analysis.supported
-    assert analysis.dest_reduction_writes == frozenset()
-    assert analysis.dest_max_reduction_writes == frozenset()
-    assert analysis.unsupported_reasons == ("source write m",)
-
-
-def test_pair_reduction_analysis_rejects_source_free_methods():
-    equation = AssignEquation(dest="fluid", sources=None)
-
-    analysis = analyze_pair_reduction_method(equation, "loop")
-
-    assert not analysis.supported
-    assert analysis.dest_reduction_writes == frozenset()
-    assert analysis.dest_max_reduction_writes == frozenset()
-    assert analysis.unsupported_reasons == (
-        "destination assignment u",
-        "source-free method",
-    )
-
-
-def test_pair_reduction_stage_accepts_additive_pair_loop():
-    equation = AccumulateEquation(dest="fluid", sources=["fluid"])
-    stage = _stage(
-        StageKind.PAIR_RATE,
-        (_method_deps("AccumulateEquation", MethodKind.LOOP, ("fluid",)),),
-    )
-
-    analysis = analyze_pair_reduction_stage(stage, (equation,))
-
-    assert analysis.supported
-    assert [method.equation_name for method in analysis.methods] == [
-        "AccumulateEquation"
-    ]
-    assert analysis.unsupported_reasons == ()
-
-
-def test_pair_reduction_stage_accepts_mixed_sum_and_max_pair_loop():
-    equation = PairRateWithTimeStepCandidate(dest="fluid", sources=["fluid"])
-    stage = _stage(
-        StageKind.PAIR_RATE,
-        (_method_deps("PairRateWithTimeStepCandidate", MethodKind.LOOP, ("fluid",)),),
-    )
-
-    analysis = analyze_pair_reduction_stage(stage, (equation,))
-
-    assert analysis.supported
-    assert analysis.unsupported_reasons == ()
-    assert analysis.methods[0].dest_reduction_writes == frozenset({"au"})
-    assert analysis.methods[0].dest_max_reduction_writes == frozenset({"dt_cfl"})
-
-
-def test_pair_reduction_stage_rejects_non_pair_stages():
-    equation = EosEquation(dest="fluid", sources=None)
-    stage = _stage(
-        StageKind.POINTWISE,
-        (_method_deps("EosEquation", MethodKind.LOOP, ()),),
-    )
-
-    analysis = analyze_pair_reduction_stage(stage, (equation,))
-
-    assert not analysis.supported
-    assert analysis.unsupported_reasons == ("non-pair stage",)
-
-
 def test_stage_planner_emits_common_explicit_sph_shape():
     groups = [
         Group([DensityEquation(dest="fluid", sources=["fluid"])]),
@@ -374,47 +258,6 @@ def test_stage_planner_emits_common_explicit_sph_shape():
     ]
     assert plan.stages[-1].legacy_group_count == 2
     assert not plan.has_host_boundary
-
-
-def test_resident_rhs_window_summarizes_common_explicit_sph_plan():
-    groups = [
-        Group([DensityEquation(dest="fluid", sources=["fluid"])]),
-        Group([EosEquation(dest="fluid", sources=None)]),
-        Group([RateEquation(dest="fluid", sources=["fluid"])]),
-        Group([TimeStepEquation(dest="fluid", sources=None)]),
-    ]
-    plan = plan_equation_groups(groups, True, ())
-
-    windows = resident_rhs_windows(plan)
-
-    assert len(windows) == 1
-    assert windows[0].dest == "fluid"
-    assert windows[0].stage_indices == (0, 1, 2)
-    assert windows[0].stage_kinds == (
-        StageKind.PAIR_DENSITY,
-        StageKind.POINTWISE,
-        StageKind.PAIR_RATE,
-    )
-    assert windows[0].neighbor_build_count == 1
-    assert windows[0].rhs_core_kernel_count == 3
-    assert windows[0].planned_launch_count == 4
-    assert not windows[0].materializes_csr
-    assert windows[0].uses_device_metadata
-
-
-def test_resident_rhs_window_rebuilds_after_h_update_before_next_pair_stage():
-    groups = [
-        Group([DensityEquation(dest="fluid", sources=["fluid"])]),
-        Group([SmoothingLengthUpdateEquation(dest="fluid", sources=None)]),
-        Group([RateEquation(dest="fluid", sources=["fluid"])]),
-    ]
-    plan = plan_equation_groups(groups, True, ())
-
-    windows = resident_rhs_windows(plan)
-
-    assert [window.stage_indices for window in windows] == [(0, 1), (2,)]
-    assert [window.neighbor_build_count for window in windows] == [1, 1]
-    assert [window.planned_launch_count for window in windows] == [3, 2]
 
 
 def test_stage_planner_keeps_pair_loop_with_timestep_candidate_as_pair_stage():
