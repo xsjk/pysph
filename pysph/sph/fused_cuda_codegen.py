@@ -228,41 +228,6 @@ def generate_hbucket_pair_stage_outline_from_equations(
     )
 
 
-def generate_resident_hbucket_pair_window_outline_from_equations(
-    plan_id: str,
-    stages: tuple[StageNode, ...],
-    equations_by_stage: tuple[tuple[object, ...], ...],
-    precomputes: tuple[CudaPairPrecompute, ...],
-) -> FusedKernelOutline:
-    """Return one cooperative h-bucket kernel for adjacent pair stages."""
-    assert len(stages) >= 2
-    assert len(stages) == len(equations_by_stage)
-    assert len(stages) == len(precomputes)
-    dest = stages[0].dest
-    sources = stages[0].sources
-    for stage in stages:
-        assert stage.kind in (StageKind.PAIR_DENSITY, StageKind.PAIR_RATE)
-        assert stage.dest == dest
-        assert stage.sources == sources
-    known_types = _cuda_known_types_for_stage_window(
-        stages, equations_by_stage, precomputes
-    )
-    equations = _unique_equations(equations_by_stage)
-    group = CUDAGroup(list(equations))
-    wrapper_source = group.get_equation_wrappers(known_types)
-    calls_by_stage = tuple(
-        _cuda_equation_calls_for_stage(
-            stage, equations_for_stage, known_types, precompute.symbols
-        )
-        for stage, equations_for_stage, precompute in zip(
-            stages, equations_by_stage, precomputes
-        )
-    )
-    return _generate_resident_hbucket_pair_window_outline_with_equation_calls(
-        plan_id, stages, wrapper_source, precomputes, calls_by_stage
-    )
-
-
 def generate_snapshot_hbucket_pair_window_outline_from_equations(
     plan_id: str,
     stages: tuple[StageNode, ...],
@@ -352,65 +317,6 @@ def _generate_hbucket_pair_loop_outline_with_equation_calls(
             "    }",
             "    int dst = sorted_ids[fused_dst_linear];",
             *segment_lines,
-            "}",
-            "}",
-        )
-    )
-    return FusedKernelOutline(name=name, source=source)
-
-
-def _generate_resident_hbucket_pair_window_outline_with_equation_calls(
-    plan_id: str,
-    stages: tuple[StageNode, ...],
-    wrapper_source: str,
-    precomputes: tuple[CudaPairPrecompute, ...],
-    calls_by_stage: tuple[tuple[CudaEquationMethodCall, ...], ...],
-) -> FusedKernelOutline:
-    assert stages
-    name = f"fused_{plan_id}_{stages[0].dest}_resident_hbucket_pair_window"
-    stage_lines = [
-        "    cooperative_groups::grid_group grid = cooperative_groups::this_grid();"
-    ]
-    for index, stage in enumerate(stages):
-        segment_lines = _hbucket_pair_segment_lines(
-            stage, calls_by_stage[index], precomputes[index]
-        )
-        stage_lines.append(
-            "    for (int fused_dst_linear = blockIdx.x * blockDim.x + threadIdx.x; "
-            "fused_dst_linear < n; fused_dst_linear += blockDim.x * gridDim.x) {"
-        )
-        stage_lines.append("        int dst = sorted_ids[fused_dst_linear];")
-        stage_lines.extend(f"    {line}" for line in segment_lines)
-        stage_lines.append("    }")
-        if index < len(stages) - 1:
-            stage_lines.append("    grid.sync();")
-    precompute_declarations = tuple(
-        declaration
-        for precompute in precomputes
-        for declaration in _precompute_argument_declarations(precompute)
-    )
-    call_arguments = tuple(
-        declaration
-        for calls in calls_by_stage
-        for declaration in _equation_call_arguments(calls)
-    )
-    arguments = hbucket_context_argument_declarations() + _unique_argument_declarations(
-        precompute_declarations, call_arguments
-    )
-    fp32_wrapper_source = _hbucket_pair_window_wrapper_source(wrapper_source, stages)
-    source = "\n".join(
-        (
-            "#include <cooperative_groups.h>",
-            'extern "C" {',
-            _FUSED_CUDA_COMPYLE_PREAMBLE,
-            _PAIR_TRAVERSAL_HELPERS,
-            *_unique_precompute_helper_sources(precomputes),
-            fp32_wrapper_source,
-            f"__global__ void {name}(",
-            _argument_block(arguments),
-            ")",
-            "{",
-            *stage_lines,
             "}",
             "}",
         )
@@ -1345,15 +1251,6 @@ def _local_reduction_methods_for_stage(stage: StageNode) -> tuple[object, ...]:
     return tuple(methods)
 
 
-def _local_reduction_methods_for_stages(
-    stages: tuple[StageNode, ...],
-) -> tuple[object, ...]:
-    methods = []
-    for stage in stages:
-        methods.extend(_local_reduction_methods_for_stage(stage))
-    return tuple(methods)
-
-
 def _local_reduction_methods_for_segment(
     loop_methods: tuple[object, ...],
 ) -> tuple[object, ...]:
@@ -1577,15 +1474,6 @@ def _hbucket_pair_wrapper_source(wrapper_source: str, stage: StageNode) -> str:
     )
 
 
-def _hbucket_pair_window_wrapper_source(
-    wrapper_source: str, stages: tuple[StageNode, ...]
-) -> str:
-    return _local_reduction_wrapper_source(
-        _force_cuda_source_fp32(wrapper_source),
-        _local_reduction_methods_for_stages(stages),
-    )
-
-
 def _local_reduction_wrapper_replacements(
     reduction_methods: tuple[object, ...],
 ) -> tuple[tuple[str, tuple[str, ...]], ...]:
@@ -1698,22 +1586,6 @@ def _cuda_known_types_for_stage(
     return known_types
 
 
-def _cuda_known_types_for_stage_window(
-    stages: tuple[StageNode, ...],
-    equations_by_stage: tuple[tuple[object, ...], ...],
-    precomputes: tuple[CudaPairPrecompute, ...],
-) -> dict[str, KnownType]:
-    known_types = {}
-    for stage, equations, precompute in zip(stages, equations_by_stage, precomputes):
-        stage_known_types = _cuda_known_types_for_stage(
-            stage, equations, precompute.symbols
-        )
-        for arg, known_type in stage_known_types.items():
-            if arg not in known_types:
-                known_types[arg] = known_type
-    return known_types
-
-
 def _unique_equations(
     equations_by_stage: tuple[tuple[object, ...], ...],
 ) -> tuple[object, ...]:
@@ -1726,16 +1598,6 @@ def _unique_equations(
                 names.append(name)
                 equations.append(equation)
     return tuple(equations)
-
-
-def _unique_precompute_helper_sources(
-    precomputes: tuple[CudaPairPrecompute, ...],
-) -> tuple[str, ...]:
-    sources = []
-    for precompute in precomputes:
-        if precompute.helper_source and precompute.helper_source not in sources:
-            sources.append(precompute.helper_source)
-    return tuple(sources)
 
 
 def _equation_for_method(equation_name: str, equations: tuple[object, ...]) -> object:

@@ -462,16 +462,6 @@ class Application(object):
             help="Use the generated fused CUDA stage backend."
         )
 
-        # --fused-window
-        parser.add_argument(
-            "--fused-window",
-            action="store",
-            dest="fused_window",
-            default="snapshot",
-            choices=("snapshot", "resident"),
-            help="Select the fused CUDA pair-window traversal."
-        )
-
         # --use-local-memory
         parser.add_argument(
             "--use-local-memory",
@@ -803,8 +793,6 @@ class Application(object):
             self.arg_parse.error("--fused requires --nnps hbucket")
         if options.nnps == 'hbucket' and not options.with_fused_cuda:
             self.arg_parse.error("--nnps hbucket requires --cuda --fused")
-        if options.fused_window != 'snapshot' and not options.with_fused_cuda:
-            self.arg_parse.error("--fused-window requires --cuda --fused")
 
     def _process_command_line(self):
         """Process the parsed command line arguments.
@@ -974,7 +962,6 @@ class Application(object):
             config.use_cuda = True
             logger.info('Using CUDA')
         config.use_fused_cuda = bool(options.with_fused_cuda)
-        config.fused_cuda_window = options.fused_window
 
         if options.with_local_memory:
             leaf_size = int(options.octree_leaf_size)

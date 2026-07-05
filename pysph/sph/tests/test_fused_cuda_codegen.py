@@ -12,7 +12,6 @@ from pysph.sph.fused_cuda_codegen import (
     generate_fused_kernel_outline,
     generate_hbucket_pair_stage_outline_from_equations,
     generate_pointwise_kernel_outline_with_equation_calls,
-    generate_resident_hbucket_pair_window_outline_from_equations,
     generate_snapshot_hbucket_pair_window_outline_from_equations,
     hbucket_context_argument_declarations,
     launch_budget_for_specs,
@@ -192,34 +191,6 @@ def test_hbucket_pair_outline_keeps_variable_h_bucket_traversal():
     assert "float fused_acc_d_au = 0.0f;" in outline.source
     assert "AddMass_loop(add_mass0, dst, src, fused_local_d_au, s_m);" in outline.source
     assert "d_au[dst] += fused_acc_d_au;" in outline.source
-
-
-def test_resident_hbucket_pair_window_uses_cooperative_grid_sync():
-    deps = _sum_reduction_deps("AddMass", "au")
-    stage0 = _stage(StageKind.PAIR_DENSITY, (deps,))
-    stage1 = _stage(StageKind.PAIR_RATE, (deps,))
-    equation = AddMass(dest="fluid", sources=["fluid"])
-    precompute = CudaPairPrecompute(symbols=frozenset(), helper_source="", lines=())
-
-    outline = generate_resident_hbucket_pair_window_outline_from_equations(
-        "plan0",
-        (stage0, stage1),
-        ((equation,), (equation,)),
-        (precompute, precompute),
-    )
-
-    assert outline.name == "fused_plan0_fluid_resident_hbucket_pair_window"
-    assert "#include <cooperative_groups.h>" in outline.source
-    assert "cooperative_groups::this_grid()" in outline.source
-    assert "int dst = sorted_ids[fused_dst_linear];" in outline.source
-    assert "grid.sync();" in outline.source
-    assert (
-        outline.source.count(
-            "AddMass_loop(add_mass0, dst, src, fused_local_d_au, s_m);"
-        )
-        == 2
-    )
-    assert outline.source.count("d_au[dst] += fused_acc_d_au;") == 2
 
 
 def test_snapshot_pair_window_snapshots_left_read_before_right_write():
