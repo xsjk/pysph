@@ -225,8 +225,6 @@ class GPUAccelerationEval(object):
         self._use_local_memory = cfg.use_local_memory
         self.stage_backend = None
         self.cuda_stage_plan = helper.cuda_stage_plan
-        self.cuda_fused_kernel_specs = helper.cuda_fused_kernel_specs
-        self.cuda_fused_launch_budget = helper.cuda_fused_launch_budget
 
     def _get_index(self, dest, attr):
         if isinstance(attr, str):
@@ -749,13 +747,7 @@ class AccelerationEvalGPUHelper(object):
     def _setup_cuda_stage_plan(self):
         if self.backend != 'cuda':
             self.cuda_stage_plan = None
-            self.cuda_fused_kernel_specs = None
-            self.cuda_fused_launch_budget = None
             return
-        from pysph.sph.fused_cuda_codegen import (
-            fused_kernel_specs,
-            launch_budget_for_specs,
-        )
         from pysph.sph.fused_cuda_stage_plan import plan_equation_groups
 
         supported_convergence = _cuda_supported_convergence_equation_names(
@@ -763,16 +755,6 @@ class AccelerationEvalGPUHelper(object):
         )
         self.cuda_stage_plan = plan_equation_groups(
             self.object.equation_groups, False, supported_convergence
-        )
-        if not self.cuda_stage_plan.strict:
-            self.cuda_fused_kernel_specs = ()
-            self.cuda_fused_launch_budget = launch_budget_for_specs(())
-            return
-        self.cuda_fused_kernel_specs = fused_kernel_specs(
-            'cuda_eval', self.cuda_stage_plan
-        )
-        self.cuda_fused_launch_budget = launch_budget_for_specs(
-            self.cuda_fused_kernel_specs
         )
 
     def setup_compiled_module(self, module):

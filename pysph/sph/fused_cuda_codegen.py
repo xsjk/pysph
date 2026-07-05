@@ -8,20 +8,10 @@ import numpy as np
 
 from pysph.sph.equation import CUDAGroup, KnownType
 from pysph.sph.fused_cuda_stage_plan import (
-    CudaStagePlan,
     MethodKind,
     StageKind,
     StageNode,
 )
-
-
-@dataclass(frozen=True)
-class FusedKernelSpec:
-    """One CUDA launch planned from a fused stage graph."""
-
-    name: str
-    stage: StageNode
-    uses_neighbors: bool
 
 
 @dataclass(frozen=True)
@@ -53,15 +43,6 @@ class CudaPairPrecompute:
 
 
 @dataclass(frozen=True)
-class FusedLaunchBudget:
-    """Launch-count summary for a fused CUDA stage graph."""
-
-    neighbor_build_count: int
-    rhs_core_kernel_count: int
-    total_launch_count: int
-
-
-@dataclass(frozen=True)
 class LocalReductionField:
     """One per-destination reduction field accumulated inside a pair kernel."""
 
@@ -79,98 +60,10 @@ class PairLaunchConfig:
     grid_x: int
 
 
-def fused_kernel_specs(
-    plan_id: str, plan: CudaStagePlan
-) -> tuple[FusedKernelSpec, ...]:
-    """Return CUDA kernel specs for a strict fused stage plan."""
-    specs = []
-    neighbor_build_dests = []
-    for stage in plan.stages:
-        assert stage.kind is not StageKind.HOST_BOUNDARY
-        if _stage_uses_neighbors(stage) and stage.dest not in neighbor_build_dests:
-            specs.append(
-                FusedKernelSpec(
-                    name=f"fused_{plan_id}_{stage.dest}_neighbor_build",
-                    stage=StageNode(
-                        kind=StageKind.NEIGHBOR_BUILD,
-                        dest=stage.dest,
-                        sources=stage.sources,
-                        methods=(),
-                        reason="metadata for fused pair stages",
-                        convergence_policy=None,
-                    ),
-                    uses_neighbors=False,
-                )
-            )
-            neighbor_build_dests.append(stage.dest)
-        specs.append(
-            FusedKernelSpec(
-                name=fused_kernel_name(plan_id, stage),
-                stage=stage,
-                uses_neighbors=_stage_uses_neighbors(stage),
-            )
-        )
-    return tuple(specs)
-
-
 def fused_kernel_name(plan_id: str, stage: StageNode) -> str:
     """Return the stable CUDA function name for one fused stage."""
     assert stage.kind is not StageKind.HOST_BOUNDARY
     return f"fused_{plan_id}_{stage.dest}_{stage.kind.value}"
-
-
-def launch_budget_for_specs(specs: tuple[FusedKernelSpec, ...]) -> FusedLaunchBudget:
-    """Return the launch-count budget represented by kernel specs."""
-    neighbor_build_count = sum(
-        1 for spec in specs if spec.stage.kind is StageKind.NEIGHBOR_BUILD
-    )
-    total_launch_count = len(specs)
-    return FusedLaunchBudget(
-        neighbor_build_count=neighbor_build_count,
-        rhs_core_kernel_count=total_launch_count - neighbor_build_count,
-        total_launch_count=total_launch_count,
-    )
-
-
-def generate_fused_kernel_outline(plan_id: str, stage: StageNode) -> FusedKernelOutline:
-    """Return a stable, non-executable fused kernel outline for one stage."""
-    if _stage_uses_neighbors(stage):
-        return _generate_pair_comment_outline(plan_id, stage)
-    name = fused_kernel_name(plan_id, stage)
-    method_lines = [
-        f"    // {method.equation_name}.{method.method_kind.value}"
-        for method in stage.methods
-    ]
-    source = "\n".join(
-        (
-            f'extern "C" __global__ void {name}(void)',
-            "{",
-            *method_lines,
-            "}",
-        )
-    )
-    return FusedKernelOutline(name=name, source=source)
-
-
-def _generate_pair_comment_outline(
-    plan_id: str, stage: StageNode
-) -> FusedKernelOutline:
-    """Return a compact pair-stage outline for launch-budget reporting."""
-    name = fused_kernel_name(plan_id, stage)
-    method_lines = [
-        f"    // {method.equation_name}.{method.method_kind.value}"
-        for method in stage.methods
-    ]
-    source = "\n".join(
-        (
-            f'extern "C" __global__ void {name}(void)',
-            "{",
-            "    // hbucket pair traversal",
-            *method_lines,
-            "}",
-        )
-    )
-    return FusedKernelOutline(name=name, source=source)
 
 
 def generate_pointwise_kernel_outline_with_equation_calls(

@@ -8,13 +8,10 @@ import numpy as np
 from pysph.sph.fused_cuda_codegen import (
     CudaPairPrecompute,
     _force_cuda_source_fp32,
-    fused_kernel_specs,
-    generate_fused_kernel_outline,
     generate_hbucket_pair_stage_outline_from_equations,
     generate_pointwise_kernel_outline_with_equation_calls,
     generate_snapshot_hbucket_pair_window_outline_from_equations,
     hbucket_context_argument_declarations,
-    launch_budget_for_specs,
     PairLaunchConfig,
     snapshot_hbucket_pair_window_stage,
 )
@@ -27,7 +24,6 @@ from pysph.sph.fused_cuda_stage_backend import (
 )
 from pysph.sph.fused_cuda_stage_plan import (
     analyze_equation_method,
-    CudaStagePlan,
     MethodDeps,
     MethodKind,
     StageKind,
@@ -79,52 +75,6 @@ def _stage(kind, methods):
         reason="test",
         convergence_policy=None,
     )
-
-
-def test_common_rhs_specs_insert_one_neighbor_build_and_four_core_kernels():
-    plan = CudaStagePlan(
-        stages=(
-            _stage(StageKind.PAIR_DENSITY, (_deps("Density", MethodKind.LOOP),)),
-            _stage(StageKind.POINTWISE, (_deps("EOS", MethodKind.LOOP),)),
-            _stage(StageKind.PAIR_RATE, (_deps("Rate", MethodKind.LOOP),)),
-            _stage(StageKind.REDUCTION, (_deps("Timestep", MethodKind.INITIALIZE),)),
-        ),
-        strict=True,
-    )
-
-    specs = fused_kernel_specs("plan0", plan)
-    budget = launch_budget_for_specs(specs)
-
-    assert [spec.name for spec in specs] == [
-        "fused_plan0_fluid_neighbor_build",
-        "fused_plan0_fluid_pair_density",
-        "fused_plan0_fluid_pointwise",
-        "fused_plan0_fluid_pair_rate",
-        "fused_plan0_fluid_reduction",
-    ]
-    assert [spec.uses_neighbors for spec in specs] == [False, True, False, True, False]
-    assert budget.neighbor_build_count == 1
-    assert budget.rhs_core_kernel_count == 4
-    assert budget.total_launch_count == 5
-
-
-def test_kernel_outline_preserves_equation_method_order():
-    stage = _stage(
-        StageKind.POINTWISE,
-        (
-            _deps("Alpha", MethodKind.INITIALIZE),
-            _deps("Beta", MethodKind.LOOP),
-            _deps("Gamma", MethodKind.POST_LOOP),
-        ),
-    )
-
-    outline = generate_fused_kernel_outline("plan0", stage)
-
-    assert outline.name == "fused_plan0_fluid_pointwise"
-    alpha = outline.source.index("Alpha.initialize")
-    beta = outline.source.index("Beta.loop")
-    gamma = outline.source.index("Gamma.post_loop")
-    assert alpha < beta < gamma
 
 
 def test_pointwise_kernel_outline_can_reuse_pysph_cuda_equation_wrapper():
