@@ -348,6 +348,18 @@ __global__ void fused_compute_cell_ids_counts_xyz(
 	__device__ int fused_hbucket_index(float hi, float h_min, int bucket_count)
 	{
 	    float ratio = fmaxf(hi / h_min, 1.0f);
+	    if (bucket_count == 4) {
+	        if (ratio < 2.0f) {
+	            return 0;
+	        }
+	        if (ratio < 4.0f) {
+	            return 1;
+	        }
+	        if (ratio < 8.0f) {
+	            return 2;
+	        }
+	        return 3;
+	    }
 	    int bucket = (int)floorf(log2f(ratio));
 	    if (bucket < 0) {
 	        bucket = 0;

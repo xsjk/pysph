@@ -7,8 +7,10 @@ import numpy as np
 import pytest
 
 from pysph.base.fused_cuda_nnps import (
+    FusedCudaNeighborWorkspace,
     brute_force_neighbor_indices,
     build_fused_cuda_context_from_device_arrays,
+    build_fused_cuda_hbucket_context_with_workspace,
     minimum_image_delta,
 )
 from pysph.sph.fused_cuda_codegen import (
@@ -24,8 +26,6 @@ from pysph.sph.fused_cuda_codegen import (
     generate_direct_pair_stage_outline_from_equations,
     generate_direct_pair_stage_outline_from_equations_with_convergence_flag,
     generate_cluster_pair_stage_outline_from_equations,
-    generate_hbucket_source_parallel_pair_stage_outline_from_equations,
-    generate_source_parallel_pair_stage_outline_from_equations,
     cluster_context_argument_declarations,
     fused_context_argument_declarations,
     fused_kernel_specs,
@@ -39,8 +39,6 @@ from pysph.sph.fused_cuda_codegen import (
     launch_budget_for_specs,
     launch_direct_pair_kernel_with_context,
     launch_hbucket_pair_kernel_with_context,
-    launch_hbucket_source_parallel_pair_kernel_with_context,
-    launch_source_parallel_pair_kernel_with_context,
     launch_pointwise_kernel,
     lower_equation_method_to_cuda,
     precompute_argument_names,
@@ -68,7 +66,6 @@ from pysph.sph.fused_cuda_stage_backend import (
 from pysph.sph.tests.fused_cuda_codegen_equations import (
     AddMass,
     AddScaledMass,
-    AssignMassToAcceleration,
     CopyAcceleration,
     PreserveThenSetDensity,
     PrepPressure,
@@ -76,7 +73,6 @@ from pysph.sph.tests.fused_cuda_codegen_equations import (
 )
 from pysph.sph.tests.fused_cuda_codegen_equations import (
     AccumulateDWIAndDWJ,
-    AccumulateDWIJAndMaxSignal,
     AccumulateDWIJ,
     AccumulateGradientH,
     AccumulateRhoIJ,
@@ -433,210 +429,6 @@ def test_cluster_pair_loop_outline_uses_sorted_cell_cluster_metadata():
     assert "int dst = blockIdx.x * blockDim.x + threadIdx.x;" not in outline.source
 
 
-def test_source_parallel_pair_outline_maps_warp_to_destination():
-    equation = AddMass(dest="fluid", sources=["fluid"])
-    precompute = CudaPairPrecompute(symbols=frozenset(), helper_source="", lines=())
-
-    outline = generate_source_parallel_pair_stage_outline_from_equations(
-        "plan0",
-        _stage(StageKind.PAIR_RATE, (_deps("AddMass", MethodKind.LOOP),)),
-        (equation,),
-        precompute,
-    )
-
-    assert "int lane = threadIdx.x & 31;" in outline.source
-    assert "int warp = threadIdx.x >> 5;" in outline.source
-    assert "int warps_per_block = blockDim.x >> 5;" in outline.source
-    assert "int dst = blockIdx.x * warps_per_block + warp;" in outline.source
-    assert "for (int pos = begin + lane; pos < end; pos += 32)" in outline.source
-    assert "__shfl_down_sync(0xffffffff, fused_reduce_d_au, offset)" in outline.source
-    assert "if (lane == 0)" in outline.source
-    assert "d_au[dst] += fused_reduce_d_au;" in outline.source
-
-
-def test_source_parallel_pair_outline_passes_partial_output_to_loop_wrapper():
-    equation = AddMass(dest="fluid", sources=["fluid"])
-    precompute = CudaPairPrecompute(symbols=frozenset(), helper_source="", lines=())
-
-    outline = generate_source_parallel_pair_stage_outline_from_equations(
-        "plan0",
-        _stage(StageKind.PAIR_RATE, (_deps("AddMass", MethodKind.LOOP),)),
-        (equation,),
-        precompute,
-    )
-
-    assert "WITHIN_KERNEL void AddMass_loop" in outline.source
-    assert "GLOBAL_MEM float* fused_partial_d_au" not in outline.source
-    assert "float *fused_partial_d_au_lane = &fused_acc_d_au;" in outline.source
-    assert "d_au[0] += s_m[s_idx];" in outline.source
-    assert "AddMass_loop(add_mass0, dst, src, fused_partial_d_au_lane, s_m);" in (
-        outline.source
-    )
-    assert "AddMass_loop(add_mass0, dst, src, d_au, s_m);" not in outline.source
-
-
-def test_source_parallel_pair_outline_uses_thread_local_accumulator():
-    equation = AddMass(dest="fluid", sources=["fluid"])
-    precompute = CudaPairPrecompute(symbols=frozenset(), helper_source="", lines=())
-
-    outline = generate_source_parallel_pair_stage_outline_from_equations(
-        "plan0",
-        _stage(StageKind.PAIR_RATE, (_deps("AddMass", MethodKind.LOOP),)),
-        (equation,),
-        precompute,
-    )
-
-    assert "__shared__ float fused_shared_d_au" not in outline.source
-    assert "float fused_acc_d_au = 0.0f;" in outline.source
-    assert "float *fused_partial_d_au_lane = &fused_acc_d_au;" in outline.source
-    assert "float fused_reduce_d_au = fused_acc_d_au;" in outline.source
-
-
-def test_source_parallel_pair_outline_rejects_non_additive_destination_write():
-    equation = AssignMassToAcceleration(dest="fluid", sources=["fluid"])
-    precompute = CudaPairPrecompute(symbols=frozenset(), helper_source="", lines=())
-
-    with pytest.raises(AssertionError):
-        generate_source_parallel_pair_stage_outline_from_equations(
-            "plan0",
-            _stage(
-                StageKind.PAIR_RATE,
-                (_deps("AssignMassToAcceleration", MethodKind.LOOP),),
-            ),
-            (equation,),
-            precompute,
-        )
-
-
-def test_source_parallel_pair_outline_runs_initialize_and_post_loop_on_lane_zero():
-    equation = InitLoopPost(dest="fluid", sources=["fluid"])
-    precompute = CudaPairPrecompute(symbols=frozenset(), helper_source="", lines=())
-    stage = _stage(
-        StageKind.PAIR_RATE,
-        (
-            _deps("InitLoopPost", MethodKind.INITIALIZE),
-            _deps("InitLoopPost", MethodKind.LOOP),
-            _deps("InitLoopPost", MethodKind.POST_LOOP),
-        ),
-    )
-
-    outline = generate_source_parallel_pair_stage_outline_from_equations(
-        "plan0",
-        stage,
-        (equation,),
-        precompute,
-    )
-
-    init_call = "InitLoopPost_initialize(init_loop_post0, dst, d_u, d_au);"
-    loop_call = (
-        "InitLoopPost_loop(init_loop_post0, dst, src, fused_partial_d_au_lane, s_m);"
-    )
-    commit = "d_au[dst] += fused_reduce_d_au;"
-    post_call = "InitLoopPost_post_loop(init_loop_post0, dst, d_u, d_au);"
-    assert f"if (lane == 0) {{\n            {init_call}\n        }}" in outline.source
-    assert f"if (lane == 0) {{\n            {post_call}\n        }}" in outline.source
-    assert outline.source.index(init_call) < outline.source.index(loop_call)
-    assert outline.source.index(loop_call) < outline.source.index(commit)
-    assert outline.source.index(commit) < outline.source.index(post_call)
-
-
-def test_source_parallel_pair_outline_supports_sum_and_max_reductions():
-    equation = AccumulateDWIJAndMaxSignal(dest="fluid", sources=["fluid"])
-    precompute = CudaPairPrecompute(
-        symbols=frozenset(("DWIJ",)),
-        helper_source="",
-        lines=("float DWIJ[3];", "DWIJ[0] = 2.0f;"),
-    )
-
-    outline = generate_source_parallel_pair_stage_outline_from_equations(
-        "plan0",
-        _stage(
-            StageKind.PAIR_RATE,
-            (_deps("AccumulateDWIJAndMaxSignal", MethodKind.LOOP),),
-        ),
-        (equation,),
-        precompute,
-    )
-
-    assert "__shared__ float fused_shared_d_au" not in outline.source
-    assert "__shared__ float fused_shared_d_dt_cfl" not in outline.source
-    assert "GLOBAL_MEM float* fused_partial_d_au" not in outline.source
-    assert "GLOBAL_MEM float* fused_partial_d_dt_cfl" not in outline.source
-    assert "float fused_acc_d_au = 0.0f;" in outline.source
-    assert "float fused_acc_d_dt_cfl = d_dt_cfl[dst];" in outline.source
-    assert "float *fused_partial_d_au_lane = &fused_acc_d_au;" in outline.source
-    assert "float *fused_partial_d_dt_cfl_lane = &fused_acc_d_dt_cfl;" in outline.source
-    assert "d_au[0] += (s_m[s_idx] * DWIJ[0]);" in outline.source
-    assert "d_dt_cfl[0] = max(d_dt_cfl[0], abs(DWIJ[0]));" in outline.source
-    assert (
-        "AccumulateDWIJAndMaxSignal_loop(accumulate_dwij_and_max_signal0, dst, src, fused_partial_d_au_lane, fused_partial_d_dt_cfl_lane, s_m, DWIJ);"
-        in outline.source
-    )
-    assert "d_au[dst] += fused_reduce_d_au;" in outline.source
-    assert (
-        "fused_reduce_d_dt_cfl = fmaxf(fused_reduce_d_dt_cfl, __shfl_down_sync(0xffffffff, fused_reduce_d_dt_cfl, offset));"
-        in outline.source
-    )
-    assert "d_dt_cfl[dst] = fmaxf(d_dt_cfl[dst], fused_reduce_d_dt_cfl);" in (
-        outline.source
-    )
-
-
-def test_source_parallel_pair_launch_uses_context_stream_and_warp_grid():
-    class FakeGpuArray:
-        gpudata = 7
-
-    class FakeKernel:
-        def __call__(self, *args, block, grid, stream):
-            self.args = args
-            self.block = block
-            self.grid = grid
-            self.stream = stream
-
-    class FakeModule:
-        def __init__(self):
-            self.kernel = FakeKernel()
-            self.requested_name = ""
-
-        def get_function(self, name):
-            self.requested_name = name
-            return self.kernel
-
-    stream = object()
-    context = SimpleNamespace(
-        x=FakeGpuArray(),
-        y=FakeGpuArray(),
-        z=FakeGpuArray(),
-        h=FakeGpuArray(),
-        n=10,
-        lower=np.array([0.0, 0.0, 0.0], dtype=np.float32),
-        upper=np.array([1.0, 1.0, 1.0], dtype=np.float32),
-        periodic=np.array([True, False, False], dtype=np.bool_),
-        radius_scale=np.float32(2.0),
-        search_radius_cells=np.int32(1),
-        cell_counts=np.array([7, 2, 1], dtype=np.int32),
-        cell_particle_counts=FakeGpuArray(),
-        cell_starts=FakeGpuArray(),
-        sorted_ids=FakeGpuArray(),
-        stream=stream,
-    )
-    module = FakeModule()
-    normal_arg = FakeGpuArray()
-
-    launch_source_parallel_pair_kernel_with_context(
-        module,
-        "kernel0",
-        context,
-        (normal_arg,),
-    )
-
-    assert module.requested_name == "kernel0"
-    assert module.kernel.block == (128, 1, 1)
-    assert module.kernel.grid == (3, 1, 1)
-    assert module.kernel.stream is stream
-    assert module.kernel.args[-1:] == (normal_arg.gpudata,)
-
-
 def test_pointwise_kernel_outline_can_reuse_pysph_cuda_equation_wrapper():
     equation = CopyAcceleration(dest="fluid", sources=None)
     group = CUDAGroup([equation])
@@ -961,6 +753,40 @@ def test_hbucket_pair_outline_uses_bucketed_cell_ranges():
     assert "fused_codegen_in_support_xyz_cached" in outline.source
 
 
+def test_hbucket_pair_outline_reuses_cached_h_for_gradient_precompute():
+    from pysph.sph.fused_cuda_codegen import (
+        generate_hbucket_pair_stage_outline_from_equations,
+    )
+
+    stage = _stage(
+        StageKind.PAIR_RATE,
+        (
+            replace(
+                _deps("AccumulateDWIJ", MethodKind.LOOP),
+                precomputed_symbols=frozenset(("DWIJ",)),
+            ),
+        ),
+    )
+
+    outline = generate_hbucket_pair_stage_outline_from_equations(
+        "test",
+        stage,
+        (AccumulateDWIJ(dest="fluid", sources=["fluid"]),),
+        cubic_spline_gradient_precompute(np.int32(1)),
+    )
+
+    assert "if (fused_codegen_in_support_xyz_cached" not in outline.source
+    assert "float src_h = h[src];" in outline.source
+    assert "float fused_support = radius_scale * fmaxf(dst_h, src_h);" in outline.source
+    assert "HIJ = 0.5f * (dst_h + src_h);" in outline.source
+    assert "fused_codegen_cubic_spline_gradient(DWI, XIJ, RIJ, dst_h, 1);" in (
+        outline.source
+    )
+    assert "fused_codegen_cubic_spline_gradient(DWJ, XIJ, RIJ, src_h, 1);" in (
+        outline.source
+    )
+
+
 def test_hbucket_pair_outline_uses_local_accumulator_for_shared_reduction_writes():
     from pysph.sph.fused_cuda_codegen import (
         generate_hbucket_pair_stage_outline_from_equations,
@@ -1004,32 +830,6 @@ def test_hbucket_pair_outline_uses_local_accumulator_for_shared_reduction_writes
         in outline.source
     )
     assert "d_au[dst] += fused_acc_d_au;" in outline.source
-
-
-def test_hbucket_source_parallel_outline_uses_bucketed_lane_ranges():
-    stage = _stage(
-        StageKind.PAIR_RATE,
-        (_deps("AddMass", MethodKind.LOOP),),
-    )
-
-    outline = generate_hbucket_source_parallel_pair_stage_outline_from_equations(
-        "test",
-        stage,
-        (AddMass(dest="fluid", sources=["fluid"]),),
-        CudaPairPrecompute(symbols=frozenset(), helper_source="", lines=()),
-    )
-
-    assert "bucket_h_max_bits" in outline.source
-    assert "cell_bucket_h_max_bits" in outline.source
-    assert "cell_bucket_counts" in outline.source
-    assert "float dst_x = x[dst];" in outline.source
-    assert (
-        "float cell_bucket_h = __uint_as_float(cell_bucket_h_max_bits[flat]);"
-        in outline.source
-    )
-    assert "fused_codegen_in_support_xyz_cached" in outline.source
-    assert "for (int pos = begin + lane; pos < end; pos += 32)" in outline.source
-    assert "__shfl_down_sync" in outline.source
 
 
 def test_hbucket_pair_launch_uses_bucket_context_stream_and_grid(monkeypatch):
@@ -1125,64 +925,6 @@ def test_generated_stage_backend_counts_pair_launch_configs():
         ("resident_hbucket", 13824, 128, 108): 1,
     }
 
-
-def test_hbucket_source_parallel_launch_uses_bucket_context_stream_and_warp_grid():
-    class FakeGpuArray:
-        gpudata = 7
-
-    class FakeKernel:
-        def __call__(self, *args, block, grid, stream):
-            self.args = args
-            self.block = block
-            self.grid = grid
-            self.stream = stream
-
-    class FakeModule:
-        def __init__(self):
-            self.kernel = FakeKernel()
-            self.requested_name = ""
-
-        def get_function(self, name):
-            self.requested_name = name
-            return self.kernel
-
-    stream = object()
-    context = SimpleNamespace(
-        x=FakeGpuArray(),
-        y=FakeGpuArray(),
-        z=FakeGpuArray(),
-        h=FakeGpuArray(),
-        n=513,
-        lower=np.array([0.0, 0.0, 0.0], dtype=np.float32),
-        upper=np.array([1.0, 1.0, 1.0], dtype=np.float32),
-        periodic=np.array([True, False, False], dtype=np.bool_),
-        radius_scale=np.float32(2.0),
-        cell_counts=np.array([7, 2, 1], dtype=np.int32),
-        total_cells=14,
-        bucket_count=4,
-        cell_width=np.array([1.0 / 7.0, 0.5, 1.0], dtype=np.float32),
-        bucket_h_max_bits=FakeGpuArray(),
-        cell_bucket_h_max_bits=FakeGpuArray(),
-        cell_bucket_counts=FakeGpuArray(),
-        cell_bucket_starts=FakeGpuArray(),
-        sorted_ids=FakeGpuArray(),
-        stream=stream,
-    )
-    module = FakeModule()
-    normal_arg = FakeGpuArray()
-
-    launch_hbucket_source_parallel_pair_kernel_with_context(
-        module,
-        "kernel0",
-        context,
-        (normal_arg,),
-    )
-
-    assert module.requested_name == "kernel0"
-    assert module.kernel.block == (128, 1, 1)
-    assert module.kernel.grid == (129, 1, 1)
-    assert module.kernel.stream is stream
-    assert module.kernel.args[-1:] == (normal_arg.gpudata,)
 
 def test_generated_stage_backend_records_pair_launch_counts():
     from pysph.sph.fused_cuda_stage_backend import GeneratedFusedCudaStageBackend
@@ -3151,165 +2893,6 @@ def test_cuda_wrapper_call_pair_kernel_matches_periodic_bruteforce():
     np.testing.assert_allclose(got, expected, rtol=1.0e-6, atol=1.0e-6)
 
 
-def test_cuda_source_parallel_pair_add_mass_matches_periodic_bruteforce():
-    cuda = require_cuda()
-    import pycuda.gpuarray as gpuarray
-    from pycuda.compiler import SourceModule
-
-    lower = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-    upper = np.array([1.0, 1.0, 1.0], dtype=np.float32)
-    periodic = np.array([True, True, True], dtype=np.bool_)
-    xyz = np.array(
-        [
-            [0.98, 0.5, 0.5],
-            [0.02, 0.5, 0.5],
-            [0.25, 0.5, 0.5],
-            [0.75, 0.5, 0.5],
-            [0.50, 0.5, 0.5],
-        ],
-        dtype=np.float32,
-    )
-    h = np.full(5, 0.08, dtype=np.float32)
-    mass = np.array([1.0, 2.0, 4.0, 8.0, 16.0], dtype=np.float32)
-    stream = cuda.Stream()
-    d_au = gpuarray.zeros(5, np.float32)
-    context = build_fused_cuda_context_from_device_arrays(
-        gpuarray.to_gpu_async(xyz[:, 0], stream=stream),
-        gpuarray.to_gpu_async(xyz[:, 1], stream=stream),
-        gpuarray.to_gpu_async(xyz[:, 2], stream=stream),
-        gpuarray.to_gpu_async(h, stream=stream),
-        5,
-        lower,
-        upper,
-        periodic,
-        np.float32(2.0),
-        np.array([7, 1, 1], dtype=np.int32),
-        stream,
-        2,
-    )
-    equation = AddMass(dest="fluid", sources=["fluid"])
-    precompute = CudaPairPrecompute(symbols=frozenset(), helper_source="", lines=())
-    outline = generate_source_parallel_pair_stage_outline_from_equations(
-        "plan0",
-        _stage(StageKind.PAIR_RATE, (_deps("AddMass", MethodKind.LOOP),)),
-        (equation,),
-        precompute,
-    )
-    module = SourceModule(outline.source, no_extern_c=True)
-
-    launch_source_parallel_pair_kernel_with_context(
-        module,
-        outline.name,
-        context,
-        (np.uintp(0), d_au, gpuarray.to_gpu_async(mass, stream=stream)),
-    )
-    got = d_au.get_async(stream=stream)
-    stream.synchronize()
-    expected = np.asarray(
-        [
-            np.sum(
-                mass[
-                    brute_force_neighbor_indices(
-                        xyz, h, lower, upper, periodic, np.float32(2.0), np.int32(i)
-                    )
-                ]
-            )
-            for i in range(5)
-        ],
-        dtype=np.float32,
-    )
-
-    np.testing.assert_allclose(got, expected, rtol=1.0e-6, atol=1.0e-6)
-
-
-def test_cuda_source_parallel_pair_sum_and_max_match_periodic_bruteforce():
-    cuda = require_cuda()
-    import pycuda.gpuarray as gpuarray
-    from pycuda.compiler import SourceModule
-
-    lower = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-    upper = np.array([1.0, 1.0, 1.0], dtype=np.float32)
-    periodic = np.array([True, True, True], dtype=np.bool_)
-    xyz = np.array(
-        [
-            [0.98, 0.5, 0.5],
-            [0.02, 0.5, 0.5],
-            [0.25, 0.5, 0.5],
-            [0.75, 0.5, 0.5],
-            [0.50, 0.5, 0.5],
-        ],
-        dtype=np.float32,
-    )
-    h = np.full(5, 0.08, dtype=np.float32)
-    mass = np.array([1.0, 2.0, 4.0, 8.0, 16.0], dtype=np.float32)
-    stream = cuda.Stream()
-    d_au = gpuarray.zeros(5, np.float32)
-    d_dt_cfl = gpuarray.zeros(5, np.float32)
-    context = build_fused_cuda_context_from_device_arrays(
-        gpuarray.to_gpu_async(xyz[:, 0], stream=stream),
-        gpuarray.to_gpu_async(xyz[:, 1], stream=stream),
-        gpuarray.to_gpu_async(xyz[:, 2], stream=stream),
-        gpuarray.to_gpu_async(h, stream=stream),
-        5,
-        lower,
-        upper,
-        periodic,
-        np.float32(2.0),
-        np.array([7, 1, 1], dtype=np.int32),
-        stream,
-        2,
-    )
-    equation = AccumulateDWIJAndMaxSignal(dest="fluid", sources=["fluid"])
-    precompute = CudaPairPrecompute(
-        symbols=frozenset(("DWIJ",)),
-        helper_source="",
-        lines=("float DWIJ[3];", "DWIJ[0] = 2.0f;"),
-    )
-    outline = generate_source_parallel_pair_stage_outline_from_equations(
-        "plan0",
-        _stage(
-            StageKind.PAIR_RATE,
-            (_deps("AccumulateDWIJAndMaxSignal", MethodKind.LOOP),),
-        ),
-        (equation,),
-        precompute,
-    )
-    module = SourceModule(outline.source, no_extern_c=True)
-
-    launch_source_parallel_pair_kernel_with_context(
-        module,
-        outline.name,
-        context,
-        (
-            np.uintp(0),
-            d_au,
-            d_dt_cfl,
-            gpuarray.to_gpu_async(mass, stream=stream),
-        ),
-    )
-    got_au = d_au.get_async(stream=stream)
-    got_dt_cfl = d_dt_cfl.get_async(stream=stream)
-    stream.synchronize()
-    expected_au = np.asarray(
-        [
-            2.0
-            * np.sum(
-                mass[
-                    brute_force_neighbor_indices(
-                        xyz, h, lower, upper, periodic, np.float32(2.0), np.int32(i)
-                    )
-                ]
-            )
-            for i in range(5)
-        ],
-        dtype=np.float32,
-    )
-    expected_dt_cfl = np.full(5, 2.0, dtype=np.float32)
-
-    np.testing.assert_allclose(got_au, expected_au, rtol=1.0e-6, atol=1.0e-6)
-    np.testing.assert_allclose(got_dt_cfl, expected_dt_cfl, rtol=1.0e-6, atol=1.0e-6)
-
-
 def test_cuda_pair_stage_runs_initialize_loop_and_post_loop_in_one_kernel():
     cuda = require_cuda()
     import pycuda.gpuarray as gpuarray
@@ -3832,6 +3415,89 @@ def test_cuda_cubic_gradient_kernel_matches_cubic_bruteforce():
     module = SourceModule(outline.source, no_extern_c=True)
 
     launch_direct_pair_kernel_with_context(
+        module,
+        outline.name,
+        context,
+        (np.uintp(0), d_au, gpuarray.to_gpu_async(mass, stream=stream)),
+    )
+    got = d_au.get_async(stream=stream)
+    stream.synchronize()
+    kernel = CubicSpline(dim=1)
+    expected = []
+    for i in range(3):
+        value = 0.0
+        for j in brute_force_neighbor_indices(
+            xyz, h, lower, upper, periodic, np.float32(2.0), np.int32(i)
+        ):
+            xij = minimum_image_delta(xyz[i], xyz[j], lower, upper, periodic)
+            grad = [0.0, 0.0, 0.0]
+            kernel.gradient(
+                xij=xij.astype(np.float64),
+                rij=np.linalg.norm(xij),
+                h=0.5 * (h[i] + h[j]),
+                grad=grad,
+            )
+            value += mass[j] * grad[0]
+        expected.append(value)
+
+    np.testing.assert_allclose(
+        got, np.asarray(expected, dtype=np.float32), rtol=2.0e-6, atol=2.0e-6
+    )
+
+
+def test_cuda_hbucket_cubic_gradient_kernel_matches_cubic_bruteforce():
+    cuda = require_cuda()
+    import pycuda.gpuarray as gpuarray
+    from pycuda.compiler import SourceModule
+    from pysph.base.kernels import CubicSpline
+    from pysph.sph.fused_cuda_codegen import (
+        generate_hbucket_pair_stage_outline_from_equations,
+    )
+
+    lower = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    upper = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+    periodic = np.array([True, True, True], dtype=np.bool_)
+    xyz = np.array(
+        [
+            [0.01, 0.0, 0.0],
+            [0.99, 0.0, 0.0],
+            [0.50, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    mass = np.array([1.0, 2.0, 4.0], dtype=np.float32)
+    h = np.full(3, 0.10, dtype=np.float32)
+    stream = cuda.Stream()
+    d_x = gpuarray.to_gpu_async(xyz[:, 0], stream=stream)
+    d_y = gpuarray.to_gpu_async(xyz[:, 1], stream=stream)
+    d_z = gpuarray.to_gpu_async(xyz[:, 2], stream=stream)
+    d_h = gpuarray.to_gpu_async(h, stream=stream)
+    d_au = gpuarray.to_gpu_async(np.zeros(3, dtype=np.float32), stream=stream)
+    context = build_fused_cuda_hbucket_context_with_workspace(
+        d_x,
+        d_y,
+        d_z,
+        d_h,
+        3,
+        lower,
+        upper,
+        periodic,
+        np.float32(2.0),
+        4,
+        stream,
+        FusedCudaNeighborWorkspace(),
+        [],
+    )
+    equation = AccumulateDWIJ(dest="fluid", sources=["fluid"])
+    outline = generate_hbucket_pair_stage_outline_from_equations(
+        "plan0",
+        _stage(StageKind.PAIR_RATE, (_deps("AccumulateDWIJ", MethodKind.LOOP),)),
+        (equation,),
+        cubic_spline_gradient_precompute(np.int32(1)),
+    )
+    module = SourceModule(outline.source, no_extern_c=True)
+
+    launch_hbucket_pair_kernel_with_context(
         module,
         outline.name,
         context,

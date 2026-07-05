@@ -14,7 +14,6 @@ from pysph.sph.fused_cuda_stage_plan import (
     MethodKind,
     StageKind,
     StageNode,
-    analyze_pair_reduction_stage,
 )
 
 
@@ -75,8 +74,8 @@ class FusedLaunchBudget:
 
 
 @dataclass(frozen=True)
-class SourceParallelReductionField:
-    """One per-destination reduction field in a source-parallel pair kernel."""
+class LocalReductionField:
+    """One per-destination reduction field accumulated inside a pair kernel."""
 
     field: str
     operation: str
@@ -535,48 +534,6 @@ def generate_hbucket_pair_stage_outline_from_equations_with_convergence_flag(
     )
 
 
-def generate_source_parallel_pair_stage_outline_from_equations(
-    plan_id: str,
-    stage: StageNode,
-    equations: tuple[object, ...],
-    precompute: CudaPairPrecompute,
-) -> FusedKernelOutline:
-    """Return a warp-per-destination pair outline for additive reductions."""
-    assert _stage_uses_neighbors(stage)
-    reduction = analyze_pair_reduction_stage(stage, equations)
-    assert reduction.supported, "; ".join(reduction.unsupported_reasons)
-    known_types = _cuda_known_types_for_stage(stage, equations, precompute.symbols)
-    group = CUDAGroup(list(equations))
-    wrapper_source = group.get_equation_wrappers(known_types)
-    calls = _cuda_equation_calls_for_stage(
-        stage, equations, known_types, precompute.symbols
-    )
-    return _generate_source_parallel_pair_loop_outline_with_equation_calls(
-        plan_id, stage, wrapper_source, precompute, calls, reduction.methods
-    )
-
-
-def generate_hbucket_source_parallel_pair_stage_outline_from_equations(
-    plan_id: str,
-    stage: StageNode,
-    equations: tuple[object, ...],
-    precompute: CudaPairPrecompute,
-) -> FusedKernelOutline:
-    """Return a warp-per-destination h-bucket pair outline."""
-    assert _stage_uses_neighbors(stage)
-    reduction = analyze_pair_reduction_stage(stage, equations)
-    assert reduction.supported, "; ".join(reduction.unsupported_reasons)
-    known_types = _cuda_known_types_for_stage(stage, equations, precompute.symbols)
-    group = CUDAGroup(list(equations))
-    wrapper_source = group.get_equation_wrappers(known_types)
-    calls = _cuda_equation_calls_for_stage(
-        stage, equations, known_types, precompute.symbols
-    )
-    return _generate_hbucket_source_parallel_pair_loop_outline_with_equation_calls(
-        plan_id, stage, wrapper_source, precompute, calls, reduction.methods
-    )
-
-
 def generate_pointwise_stage_outline_from_equations(
     plan_id: str,
     stage: StageNode,
@@ -642,102 +599,6 @@ def _generate_direct_pair_loop_outline_with_equation_calls(
             "    }",
             *segment_lines,
             *convergence_flag_lines,
-            "}",
-            "}",
-        )
-    )
-    return FusedKernelOutline(name=name, source=source)
-
-
-def _generate_source_parallel_pair_loop_outline_with_equation_calls(
-    plan_id: str,
-    stage: StageNode,
-    wrapper_source: str,
-    precompute: CudaPairPrecompute,
-    calls: tuple[CudaEquationMethodCall, ...],
-    reduction_methods: tuple[object, ...],
-) -> FusedKernelOutline:
-    assert _stage_uses_neighbors(stage)
-    name = fused_kernel_name(plan_id, stage)
-    reduced_fields = _source_parallel_reduced_fields(reduction_methods)
-    precompute_lines = _direct_pair_precompute_lines(precompute)
-    segment_lines = _source_parallel_pair_segment_lines(
-        stage, calls, precompute_lines, reduction_methods, reduced_fields
-    )
-    arguments = fused_context_argument_declarations() + _unique_argument_declarations(
-        _precompute_argument_declarations(precompute),
-        _equation_call_arguments(calls),
-    )
-    fp32_wrapper_source = _source_parallel_wrapper_source(
-        _force_cuda_source_fp32(wrapper_source), reduction_methods
-    )
-    source = "\n".join(
-        (
-            'extern "C" {',
-            _FUSED_CUDA_COMPYLE_PREAMBLE,
-            _DIRECT_PAIR_HELPERS,
-            precompute.helper_source,
-            fp32_wrapper_source,
-            f"__global__ void {name}(",
-            _argument_block(arguments),
-            ")",
-            "{",
-            "    int lane = threadIdx.x & 31;",
-            "    int warp = threadIdx.x >> 5;",
-            "    int warps_per_block = blockDim.x >> 5;",
-            "    int dst = blockIdx.x * warps_per_block + warp;",
-            "    if (dst >= n) {",
-            "        return;",
-            "    }",
-            *segment_lines,
-            "}",
-            "}",
-        )
-    )
-    return FusedKernelOutline(name=name, source=source)
-
-
-def _generate_hbucket_source_parallel_pair_loop_outline_with_equation_calls(
-    plan_id: str,
-    stage: StageNode,
-    wrapper_source: str,
-    precompute: CudaPairPrecompute,
-    calls: tuple[CudaEquationMethodCall, ...],
-    reduction_methods: tuple[object, ...],
-) -> FusedKernelOutline:
-    assert _stage_uses_neighbors(stage)
-    name = fused_kernel_name(plan_id, stage)
-    reduced_fields = _source_parallel_reduced_fields(reduction_methods)
-    precompute_lines = _direct_pair_precompute_lines(precompute)
-    segment_lines = _hbucket_source_parallel_pair_segment_lines(
-        stage, calls, precompute_lines, reduction_methods, reduced_fields
-    )
-    arguments = hbucket_context_argument_declarations() + _unique_argument_declarations(
-        _precompute_argument_declarations(precompute),
-        _equation_call_arguments(calls),
-    )
-    fp32_wrapper_source = _source_parallel_wrapper_source(
-        _force_cuda_source_fp32(wrapper_source), reduction_methods
-    )
-    source = "\n".join(
-        (
-            'extern "C" {',
-            _FUSED_CUDA_COMPYLE_PREAMBLE,
-            _DIRECT_PAIR_HELPERS,
-            precompute.helper_source,
-            fp32_wrapper_source,
-            f"__global__ void {name}(",
-            _argument_block(arguments),
-            ")",
-            "{",
-            "    int lane = threadIdx.x & 31;",
-            "    int warp = threadIdx.x >> 5;",
-            "    int warps_per_block = blockDim.x >> 5;",
-            "    int dst = blockIdx.x * warps_per_block + warp;",
-            "    if (dst >= n) {",
-            "        return;",
-            "    }",
-            *segment_lines,
             "}",
             "}",
         )
@@ -811,8 +672,7 @@ def _generate_hbucket_pair_loop_outline_with_equation_calls(
 ) -> FusedKernelOutline:
     assert _stage_uses_neighbors(stage)
     name = fused_kernel_name(plan_id, stage)
-    precompute_lines = _direct_pair_precompute_lines(precompute)
-    segment_lines = _hbucket_pair_segment_lines(stage, calls, precompute_lines)
+    segment_lines = _hbucket_pair_segment_lines(stage, calls, precompute)
     arguments = (
         hbucket_context_argument_declarations()
         + _convergence_flag_argument_declarations(convergence_field)
@@ -862,9 +722,7 @@ def _generate_resident_hbucket_pair_window_outline_with_equation_calls(
     for index, stage in enumerate(stages):
         precompute = precomputes[index]
         calls = calls_by_stage[index]
-        segment_lines = _hbucket_pair_segment_lines(
-            stage, calls, _direct_pair_precompute_lines(precompute)
-        )
+        segment_lines = _hbucket_pair_segment_lines(stage, calls, precompute)
         stage_lines.append(
             "    for (int dst = blockIdx.x * blockDim.x + threadIdx.x; "
             "dst < n; dst += blockDim.x * gridDim.x) {"
@@ -928,7 +786,7 @@ def _generate_hbucket_source_inline_pair_window_outline_with_equation_calls(
     second_segment_lines = _hbucket_pair_segment_lines_with_source_inline(
         stages[1],
         calls_by_stage[1],
-        _direct_pair_precompute_lines(precomputes[1]),
+        precomputes[1],
         source_prep_lines,
         source_local_fields,
     )
@@ -1505,53 +1363,6 @@ def launch_cluster_pair_kernel_with_context(
     )
 
 
-def launch_source_parallel_pair_kernel_with_context(
-    module: object,
-    kernel_name: str,
-    context: object,
-    extra_args: tuple[object, ...],
-) -> PairLaunchConfig:
-    """Launch a warp-per-destination generated pair kernel."""
-    kernel = module.get_function(kernel_name)
-    block_size = 128
-    warps_per_block = block_size // 32
-    grid_x = (context.n + warps_per_block - 1) // warps_per_block
-    kernel(
-        _kernel_arg(context.x),
-        _kernel_arg(context.y),
-        _kernel_arg(context.z),
-        _kernel_arg(context.h),
-        np.int32(context.n),
-        np.float32(context.lower[0]),
-        np.float32(context.upper[0]),
-        np.float32(context.lower[1]),
-        np.float32(context.upper[1]),
-        np.float32(context.lower[2]),
-        np.float32(context.upper[2]),
-        np.int32(context.periodic[0]),
-        np.int32(context.periodic[1]),
-        np.int32(context.periodic[2]),
-        context.radius_scale,
-        np.int32(context.search_radius_cells),
-        np.int32(context.cell_counts[0]),
-        np.int32(context.cell_counts[1]),
-        np.int32(context.cell_counts[2]),
-        _kernel_arg(context.cell_particle_counts),
-        _kernel_arg(context.cell_starts),
-        _kernel_arg(context.sorted_ids),
-        *tuple(_kernel_arg(arg) for arg in extra_args),
-        block=(block_size, 1, 1),
-        grid=(grid_x, 1, 1),
-        stream=context.stream,
-    )
-    return PairLaunchConfig(
-        traversal="source_parallel",
-        n=int(context.n),
-        block_size=int(block_size),
-        grid_x=int(grid_x),
-    )
-
-
 def launch_hbucket_pair_kernel_with_context(
     module: object,
     kernel_name: str,
@@ -1598,59 +1409,6 @@ def launch_hbucket_pair_kernel_with_context(
     )
     return PairLaunchConfig(
         traversal="hbucket",
-        n=int(context.n),
-        block_size=int(block_size),
-        grid_x=int(grid_x),
-    )
-
-
-def launch_hbucket_source_parallel_pair_kernel_with_context(
-    module: object,
-    kernel_name: str,
-    context: object,
-    extra_args: tuple[object, ...],
-) -> PairLaunchConfig:
-    """Launch a warp-per-destination generated h-bucket pair kernel."""
-    kernel = module.get_function(kernel_name)
-    block_size = 128
-    warps_per_block = block_size // 32
-    grid_x = (context.n + warps_per_block - 1) // warps_per_block
-    kernel(
-        _kernel_arg(context.x),
-        _kernel_arg(context.y),
-        _kernel_arg(context.z),
-        _kernel_arg(context.h),
-        np.int32(context.n),
-        np.float32(context.lower[0]),
-        np.float32(context.upper[0]),
-        np.float32(context.lower[1]),
-        np.float32(context.upper[1]),
-        np.float32(context.lower[2]),
-        np.float32(context.upper[2]),
-        np.int32(context.periodic[0]),
-        np.int32(context.periodic[1]),
-        np.int32(context.periodic[2]),
-        context.radius_scale,
-        np.int32(context.cell_counts[0]),
-        np.int32(context.cell_counts[1]),
-        np.int32(context.cell_counts[2]),
-        np.int32(context.total_cells),
-        np.int32(context.bucket_count),
-        np.float32(context.cell_width[0]),
-        np.float32(context.cell_width[1]),
-        np.float32(context.cell_width[2]),
-        _kernel_arg(context.bucket_h_max_bits),
-        _kernel_arg(context.cell_bucket_h_max_bits),
-        _kernel_arg(context.cell_bucket_counts),
-        _kernel_arg(context.cell_bucket_starts),
-        _kernel_arg(context.sorted_ids),
-        *tuple(_kernel_arg(arg) for arg in extra_args),
-        block=(block_size, 1, 1),
-        grid=(grid_x, 1, 1),
-        stream=context.stream,
-    )
-    return PairLaunchConfig(
-        traversal="hbucket_source_parallel",
         n=int(context.n),
         block_size=int(block_size),
         grid_x=int(grid_x),
@@ -1892,13 +1650,13 @@ def _cluster_pair_segment_lines(
 def _hbucket_pair_segment_lines(
     stage: StageNode,
     calls: tuple[CudaEquationMethodCall, ...],
-    precompute_lines: tuple[str, ...],
+    precompute: CudaPairPrecompute,
 ) -> tuple[str, ...]:
     lines = []
     for methods in _stage_method_segments(stage):
         pre_methods, loop_methods, post_methods = _pair_segment_methods(methods)
         reduction_methods = _local_reduction_methods_for_segment(loop_methods)
-        reduced_fields = _source_parallel_reduced_fields(reduction_methods)
+        reduced_fields = _local_reduction_fields(reduction_methods)
         pre_loop_method_lines = _direct_pair_equation_call_lines(pre_methods, calls)
         if reduction_methods:
             loop_method_lines = _local_reduction_pair_loop_call_lines(
@@ -1914,7 +1672,10 @@ def _hbucket_pair_segment_lines(
         lines.extend(_local_reduction_initialization_lines(reduced_fields))
         lines.extend(
             _hbucket_pair_neighbor_traversal_lines(
-                precompute_lines, (), loop_method_lines
+                _hbucket_pair_precompute_lines(precompute),
+                precompute,
+                (),
+                loop_method_lines,
             )
         )
         lines.extend(_local_reduction_commit_lines(reduced_fields))
@@ -1935,15 +1696,13 @@ def _hbucket_source_inline_first_segment_lines(
             line.replace("                                        ", "    ")
             for line in _direct_pair_equation_call_lines(stage, calls)
         )
-    return _hbucket_pair_segment_lines(
-        stage, calls, _direct_pair_precompute_lines(precompute)
-    )
+    return _hbucket_pair_segment_lines(stage, calls, precompute)
 
 
 def _hbucket_pair_segment_lines_with_source_inline(
     stage: StageNode,
     calls: tuple[CudaEquationMethodCall, ...],
-    precompute_lines: tuple[str, ...],
+    precompute: CudaPairPrecompute,
     source_inline_lines: tuple[str, ...],
     source_inline_fields: tuple[str, ...],
 ) -> tuple[str, ...]:
@@ -1959,7 +1718,11 @@ def _hbucket_pair_segment_lines_with_source_inline(
         )
         lines.extend(
             _hbucket_pair_neighbor_traversal_lines(
-                _replace_source_inline_reads(precompute_lines, source_inline_fields),
+                _replace_source_inline_reads(
+                    _hbucket_pair_precompute_lines(precompute),
+                    source_inline_fields,
+                ),
+                precompute,
                 source_inline_lines,
                 loop_method_lines,
             )
@@ -1968,64 +1731,6 @@ def _hbucket_pair_segment_lines_with_source_inline(
             line.replace("                                        ", "    ")
             for line in post_loop_method_lines
         )
-    return tuple(lines)
-
-
-def _source_parallel_pair_segment_lines(
-    stage: StageNode,
-    calls: tuple[CudaEquationMethodCall, ...],
-    precompute_lines: tuple[str, ...],
-    reduction_methods: tuple[object, ...],
-    reduced_fields: tuple[SourceParallelReductionField, ...],
-) -> tuple[str, ...]:
-    lines = []
-    for methods in _stage_method_segments(stage):
-        pre_methods, loop_methods, post_methods = _pair_segment_methods(methods)
-        pre_loop_method_lines = _direct_pair_equation_call_lines(pre_methods, calls)
-        loop_method_lines = _source_parallel_pair_loop_call_lines(
-            loop_methods, calls, reduction_methods
-        )
-        post_loop_method_lines = _direct_pair_equation_call_lines(post_methods, calls)
-        lines.append("    {")
-        lines.extend(_source_parallel_lane_zero_call_lines(pre_loop_method_lines))
-        lines.extend(_source_parallel_partial_initialization_lines(reduced_fields))
-        lines.extend(
-            _source_parallel_pair_neighbor_traversal_lines(
-                precompute_lines, loop_method_lines
-            )
-        )
-        lines.extend(_source_parallel_reduction_commit_lines(reduced_fields))
-        lines.extend(_source_parallel_lane_zero_call_lines(post_loop_method_lines))
-        lines.append("    }")
-    return tuple(lines)
-
-
-def _hbucket_source_parallel_pair_segment_lines(
-    stage: StageNode,
-    calls: tuple[CudaEquationMethodCall, ...],
-    precompute_lines: tuple[str, ...],
-    reduction_methods: tuple[object, ...],
-    reduced_fields: tuple[SourceParallelReductionField, ...],
-) -> tuple[str, ...]:
-    lines = []
-    for methods in _stage_method_segments(stage):
-        pre_methods, loop_methods, post_methods = _pair_segment_methods(methods)
-        pre_loop_method_lines = _direct_pair_equation_call_lines(pre_methods, calls)
-        loop_method_lines = _source_parallel_pair_loop_call_lines(
-            loop_methods, calls, reduction_methods
-        )
-        post_loop_method_lines = _direct_pair_equation_call_lines(post_methods, calls)
-        lines.append("    {")
-        lines.extend(_source_parallel_lane_zero_call_lines(pre_loop_method_lines))
-        lines.extend(_source_parallel_partial_initialization_lines(reduced_fields))
-        lines.extend(
-            _hbucket_source_parallel_pair_neighbor_traversal_lines(
-                precompute_lines, loop_method_lines
-            )
-        )
-        lines.extend(_source_parallel_reduction_commit_lines(reduced_fields))
-        lines.extend(_source_parallel_lane_zero_call_lines(post_loop_method_lines))
-        lines.append("    }")
     return tuple(lines)
 
 
@@ -2166,6 +1871,7 @@ def _cluster_pair_neighbor_traversal_lines(
 
 def _hbucket_pair_neighbor_traversal_lines(
     precompute_lines: tuple[str, ...],
+    precompute: CudaPairPrecompute,
     source_inline_lines: tuple[str, ...],
     loop_method_lines: tuple[str, ...],
 ) -> tuple[str, ...]:
@@ -2236,11 +1942,7 @@ def _hbucket_pair_neighbor_traversal_lines(
         "                    int end = begin + cell_bucket_counts[flat];",
         "                    for (int pos = begin; pos < end; ++pos) {",
         "                        int src = sorted_ids[pos];",
-        "                        if (fused_codegen_in_support_xyz_cached(",
-        "                            dst_x, dst_y, dst_z, dst_h, src, x, y, z, h, xmin, xmax, ymin, ymax,",
-        "                            zmin, zmax, periodic_x, periodic_y, periodic_z,",
-        "                            radius_scale",
-        "                        )) {",
+        *_hbucket_pair_support_lines(precompute, "                        "),
         *tuple(
             line.replace(
                 "                                        ",
@@ -2270,186 +1972,6 @@ def _hbucket_pair_neighbor_traversal_lines(
         "    }",
     )
     return ("    {", *tuple(f"    {line}" for line in traversal_lines), "    }")
-
-
-def _source_parallel_pair_neighbor_traversal_lines(
-    precompute_lines: tuple[str, ...],
-    loop_method_lines: tuple[str, ...],
-) -> tuple[str, ...]:
-    traversal_lines = (
-        "        int base_cx = fused_codegen_clamp_cell(x[dst], xmin, xmax, nx);",
-        "        int base_cy = fused_codegen_clamp_cell(y[dst], ymin, ymax, ny);",
-        "        int base_cz = fused_codegen_clamp_cell(z[dst], zmin, zmax, nz);",
-        "        for (int oz = -search_radius_cells; oz <= search_radius_cells; ++oz) {",
-        "            if (!fused_codegen_valid_offset(oz, nz)) {",
-        "                continue;",
-        "            }",
-        "            int cz = 0;",
-        "            if (!fused_codegen_neighbor_cell(base_cz, oz, nz, periodic_z, &cz)) {",
-        "                continue;",
-        "            }",
-        "            for (int oy = -search_radius_cells; oy <= search_radius_cells; ++oy) {",
-        "                if (!fused_codegen_valid_offset(oy, ny)) {",
-        "                    continue;",
-        "                }",
-        "                int cy = 0;",
-        "                if (!fused_codegen_neighbor_cell(base_cy, oy, ny, periodic_y, &cy)) {",
-        "                    continue;",
-        "                }",
-        "                for (int ox = -search_radius_cells; ox <= search_radius_cells; ++ox) {",
-        "                    if (!fused_codegen_valid_offset(ox, nx)) {",
-        "                        continue;",
-        "                    }",
-        "                    int cx = 0;",
-        "                    if (!fused_codegen_neighbor_cell(base_cx, ox, nx, periodic_x, &cx)) {",
-        "                        continue;",
-        "                    }",
-        "                    int cell = fused_codegen_linear_cell(cx, cy, cz, nx, ny);",
-        "                    int begin = cell_starts[cell];",
-        "                    int end = begin + cell_counts[cell];",
-        "                    for (int pos = begin + lane; pos < end; pos += 32) {",
-        "                        int src = sorted_ids[pos];",
-        "                        if (fused_codegen_in_support_xyz(",
-        "                            dst, src, x, y, z, h, xmin, xmax, ymin, ymax,",
-        "                            zmin, zmax, periodic_x, periodic_y, periodic_z,",
-        "                            radius_scale",
-        "                        )) {",
-        *tuple(
-            line.replace(
-                "                                        ",
-                "                            ",
-            )
-            for line in precompute_lines
-        ),
-        *tuple(
-            line.replace(
-                "                                        ",
-                "                            ",
-            )
-            for line in loop_method_lines
-        ),
-        "                        }",
-        "                    }",
-        "                }",
-        "            }",
-        "        }",
-    )
-    return traversal_lines
-
-
-def _hbucket_source_parallel_pair_neighbor_traversal_lines(
-    precompute_lines: tuple[str, ...],
-    loop_method_lines: tuple[str, ...],
-) -> tuple[str, ...]:
-    traversal_lines = (
-        "        float dst_x = x[dst];",
-        "        float dst_y = y[dst];",
-        "        float dst_z = z[dst];",
-        "        float dst_h = h[dst];",
-        "        int base_cx = fused_codegen_clamp_cell(dst_x, xmin, xmax, nx);",
-        "        int base_cy = fused_codegen_clamp_cell(dst_y, ymin, ymax, ny);",
-        "        int base_cz = fused_codegen_clamp_cell(dst_z, zmin, zmax, nz);",
-        "        for (int bucket = 0; bucket < bucket_count; ++bucket) {",
-        "            float bucket_h = __uint_as_float(bucket_h_max_bits[bucket]);",
-        "            if (bucket_h <= 0.0f) {",
-        "                continue;",
-        "            }",
-        "            float bucket_support = radius_scale * fmaxf(dst_h, bucket_h);",
-        "            int max_x = (int)ceilf(bucket_support / cell_width_x);",
-        "            int max_y = (int)ceilf(bucket_support / cell_width_y);",
-        "            int max_z = (int)ceilf(bucket_support / cell_width_z);",
-        "            int full_x = periodic_x && nx <= 2 * max_x + 1;",
-        "            int full_y = periodic_y && ny <= 2 * max_y + 1;",
-        "            int full_z = periodic_z && nz <= 2 * max_z + 1;",
-        "            int loops_x = full_x ? nx : 2 * max_x + 1;",
-        "            int loops_y = full_y ? ny : 2 * max_y + 1;",
-        "            int loops_z = full_z ? nz : 2 * max_z + 1;",
-        "            for (int iz = 0; iz < loops_z; ++iz) {",
-        "                int cz = iz;",
-        "                if (!full_z) {",
-        "                    int offset = iz - max_z;",
-        "                    if (!fused_codegen_neighbor_cell(base_cz, offset, nz, periodic_z, &cz)) {",
-        "                        continue;",
-        "                    }",
-        "                }",
-        "                for (int iy = 0; iy < loops_y; ++iy) {",
-        "                    int cy = iy;",
-        "                    if (!full_y) {",
-        "                        int offset = iy - max_y;",
-        "                        if (!fused_codegen_neighbor_cell(base_cy, offset, ny, periodic_y, &cy)) {",
-        "                            continue;",
-        "                        }",
-        "                    }",
-        "                    for (int ix = 0; ix < loops_x; ++ix) {",
-        "                        int cx = ix;",
-        "                        if (!full_x) {",
-        "                            int offset = ix - max_x;",
-        "                            if (!fused_codegen_neighbor_cell(base_cx, offset, nx, periodic_x, &cx)) {",
-        "                                continue;",
-        "                            }",
-        "                        }",
-        "                        int cell = fused_codegen_linear_cell(cx, cy, cz, nx, ny);",
-        "                        int flat = bucket * total_cells + cell;",
-        "                        float cell_bucket_h = __uint_as_float(cell_bucket_h_max_bits[flat]);",
-        "                        if (cell_bucket_h <= 0.0f) {",
-        "                            continue;",
-        "                        }",
-        "                        float cell_support = radius_scale * fmaxf(dst_h, cell_bucket_h);",
-        "                        float cell_support2 = cell_support * cell_support;",
-        "                        float cell_distance2 = fused_codegen_cell_distance2_to_particle(",
-        "                            cell, nx, ny, dst_x, dst_y, dst_z, xmin, xmax,",
-        "                            ymin, ymax, zmin, zmax, periodic_x, periodic_y,",
-        "                            periodic_z, cell_width_x, cell_width_y, cell_width_z",
-        "                        );",
-        "                        if (cell_distance2 > cell_support2) {",
-        "                            continue;",
-        "                        }",
-        "                        int begin = cell_bucket_starts[flat];",
-        "                        int end = begin + cell_bucket_counts[flat];",
-        "                        for (int pos = begin + lane; pos < end; pos += 32) {",
-        "                            int src = sorted_ids[pos];",
-        "                            if (fused_codegen_in_support_xyz_cached(",
-        "                                dst_x, dst_y, dst_z, dst_h, src, x, y, z, h, xmin, xmax, ymin, ymax,",
-        "                                zmin, zmax, periodic_x, periodic_y, periodic_z,",
-        "                                radius_scale",
-        "                            )) {",
-        *tuple(
-            line.replace(
-                "                                        ",
-                "                                ",
-            )
-            for line in precompute_lines
-        ),
-        *tuple(
-            line.replace(
-                "                                        ",
-                "                                ",
-            )
-            for line in loop_method_lines
-        ),
-        "                            }",
-        "                        }",
-        "                    }",
-        "                }",
-        "            }",
-        "        }",
-    )
-    return traversal_lines
-
-
-def _source_parallel_lane_zero_call_lines(
-    call_lines: tuple[str, ...],
-) -> tuple[str, ...]:
-    if len(call_lines) == 0:
-        return ()
-    lines = ["        if (lane == 0) {"]
-    lines.extend(
-        line.replace("                                        ", "            ")
-        for line in call_lines
-    )
-    lines.append("        }")
-    lines.append("        __syncwarp();")
-    return tuple(lines)
 
 
 def _direct_pair_equation_call_lines(
@@ -2485,31 +2007,6 @@ def _grid_stride_call_lines(
     )
 
 
-def _source_parallel_pair_loop_call_lines(
-    methods: tuple[object, ...],
-    calls: tuple[CudaEquationMethodCall, ...],
-    reduction_methods: tuple[object, ...],
-) -> tuple[str, ...]:
-    lines = []
-    for method in methods:
-        if not _is_pair_loop_method(method):
-            continue
-        call = _equation_call_for_method(
-            method.equation_name, method.method_kind, calls
-        )
-        reduction = _reduction_method_for_method(
-            method.equation_name, method.method_kind, reduction_methods
-        )
-        arguments = ", ".join(
-            _source_parallel_call_argument(argument, reduction)
-            for argument in call.arguments
-        )
-        lines.append(
-            f"                                        {call.function_name}({arguments});"
-        )
-    return tuple(lines)
-
-
 def _local_reduction_pair_loop_call_lines(
     methods: tuple[object, ...],
     calls: tuple[CudaEquationMethodCall, ...],
@@ -2533,16 +2030,6 @@ def _local_reduction_pair_loop_call_lines(
             f"                                        {call.function_name}({arguments});"
         )
     return tuple(lines)
-
-
-def _source_parallel_call_argument(argument: str, reduction: object) -> str:
-    for field in reduction.dest_reduction_writes:
-        if argument == f"d_{field}":
-            return f"fused_partial_d_{field}_lane"
-    for field in reduction.dest_max_reduction_writes:
-        if argument == f"d_{field}":
-            return f"fused_partial_d_{field}_lane"
-    return argument
 
 
 def _local_reduction_call_argument(argument: str, reduction: object | None) -> str:
@@ -2660,43 +2147,79 @@ def _direct_pair_precompute_lines(precompute: CudaPairPrecompute) -> tuple[str, 
     )
 
 
-def _source_parallel_reduced_fields(
+def _hbucket_pair_precompute_lines(
+    precompute: CudaPairPrecompute,
+) -> tuple[str, ...]:
+    lines = precompute.lines
+    if _hbucket_pair_reuses_support_distance(precompute):
+        lines = tuple(
+            line
+            for line in lines
+            if not _hbucket_support_distance_precompute_line(line)
+        )
+        lines = tuple(_hbucket_cached_h_precompute_line(line) for line in lines)
+    return tuple(f"                                        {line}" for line in lines)
+
+
+def _hbucket_pair_reuses_support_distance(precompute: CudaPairPrecompute) -> bool:
+    return "XIJ" in precompute.symbols
+
+
+def _hbucket_cached_h_precompute_line(line: str) -> str:
+    return line.replace("h[dst]", "dst_h").replace("h[src]", "src_h")
+
+
+def _hbucket_support_distance_precompute_line(line: str) -> bool:
+    return (
+        line in ("float XIJ[3];", "float R2IJ;")
+        or line.startswith("XIJ[0] = fused_codegen_minimum_image(")
+        or line.startswith("XIJ[1] = fused_codegen_minimum_image(")
+        or line.startswith("XIJ[2] = fused_codegen_minimum_image(")
+        or line == "R2IJ = XIJ[0] * XIJ[0] + XIJ[1] * XIJ[1] + XIJ[2] * XIJ[2];"
+    )
+
+
+def _hbucket_pair_support_lines(
+    precompute: CudaPairPrecompute, indent: str
+) -> tuple[str, ...]:
+    if not _hbucket_pair_reuses_support_distance(precompute):
+        return (
+            f"{indent}if (fused_codegen_in_support_xyz_cached(",
+            f"{indent}    dst_x, dst_y, dst_z, dst_h, src, x, y, z, h, xmin, xmax, ymin, ymax,",
+            f"{indent}    zmin, zmax, periodic_x, periodic_y, periodic_z,",
+            f"{indent}    radius_scale",
+            f"{indent})) {{",
+        )
+    return (
+        f"{indent}float XIJ[3];",
+        f"{indent}XIJ[0] = fused_codegen_minimum_image(dst_x - x[src], xmax - xmin, periodic_x);",
+        f"{indent}XIJ[1] = fused_codegen_minimum_image(dst_y - y[src], ymax - ymin, periodic_y);",
+        f"{indent}XIJ[2] = fused_codegen_minimum_image(dst_z - z[src], zmax - zmin, periodic_z);",
+        f"{indent}float R2IJ = XIJ[0] * XIJ[0] + XIJ[1] * XIJ[1] + XIJ[2] * XIJ[2];",
+        f"{indent}float src_h = h[src];",
+        f"{indent}float fused_support = radius_scale * fmaxf(dst_h, src_h);",
+        f"{indent}if (R2IJ < fused_support * fused_support) {{",
+    )
+
+
+def _local_reduction_fields(
     reduction_methods: tuple[object, ...],
-) -> tuple[SourceParallelReductionField, ...]:
+) -> tuple[LocalReductionField, ...]:
     fields = []
     for method in reduction_methods:
         for field in sorted(method.dest_reduction_writes):
-            item = SourceParallelReductionField(field=field, operation="sum")
+            item = LocalReductionField(field=field, operation="sum")
             if item not in fields:
                 fields.append(item)
         for field in sorted(method.dest_max_reduction_writes):
-            item = SourceParallelReductionField(field=field, operation="max")
+            item = LocalReductionField(field=field, operation="max")
             if item not in fields:
                 fields.append(item)
     return tuple(fields)
 
 
-def _source_parallel_partial_initialization_lines(
-    fields: tuple[SourceParallelReductionField, ...],
-) -> tuple[str, ...]:
-    lines = []
-    for item in fields:
-        if item.operation == "sum":
-            lines.append(f"        float fused_acc_d_{item.field} = 0.0f;")
-        else:
-            assert item.operation == "max"
-            lines.append(
-                f"        float fused_acc_d_{item.field} = d_{item.field}[dst];"
-            )
-        lines.append(
-            f"        float *fused_partial_d_{item.field}_lane = "
-            f"&fused_acc_d_{item.field};"
-        )
-    return tuple(lines)
-
-
 def _local_reduction_initialization_lines(
-    fields: tuple[SourceParallelReductionField, ...],
+    fields: tuple[LocalReductionField, ...],
 ) -> tuple[str, ...]:
     lines = []
     for item in fields:
@@ -2711,42 +2234,8 @@ def _local_reduction_initialization_lines(
     return tuple(lines)
 
 
-def _source_parallel_reduction_commit_lines(
-    fields: tuple[SourceParallelReductionField, ...],
-) -> tuple[str, ...]:
-    lines = []
-    for item in fields:
-        field = item.field
-        lines.append(f"        float fused_reduce_d_{field} = fused_acc_d_{field};")
-        lines.append("        #pragma unroll")
-        lines.append("        for (int offset = 16; offset > 0; offset >>= 1) {")
-        if item.operation == "sum":
-            lines.append(
-                f"            fused_reduce_d_{field} += "
-                f"__shfl_down_sync(0xffffffff, fused_reduce_d_{field}, offset);"
-            )
-        else:
-            assert item.operation == "max"
-            lines.append(
-                f"            fused_reduce_d_{field} = fmaxf(fused_reduce_d_{field}, "
-                f"__shfl_down_sync(0xffffffff, fused_reduce_d_{field}, offset));"
-            )
-        lines.append("        }")
-        lines.append("        if (lane == 0) {")
-        if item.operation == "sum":
-            lines.append(f"            d_{field}[dst] += fused_reduce_d_{field};")
-        else:
-            assert item.operation == "max"
-            lines.append(
-                f"            d_{field}[dst] = fmaxf(d_{field}[dst], "
-                f"fused_reduce_d_{field});"
-            )
-        lines.append("        }")
-    return tuple(lines)
-
-
 def _local_reduction_commit_lines(
-    fields: tuple[SourceParallelReductionField, ...],
+    fields: tuple[LocalReductionField, ...],
 ) -> tuple[str, ...]:
     lines = []
     for item in fields:
@@ -2761,11 +2250,11 @@ def _local_reduction_commit_lines(
     return tuple(lines)
 
 
-def _source_parallel_wrapper_source(
+def _local_reduction_wrapper_source(
     wrapper_source: str,
     reduction_methods: tuple[object, ...],
 ) -> str:
-    replacements = _source_parallel_wrapper_replacements(reduction_methods)
+    replacements = _local_reduction_wrapper_replacements(reduction_methods)
     lines = []
     pending_fields = ()
     active_fields = ()
@@ -2791,7 +2280,7 @@ def _source_parallel_wrapper_source(
 
 
 def _hbucket_pair_wrapper_source(wrapper_source: str, stage: StageNode) -> str:
-    return _source_parallel_wrapper_source(
+    return _local_reduction_wrapper_source(
         _force_cuda_source_fp32(wrapper_source),
         _local_reduction_methods_for_stage(stage),
     )
@@ -2800,13 +2289,13 @@ def _hbucket_pair_wrapper_source(wrapper_source: str, stage: StageNode) -> str:
 def _hbucket_pair_window_wrapper_source(
     wrapper_source: str, stages: tuple[StageNode, ...]
 ) -> str:
-    return _source_parallel_wrapper_source(
+    return _local_reduction_wrapper_source(
         _force_cuda_source_fp32(wrapper_source),
         _local_reduction_methods_for_stages(stages),
     )
 
 
-def _source_parallel_wrapper_replacements(
+def _local_reduction_wrapper_replacements(
     reduction_methods: tuple[object, ...],
 ) -> tuple[tuple[str, tuple[str, ...]], ...]:
     replacements = []
