@@ -348,6 +348,12 @@ __global__ void fused_compute_cell_ids_counts_xyz(
 	__device__ int fused_hbucket_index(float hi, float h_min, int bucket_count)
 	{
 	    float ratio = fmaxf(hi / h_min, 1.0f);
+	    if (bucket_count == 1) {
+	        return 0;
+	    }
+	    if (bucket_count == 2) {
+	        return ratio < 2.0f ? 0 : 1;
+	    }
 	    if (bucket_count == 4) {
 	        if (ratio < 2.0f) {
 	            return 0;
@@ -1067,6 +1073,7 @@ class FusedCudaNeighborWorkspace:
         self.hbucket_bucket_h_max_bits = None
         self.hbucket_cell_bucket_h_max_bits = None
         self.hbucket_h_min_ref = None
+        self.hbucket_h_max_ref = None
 
     def ensure_base(self, n: int, total_cells: int) -> None:
         import pycuda.gpuarray as gpuarray
@@ -1302,7 +1309,11 @@ def build_fused_cuda_hbucket_context_with_workspace(
     """Build h-bucket sorted-cell context using reusable device buffers."""
     if workspace.hbucket_h_min_ref is None:
         workspace.hbucket_h_min_ref = reduce_min_float(h, n, stream, h_reduce_scratch)
+    if workspace.hbucket_h_max_ref is None:
+        workspace.hbucket_h_max_ref = reduce_max_float(h, n, stream, h_reduce_scratch)
     h_min = workspace.hbucket_h_min_ref
+    h_max = workspace.hbucket_h_max_ref
+    active_bucket_count = _effective_hbucket_count(bucket_count, h_min, h_max)
     return _build_fused_cuda_hbucket_context_from_hmin(
         x,
         y,
@@ -1313,11 +1324,34 @@ def build_fused_cuda_hbucket_context_with_workspace(
         upper,
         periodic,
         radius_scale,
-        bucket_count,
+        active_bucket_count,
         stream,
         workspace,
         h_min,
     )
+
+
+def _effective_hbucket_count(
+    requested_bucket_count: int,
+    h_min: np.float32,
+    h_max: np.float32,
+) -> int:
+    assert requested_bucket_count > 0
+    assert isinstance(h_min, np.float32)
+    assert isinstance(h_max, np.float32)
+    assert h_min > np.float32(0.0)
+    assert h_max >= h_min
+    if requested_bucket_count == 1:
+        return 1
+    ratio = np.float32(h_max / h_min)
+    if ratio < np.float32(2.0):
+        return 1
+    # Moderate h variation benefits from separating small/large support radii,
+    # but extra buckets mostly add metadata and per-destination bucket-loop
+    # overhead. Keep the requested split for very broad h ranges.
+    if ratio >= np.float32(8.0):
+        return requested_bucket_count
+    return min(requested_bucket_count, 2)
 
 
 def _build_fused_cuda_hbucket_context_from_hmin(

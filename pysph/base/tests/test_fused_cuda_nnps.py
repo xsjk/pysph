@@ -149,6 +149,15 @@ def test_brute_force_neighbor_indices_use_max_h_and_strict_cutoff():
     np.testing.assert_array_equal(neighbors, np.array([0, 1], dtype=np.int32))
 
 
+def test_hbucket_index_fast_paths_cover_active_bucket_counts():
+    source = fused_nnps.CUDA_SOURCE
+
+    assert "if (bucket_count == 1)" in source
+    assert "return 0;" in source[source.index("if (bucket_count == 1)") :]
+    assert "if (bucket_count == 2)" in source
+    assert "return ratio < 2.0f ? 0 : 1;" in source
+
+
 def test_context_declares_no_csr_and_separate_xyz_device_layout():
     context = FusedCudaNeighborContext(
         n=4,
@@ -268,19 +277,29 @@ def test_hbucket_builder_uses_device_hmax_bits_without_materialization(monkeypat
     assert context.cell_bucket_h_max_bits.dtype == np.uint32
 
 
-def test_hbucket_workspace_reuses_reference_hmin(monkeypatch):
+def test_hbucket_workspace_reuses_reference_h_bounds_and_selects_one_bucket(
+    monkeypatch,
+):
     hmins = []
-    reduce_calls = []
+    bucket_counts = []
+    reduce_min_calls = []
+    reduce_max_calls = []
 
     def fake_reduce_min_float(array, n, stream, scratch):
-        reduce_calls.append((array, n, stream, scratch))
+        reduce_min_calls.append((array, n, stream, scratch))
         return np.float32(0.1)
 
+    def fake_reduce_max_float(array, n, stream, scratch):
+        reduce_max_calls.append((array, n, stream, scratch))
+        return np.float32(0.15)
+
     def fake_build(*args):
+        bucket_counts.append(args[9])
         hmins.append(args[-1])
         return object()
 
     monkeypatch.setattr(fused_nnps, "reduce_min_float", fake_reduce_min_float)
+    monkeypatch.setattr(fused_nnps, "reduce_max_float", fake_reduce_max_float)
     monkeypatch.setattr(
         fused_nnps, "_build_fused_cuda_hbucket_context_from_hmin", fake_build
     )
@@ -304,8 +323,50 @@ def test_hbucket_workspace_reuses_reference_hmin(monkeypatch):
             [],
         )
 
-    assert len(reduce_calls) == 1
+    assert len(reduce_min_calls) == 1
+    assert len(reduce_max_calls) == 1
+    assert bucket_counts == [1, 1]
     assert hmins == [np.float32(0.1), np.float32(0.1)]
+
+
+def test_hbucket_workspace_caps_effective_bucket_count_to_two(monkeypatch):
+    bucket_counts = []
+
+    def fake_build(*args):
+        bucket_counts.append(args[9])
+        return object()
+
+    monkeypatch.setattr(
+        fused_nnps,
+        "reduce_min_float",
+        lambda array, n, stream, scratch: np.float32(0.1),
+    )
+    monkeypatch.setattr(
+        fused_nnps,
+        "reduce_max_float",
+        lambda array, n, stream, scratch: np.float32(0.45),
+    )
+    monkeypatch.setattr(
+        fused_nnps, "_build_fused_cuda_hbucket_context_from_hmin", fake_build
+    )
+
+    build_fused_cuda_hbucket_context_with_workspace(
+        FakeSizedDeviceArray(8, np.float32),
+        FakeSizedDeviceArray(8, np.float32),
+        FakeSizedDeviceArray(8, np.float32),
+        FakeSizedDeviceArray(8, np.float32),
+        8,
+        np.array([0.0, 0.0, 0.0], dtype=np.float32),
+        np.array([1.0, 1.0, 1.0], dtype=np.float32),
+        np.array([True, True, True], dtype=np.bool_),
+        np.float32(2.0),
+        4,
+        object(),
+        FusedCudaNeighborWorkspace(),
+        [],
+    )
+
+    assert bucket_counts == [2]
 
 
 def test_cuda_event_timing_is_disabled_by_default(monkeypatch):
@@ -700,7 +761,7 @@ def test_cuda_hbucket_context_neighbor_count_matches_variable_h_bruteforce():
         for index in range(4)
     ]
 
-    assert context.bucket_count == 4
+    assert context.bucket_count == 2
     assert context.cell_count_tuple == (10, 10, 10)
     np.testing.assert_array_equal(gpu_counts, np.asarray(expected, dtype=np.int32))
 
@@ -770,5 +831,6 @@ def test_cuda_hbucket_cached_hmin_remains_correct_when_h_shrinks():
         for index in range(4)
     ]
 
+    assert context.bucket_count == 1
     assert context.cell_count_tuple == (5, 5, 5)
     np.testing.assert_array_equal(gpu_counts, np.asarray(expected, dtype=np.int32))
