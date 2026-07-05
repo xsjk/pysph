@@ -6,21 +6,18 @@ import inspect
 import os
 from dataclasses import replace
 
+from compyle.config import get_config
 import numpy as np
 
 from pysph.base.fused_cuda_nnps import (
     FusedCudaNeighborWorkspace,
     build_fused_cuda_neighbor_context_with_workspace,
-    create_fused_cuda_convergence_flag,
-    read_fused_cuda_convergence_flag,
-    reset_fused_cuda_convergence_flag,
     wrap_periodic_xyz,
 )
 from pysph.sph.fused_cuda_codegen import (
     CudaPairPrecompute,
     cubic_spline_pair_precompute_for_symbols,
     generate_hbucket_pair_stage_outline_from_equations,
-    generate_hbucket_pair_stage_outline_from_equations_with_convergence_flag,
     generate_resident_hbucket_pair_window_outline_from_equations,
     generate_snapshot_hbucket_pair_window_outline_from_equations,
     PairLaunchConfig,
@@ -48,22 +45,26 @@ class FusedCudaStageBackend:
             self.covered_stage_groups,
             self.stage_group_by_plan_index,
         ) = _stage_group_mapping(helper)
-        (
-            self.resident_window_by_group,
-            self.resident_window_covered_groups,
-        ) = _resident_window_mapping(helper, self.stage_group_by_plan_index)
-        (
-            self.snapshot_window_by_group,
-            self.snapshot_window_covered_groups,
-        ) = _snapshot_window_mapping(helper, self.stage_group_by_plan_index)
+        if _fused_window_mode() == "snapshot":
+            self.resident_window_by_group = {}
+            self.resident_window_covered_groups = set()
+            (
+                self.snapshot_window_by_group,
+                self.snapshot_window_covered_groups,
+            ) = _snapshot_window_mapping(helper, self.stage_group_by_plan_index)
+        else:
+            self.snapshot_window_by_group = {}
+            self.snapshot_window_covered_groups = set()
+            (
+                self.resident_window_by_group,
+                self.resident_window_covered_groups,
+            ) = _resident_window_mapping(helper, self.stage_group_by_plan_index)
         self.has_device_convergence = _has_device_convergence(helper)
         self.launched_groups = set()
         self.device_convergence_skip_groups = set()
         self.device_convergence_active = False
         self.device_convergence_iteration_counts = []
         self.device_convergence_rebuild_count = 0
-        self.device_convergence_host_flag_pull_count = 0
-        self.device_convergence_device_flag_read_count = 0
 
     def begin_compute(self, evaluator, t, dt):
         self.launched_groups = set()
@@ -266,8 +267,6 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
         self.neighbor_contexts = {}
         self.neighbor_workspaces = {}
         self.snapshot_arrays = {}
-        self.device_convergence_flag = None
-        self.device_convergence_uses_particle_flag = False
         self.launch_count = 0
         self.h_reduce_scratch = []
         self.traversal_launch_counts = {}
@@ -290,11 +289,6 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
             self._kernel_info_for_plan_stage_index(index) for index in stage_indices
         )
         context = self._neighbor_context_for_stage(evaluator, infos[0])
-        if not _snapshot_window_is_profitable(context.n):
-            self._launch_resident_hbucket_pair_window(
-                evaluator, stage_indices, extra_args
-            )
-            return
         equations_by_stage = tuple(
             _equations_for_stage(self.helper, stage, info["stage_group"])
             for stage, info in zip(stages, infos)
@@ -448,21 +442,18 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
     def _launch_single_stage(self, evaluator, stage, info, extra_args):
         equations = _equations_for_stage(self.helper, stage, info["stage_group"])
         precompute = _precompute_for_stage(stage, self.helper.object.kernel)
-        convergence_field = self._device_convergence_field_for_stage(stage)
         timer = _stage_timer(self.stream)
         traversal = "pointwise"
         if stage.kind in (StageKind.PAIR_DENSITY, StageKind.PAIR_RATE):
             context = self._neighbor_context_for_stage(evaluator, info)
             traversal = _pair_traversal_for_stage(context)
             outline = self._outline_for_stage(
-                stage, equations, precompute, info, convergence_field, traversal
+                stage, equations, precompute, info, traversal
             )
             module = self._module_for_stage(outline, info, stage)
             stage_args = _stage_extra_args(
                 self.helper, stage, equations, info, extra_args, precompute
             )
-            if convergence_field is not None:
-                stage_args = (self.device_convergence_flag,) + stage_args
             self._record_pair_launch(traversal)
             launch_config = launch_hbucket_pair_kernel_with_context(
                 module, outline.name, context, stage_args
@@ -470,7 +461,7 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
             self._record_pair_launch_config(launch_config)
         elif _stage_can_use_pointwise_kernel(stage):
             outline = self._outline_for_stage(
-                stage, equations, precompute, info, convergence_field, traversal
+                stage, equations, precompute, info, traversal
             )
             module = self._module_for_stage(outline, info, stage)
             stage_args = _stage_extra_args(
@@ -557,68 +548,7 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
             self.neighbor_contexts = {}
 
     def _device_convergence_has_converged(self, info):
-        if _assume_converged_after_min_iterations():
-            return True
-        if (
-            self.device_convergence_uses_particle_flag
-            and self.device_convergence_flag is not None
-        ):
-            self.device_convergence_device_flag_read_count += 1
-            return self._read_device_convergence_flag()
-        policy = self._device_convergence_policy()
-        if policy is not None and policy.flag_fields:
-            return self._device_convergence_flags_are_positive(info, policy)
-        for equation in info["equations"]:
-            if hasattr(equation, "_gpu"):
-                self.device_convergence_host_flag_pull_count += 1
-                equation._pull("equation_has_converged")
-            if not (equation.converged() > 0):
-                return False
         return True
-
-    def _device_convergence_flags_are_positive(self, info, policy):
-        for equation in info["equations"]:
-            if equation.__class__.__name__ not in policy.equation_names:
-                continue
-            if hasattr(equation, "_gpu"):
-                self.device_convergence_host_flag_pull_count += 1
-                equation._pull(*policy.flag_fields)
-            for field in policy.flag_fields:
-                if not (getattr(equation, field) > 0):
-                    return False
-        return True
-
-    def _begin_device_convergence_iteration(self, info):
-        if not self.device_convergence_uses_particle_flag:
-            return
-        if self.device_convergence_flag is None:
-            self.device_convergence_flag = create_fused_cuda_convergence_flag(
-                self.stream
-            )
-            return
-        reset_fused_cuda_convergence_flag(self.device_convergence_flag, self.stream)
-
-    def _read_device_convergence_flag(self):
-        return read_fused_cuda_convergence_flag(
-            self.device_convergence_flag, self.stream
-        )
-
-    def _begin_device_convergence_super_stage(self, kernel_infos):
-        stages = tuple(
-            self.stage_by_group[kernel_info["stage_group"]]
-            for kernel_info in kernel_infos
-        )
-        self.device_convergence_uses_particle_flag = all(
-            _stage_convergence_particle_field(stage) is not None for stage in stages
-        )
-
-    def _end_device_convergence_super_stage(self):
-        self.device_convergence_uses_particle_flag = False
-
-    def _device_convergence_field_for_stage(self, stage):
-        if not self.device_convergence_uses_particle_flag:
-            return None
-        return _stage_convergence_particle_field(stage)
 
     def _update_device_convergence_nnps(self, evaluator, info):
         self.neighbor_contexts = {}
@@ -631,9 +561,7 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
         self.neighbor_contexts = {}
         return True
 
-    def _outline_for_stage(
-        self, stage, equations, precompute, info, convergence_field, traversal
-    ):
+    def _outline_for_stage(self, stage, equations, precompute, info, traversal):
         stage_group = info["stage_group"]
         outline_key = (
             stage_group,
@@ -643,19 +571,13 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
                 (method.equation_name, method.method_kind.value)
                 for method in stage.methods
             ),
-            convergence_field,
         )
         if outline_key in self.outlines:
             return self.outlines[outline_key]
         if stage.kind in (StageKind.PAIR_DENSITY, StageKind.PAIR_RATE):
-            if convergence_field is None:
-                outline = generate_hbucket_pair_stage_outline_from_equations(
-                    "cuda_eval", stage, equations, precompute
-                )
-            else:
-                outline = generate_hbucket_pair_stage_outline_from_equations_with_convergence_flag(
-                    "cuda_eval", stage, equations, precompute, convergence_field
-                )
+            outline = generate_hbucket_pair_stage_outline_from_equations(
+                "cuda_eval", stage, equations, precompute
+            )
         elif _stage_can_use_pointwise_kernel(stage):
             outline = generate_pointwise_stage_outline_from_equations(
                 "cuda_eval", stage, equations
@@ -673,7 +595,6 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
                 (method.equation_name, method.method_kind.value)
                 for method in stage.methods
             ),
-            "fused_convergence_flag" in outline.source,
         )
         if module_key in self.modules:
             return self.modules[module_key]
@@ -992,13 +913,6 @@ def _precomputed_source_reads(symbols):
     return frozenset(reads)
 
 
-def _stage_convergence_particle_field(stage):
-    for method in stage.methods:
-        if "converged" in method.dest_writes:
-            return "converged"
-    return None
-
-
 def _stage_can_launch_from_kernel_call(stage):
     if stage.kind in (StageKind.PAIR_DENSITY, StageKind.PAIR_RATE):
         return True
@@ -1042,10 +956,6 @@ def _stage_timer(stream):
 
 def _source_module_options():
     return ("--use_fast_math",)
-
-
-def _assume_converged_after_min_iterations():
-    return True
 
 
 def _hbucket_bucket_count():
@@ -1314,10 +1224,6 @@ def _snapshot_hbucket_pair_window_key(stages, precompute, snapshot_fields):
     )
 
 
-def _snapshot_window_is_profitable(n):
-    return int(n) >= 32768
-
-
 def _unique_equations_for_window(equations_by_stage):
     equations = []
     names = []
@@ -1328,6 +1234,12 @@ def _unique_equations_for_window(equations_by_stage):
                 names.append(name)
                 equations.append(equation)
     return tuple(equations)
+
+
+def _fused_window_mode():
+    mode = get_config().fused_cuda_window
+    assert mode in ("snapshot", "resident")
+    return mode
 
 
 def _device_pointer_int(array):

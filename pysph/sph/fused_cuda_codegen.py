@@ -224,7 +224,7 @@ def generate_hbucket_pair_stage_outline_from_equations(
         stage, equations, known_types, precompute.symbols
     )
     return _generate_hbucket_pair_loop_outline_with_equation_calls(
-        plan_id, stage, wrapper_source, precompute, calls, None
+        plan_id, stage, wrapper_source, precompute, calls
     )
 
 
@@ -291,26 +291,6 @@ def generate_snapshot_hbucket_pair_window_outline_from_equations(
     )
 
 
-def generate_hbucket_pair_stage_outline_from_equations_with_convergence_flag(
-    plan_id: str,
-    stage: StageNode,
-    equations: tuple[object, ...],
-    precompute: CudaPairPrecompute,
-    convergence_field: str,
-) -> FusedKernelOutline:
-    """Return an h-bucket pair outline that clears a device convergence flag."""
-    assert _stage_uses_neighbors(stage)
-    known_types = _cuda_known_types_for_stage(stage, equations, precompute.symbols)
-    group = CUDAGroup(list(equations))
-    wrapper_source = group.get_equation_wrappers(known_types)
-    calls = _cuda_equation_calls_for_stage(
-        stage, equations, known_types, precompute.symbols
-    )
-    return _generate_hbucket_pair_loop_outline_with_equation_calls(
-        plan_id, stage, wrapper_source, precompute, calls, convergence_field
-    )
-
-
 def generate_pointwise_stage_outline_from_equations(
     plan_id: str,
     stage: StageNode,
@@ -343,20 +323,17 @@ def _generate_hbucket_pair_loop_outline_with_equation_calls(
     wrapper_source: str,
     precompute: CudaPairPrecompute,
     calls: tuple[CudaEquationMethodCall, ...],
-    convergence_field: str | None,
 ) -> FusedKernelOutline:
     assert _stage_uses_neighbors(stage)
     name = fused_kernel_name(plan_id, stage)
     segment_lines = _hbucket_pair_segment_lines(stage, calls, precompute)
     arguments = (
         hbucket_context_argument_declarations()
-        + _convergence_flag_argument_declarations(convergence_field)
         + _unique_argument_declarations(
             _precompute_argument_declarations(precompute),
             _equation_call_arguments(calls),
         )
     )
-    convergence_flag_lines = _convergence_flag_lines(convergence_field)
     fp32_wrapper_source = _hbucket_pair_wrapper_source(wrapper_source, stage)
     source = "\n".join(
         (
@@ -375,7 +352,6 @@ def _generate_hbucket_pair_loop_outline_with_equation_calls(
             "    }",
             "    int dst = sorted_ids[fused_dst_linear];",
             *segment_lines,
-            *convergence_flag_lines,
             "}",
             "}",
         )
@@ -1872,25 +1848,6 @@ def _force_cuda_source_fp32(source: str) -> str:
         r"pow\(\(([^,\n]+)\), self->dim\)",
         r"fused_codegen_pow_dim(\1, self->dim)",
         fp32_source,
-    )
-
-
-def _convergence_flag_argument_declarations(
-    convergence_field: str | None,
-) -> tuple[str, ...]:
-    if convergence_field is None:
-        return ()
-    return ("int *fused_convergence_flag",)
-
-
-def _convergence_flag_lines(convergence_field: str | None) -> tuple[str, ...]:
-    if convergence_field is None:
-        return ()
-    field_array = f"d_{convergence_field}"
-    return (
-        f"    if ({field_array}[dst] == 0.0f) {{",
-        "        atomicExch(fused_convergence_flag, 0);",
-        "    }",
     )
 
 

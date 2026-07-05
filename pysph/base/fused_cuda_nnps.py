@@ -29,11 +29,6 @@ extern "C" {
 	    }
 	}
 
-__global__ void fused_reset_convergence_flag(int *flag)
-{
-    flag[0] = 1;
-}
-
 	__global__ void fused_reduce_max_float(const float *values, int n, float *out)
 	{
     __shared__ float scratch[256];
@@ -1212,41 +1207,6 @@ def _reduce_float(
     cuda.memcpy_dtoh_async(host, _device_ptr(current), stream)
     stream.synchronize()
     return np.float32(host[0])
-
-
-def create_fused_cuda_convergence_flag(stream: object) -> object:
-    """Return a device convergence flag initialized to true."""
-    _ensure_cuda_context()
-    import pycuda.gpuarray as gpuarray
-
-    flag = gpuarray.empty((1,), np.int32)
-    reset_fused_cuda_convergence_flag(flag, stream)
-    return flag
-
-
-def reset_fused_cuda_convergence_flag(flag: object, stream: object) -> None:
-    """Reset a device convergence flag to true on the given stream."""
-    _ensure_cuda_context()
-    assert flag.dtype == np.int32
-    kernel = _module().get_function("fused_reset_convergence_flag")
-    kernel(
-        _device_ptr(flag),
-        block=(1, 1, 1),
-        grid=(1, 1, 1),
-        stream=stream,
-    )
-
-
-def read_fused_cuda_convergence_flag(flag: object, stream: object) -> bool:
-    """Read a device convergence flag at a true host boundary."""
-    _ensure_cuda_context()
-    assert flag.dtype == np.int32
-    import pycuda.driver as cuda
-
-    host_flag = np.empty((1,), dtype=np.int32)
-    cuda.memcpy_dtoh_async(host_flag, flag.gpudata, stream)
-    stream.synchronize()
-    return bool(host_flag[0] > np.int32(0))
 
 
 def cell_counts_from_hmin(

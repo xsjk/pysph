@@ -71,12 +71,16 @@ class TestApplication(TestCase):
         self._old_use_cuda = config.use_cuda
         self._old_use_opencl = config.use_opencl
         self._old_use_fused_cuda = getattr(config, 'use_fused_cuda', False)
+        self._old_fused_cuda_window = getattr(
+            config, 'fused_cuda_window', 'snapshot'
+        )
 
     def tearDown(self):
         config = get_config()
         config.use_cuda = self._old_use_cuda
         config.use_opencl = self._old_use_opencl
         config.use_fused_cuda = self._old_use_fused_cuda
+        config.fused_cuda_window = self._old_fused_cuda_window
         if sys.platform.startswith('win'):
             try:
                 shutil.rmtree(self.output_dir)
@@ -132,6 +136,24 @@ class TestApplication(TestCase):
         config = get_config()
         self.assertTrue(config.use_cuda)
         self.assertTrue(config.use_fused_cuda)
+        self.assertEqual(config.fused_cuda_window, 'snapshot')
+
+    def test_cuda_fused_window_sets_global_config(self):
+        app = self.app
+        app.set_args(['--cuda', '--fused', '--fused-window', 'resident'])
+        app._parse_command_line(force=True)
+
+        app._configure_global_config()
+
+        config = get_config()
+        self.assertEqual(config.fused_cuda_window, 'resident')
+
+    def test_fused_window_requires_fused_cuda(self):
+        app = self.app
+        app.set_args(['--cuda', '--fused-window', 'resident'])
+
+        with self.assertRaises(SystemExit):
+            app._parse_command_line(force=True)
 
     def test_fused_rejects_non_hbucket_nnps(self):
         app = self.app

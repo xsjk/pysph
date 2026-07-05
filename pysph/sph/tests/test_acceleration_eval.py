@@ -264,11 +264,14 @@ class TestAccelerationEvalGPUHelperCodegen(unittest.TestCase):
 
         config = get_config()
         old_use_fused_cuda = getattr(config, "use_fused_cuda", False)
+        old_fused_cuda_window = getattr(config, "fused_cuda_window", "snapshot")
         config.use_fused_cuda = True
+        config.fused_cuda_window = "snapshot"
         try:
             helper.setup_compiled_module(None)
         finally:
             config.use_fused_cuda = old_use_fused_cuda
+            config.fused_cuda_window = old_fused_cuda_window
 
         self.assertIsNotNone(helper.object.compiled.stage_backend)
 

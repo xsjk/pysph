@@ -15,12 +15,9 @@ from pysph.base.fused_cuda_nnps import (
     build_fused_cuda_neighbor_context_with_workspace,
     count_hbucket_traversal_work_from_context,
     count_neighbors_from_hbucket_context,
-    create_fused_cuda_convergence_flag,
     minimum_image_delta,
-    read_fused_cuda_convergence_flag,
     reduce_max_float,
     reduce_min_float,
-    reset_fused_cuda_convergence_flag,
     wrap_periodic_xyz,
 )
 
@@ -391,19 +388,6 @@ def test_cuda_hbucket_context_neighbor_count_matches_variable_h_bruteforce():
     assert context.bucket_count == 2
     assert context.cell_count_tuple == (10, 10, 10)
     np.testing.assert_array_equal(gpu_counts, np.asarray(expected, dtype=np.int32))
-
-
-def test_cuda_convergence_flag_resets_and_reads_from_device():
-    cuda = require_cuda()
-
-    stream = cuda.Stream()
-    flag = create_fused_cuda_convergence_flag(stream)
-
-    assert read_fused_cuda_convergence_flag(flag, stream)
-    cuda.memset_d32_async(int(flag.gpudata), 0, 1, stream)
-    assert not read_fused_cuda_convergence_flag(flag, stream)
-    reset_fused_cuda_convergence_flag(flag, stream)
-    assert read_fused_cuda_convergence_flag(flag, stream)
 
 
 def test_cuda_reduce_max_float_reads_device_value():
