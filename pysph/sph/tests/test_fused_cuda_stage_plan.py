@@ -10,12 +10,8 @@ from pysph.sph.fused_cuda_stage_plan import (
     analyze_pair_reduction_stage,
     analyze_pair_reduction_method,
     analyze_equation_method,
-    cooperative_grid_sync_windows,
-    cooperative_grid_sync_launch_budget,
     plan_equation_groups,
     resident_rhs_windows,
-    source_visible_inline_precompute_windows,
-    stage_dependency_barriers,
 )
 
 
@@ -421,100 +417,6 @@ def test_resident_rhs_window_rebuilds_after_h_update_before_next_pair_stage():
     assert [window.planned_launch_count for window in windows] == [3, 2]
 
 
-def test_stage_dependency_barriers_report_neighbor_rebuild_after_h_update():
-    groups = [
-        Group([DensityEquation(dest="fluid", sources=["fluid"])]),
-        Group([SmoothingLengthUpdateEquation(dest="fluid", sources=None)]),
-        Group([RateEquation(dest="fluid", sources=["fluid"])]),
-    ]
-    plan = plan_equation_groups(groups, True, ())
-
-    barriers = stage_dependency_barriers(plan)
-
-    assert [(barrier.left_index, barrier.right_index) for barrier in barriers] == [
-        (1, 2),
-        (1, 2),
-    ]
-    assert [barrier.reason for barrier in barriers] == [
-        "neighbor_metadata_rebuild",
-        "source_visible_dependency",
-    ]
-    assert [barrier.fields for barrier in barriers] == [("h",), ("h",)]
-
-
-def test_stage_dependency_barriers_report_source_visible_dependency():
-    groups = [
-        Group([SourceVisibleWriteEquation(dest="fluid", sources=["fluid"])]),
-        Group([SourceVisibleReadEquation(dest="fluid", sources=["fluid"])]),
-    ]
-    plan = plan_equation_groups(groups, True, ())
-
-    barriers = stage_dependency_barriers(plan)
-
-    assert [(barrier.left_index, barrier.right_index) for barrier in barriers] == [
-        (0, 1)
-    ]
-    assert barriers[0].reason == "source_visible_dependency"
-    assert barriers[0].fields == ("u",)
-
-
-def test_stage_dependency_barriers_do_not_report_destination_only_dependency():
-    groups = [
-        Group([EosEquation(dest="fluid", sources=None)]),
-        Group([DestinationPressureRateEquation(dest="fluid", sources=["fluid"])]),
-    ]
-    plan = plan_equation_groups(groups, True, ())
-
-    assert stage_dependency_barriers(plan) == ()
-
-
-def test_cooperative_grid_sync_window_fuses_source_visible_pair_dependency():
-    groups = [
-        Group([SourceVisibleWriteEquation(dest="fluid", sources=["fluid"])]),
-        Group([SourceVisibleReadEquation(dest="fluid", sources=["fluid"])]),
-    ]
-    plan = plan_equation_groups(groups, True, ())
-
-    windows = cooperative_grid_sync_windows(plan)
-
-    assert len(windows) == 1
-    assert windows[0].stage_indices == (0, 1)
-    assert windows[0].stage_kinds == (StageKind.PAIR_RATE, StageKind.PAIR_RATE)
-    assert windows[0].sync_count == 1
-    assert windows[0].ordinary_rhs_core_kernel_count == 2
-    assert windows[0].cooperative_rhs_core_kernel_count == 1
-    assert windows[0].barrier_reasons == ("source_visible_dependency",)
-    assert windows[0].barrier_fields == ("u",)
-
-
-def test_cooperative_grid_sync_window_rejects_neighbor_rebuild_boundary():
-    groups = [
-        Group([DensityEquation(dest="fluid", sources=["fluid"])]),
-        Group([SmoothingLengthUpdateEquation(dest="fluid", sources=None)]),
-        Group([RateEquation(dest="fluid", sources=["fluid"])]),
-    ]
-    plan = plan_equation_groups(groups, True, ())
-
-    assert cooperative_grid_sync_windows(plan) == ()
-
-
-def test_cooperative_grid_sync_budget_reports_core_kernel_savings():
-    groups = [
-        Group([DensityEquation(dest="fluid", sources=["fluid"])]),
-        Group([EosEquation(dest="fluid", sources=None)]),
-        Group([SourceVisibleWriteEquation(dest="fluid", sources=["fluid"])]),
-        Group([SourceVisibleReadEquation(dest="fluid", sources=["fluid"])]),
-    ]
-    plan = plan_equation_groups(groups, True, ())
-
-    budget = cooperative_grid_sync_launch_budget(plan)
-
-    assert budget.ordinary_rhs_core_kernel_count == 3
-    assert budget.cooperative_rhs_core_kernel_count == 2
-    assert budget.core_kernel_savings == 1
-    assert budget.cooperative_planned_launch_count == 3
-
-
 def test_stage_planner_keeps_pair_loop_with_timestep_candidate_as_pair_stage():
     group = Group([PairRateWithTimeStepCandidate(dest="fluid", sources=["fluid"])])
 
@@ -691,50 +593,6 @@ def test_stage_planner_keeps_pointwise_head_when_pair_reads_written_source_field
     ]
 
 
-def test_source_visible_inline_precompute_window_accepts_pointwise_self_source():
-    groups = [
-        Group([EosEquation(dest="fluid", sources=None)]),
-        Group([RateEquation(dest="fluid", sources=["fluid"])]),
-    ]
-
-    plan = plan_equation_groups(groups, True, ())
-    windows = source_visible_inline_precompute_windows(plan)
-
-    assert len(windows) == 1
-    assert windows[0].dest == "fluid"
-    assert windows[0].stage_indices == (0, 1)
-    assert windows[0].fields == ("p",)
-    assert [method.equation_name for method in windows[0].producer_methods] == [
-        "EosEquation",
-    ]
-    assert [method.equation_name for method in windows[0].consumer_methods] == [
-        "RateEquation",
-        "RateEquation",
-    ]
-
-
-def test_source_visible_inline_precompute_window_rejects_neighbor_metadata_write():
-    groups = [
-        Group([SmoothingLengthUpdateEquation(dest="fluid", sources=None)]),
-        Group([RateEquation(dest="fluid", sources=["fluid"])]),
-    ]
-
-    plan = plan_equation_groups(groups, True, ())
-
-    assert source_visible_inline_precompute_windows(plan) == ()
-
-
-def test_source_visible_inline_precompute_window_rejects_non_self_source():
-    groups = [
-        Group([EosEquation(dest="fluid", sources=None)]),
-        Group([RateEquation(dest="fluid", sources=["solid"])]),
-    ]
-
-    plan = plan_equation_groups(groups, True, ())
-
-    assert source_visible_inline_precompute_windows(plan) == ()
-
-
 def test_stage_planner_merges_adjacent_pair_rates_without_source_visible_dependency():
     groups = [
         Group([RateEquation(dest="fluid", sources=["fluid"])]),
@@ -856,6 +714,7 @@ def test_stage_planner_keeps_segments_for_non_reduction_shared_write():
 
     assert [stage.kind for stage in plan.stages] == [StageKind.PAIR_RATE]
     assert len(plan.stages[0].method_segments) == 2
+
 
 def test_stage_planner_keeps_adjacent_pair_rates_when_next_reads_written_source_field():
     groups = [

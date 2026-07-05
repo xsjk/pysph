@@ -33,14 +33,14 @@ from pysph.sph.fused_cuda_codegen import (
     generate_direct_pair_loop_outline_with_equation_calls_and_precompute,
     generate_direct_pair_loop_outline_with_equation_calls,
     generate_direct_pair_loop_outline_with_inline_bodies,
-    generate_cell_tile_hbucket_pair_stage_outline_from_equations,
+    generate_sorted_hbucket_pair_stage_outline_from_equations,
     generate_pointwise_stage_outline_from_equations,
     generate_pointwise_kernel_outline_with_equation_calls,
     generate_fused_kernel_outline,
     generate_hbucket_pair_stage_outline_from_equations,
     launch_budget_for_specs,
     launch_direct_pair_kernel_with_context,
-    launch_cell_tile_hbucket_pair_kernel_with_context,
+    launch_sorted_hbucket_pair_kernel_with_context,
     launch_hbucket_pair_kernel_with_context,
     launch_pointwise_kernel,
     lower_equation_method_to_cuda,
@@ -831,7 +831,7 @@ def test_hbucket_pair_outline_uses_local_accumulator_for_shared_reduction_writes
     assert "d_au[dst] += fused_acc_d_au;" in outline.source
 
 
-def test_cell_tile_hbucket_outline_uses_shared_source_tiles():
+def test_sorted_hbucket_outline_uses_sorted_destination_order():
     stage = replace(
         _stage(
             StageKind.PAIR_RATE,
@@ -840,30 +840,27 @@ def test_cell_tile_hbucket_outline_uses_shared_source_tiles():
         method_segments=((_sum_reduction_deps("AddMass", "au"),),),
     )
 
-    outline = generate_cell_tile_hbucket_pair_stage_outline_from_equations(
+    outline = generate_sorted_hbucket_pair_stage_outline_from_equations(
         "test",
         stage,
         (AddMass(dest="fluid", sources=["fluid"]),),
         CudaPairPrecompute(symbols=frozenset(), helper_source="", lines=()),
+        None,
     )
 
-    assert "__shared__ float fused_tile_s_m[128];" in outline.source
-    assert "for (int dest_local_base = 0; dest_local_base < dst_count;" in (
+    assert "int rank = blockIdx.x * blockDim.x + threadIdx.x;" in outline.source
+    assert "int dst = sorted_ids[rank];" in outline.source
+    assert "if (rank >= n || bucket_count != 1)" in outline.source
+    assert "for (int bucket = 0; bucket < bucket_count; ++bucket)" not in (
         outline.source
     )
-    assert "int dest_local = dest_local_base + threadIdx.x;" in outline.source
-    assert "fused_tile_s_m[threadIdx.x] = s_m[src_id];" in outline.source
-    assert "AddMass_loop(add_mass0, dst, tile_j, d_au, fused_tile_s_m);" in (
-        outline.source
-    )
+    assert "AddMass_loop(add_mass0, dst, src, d_au, s_m);" in outline.source
 
 
-def test_cell_tile_hbucket_pair_launch_uses_cell_grid(monkeypatch):
+def test_sorted_hbucket_pair_launch_uses_particle_grid(monkeypatch):
     from pysph.sph import fused_cuda_codegen as codegen
 
-    monkeypatch.setattr(
-        codegen, "_cell_tile_hbucket_block_size", lambda: 128, raising=False
-    )
+    monkeypatch.setattr(codegen, "_pair_block_size_for_count", lambda n: 128)
 
     class FakeGpuArray:
         gpudata = 7
@@ -909,7 +906,7 @@ def test_cell_tile_hbucket_pair_launch_uses_cell_grid(monkeypatch):
     module = FakeModule()
     normal_arg = FakeGpuArray()
 
-    launch_config = launch_cell_tile_hbucket_pair_kernel_with_context(
+    launch_config = launch_sorted_hbucket_pair_kernel_with_context(
         module,
         "kernel0",
         context,
@@ -917,12 +914,12 @@ def test_cell_tile_hbucket_pair_launch_uses_cell_grid(monkeypatch):
     )
 
     assert module.requested_name == "kernel0"
-    assert launch_config.traversal == "cell_tile_hbucket"
+    assert launch_config.traversal == "sorted_hbucket"
     assert launch_config.n == 513
     assert launch_config.block_size == 128
-    assert launch_config.grid_x == 14
+    assert launch_config.grid_x == 5
     assert module.kernel.block == (128, 1, 1)
-    assert module.kernel.grid == (14, 1, 1)
+    assert module.kernel.grid == (5, 1, 1)
     assert module.kernel.stream is stream
     assert module.kernel.args[-1:] == (normal_arg.gpudata,)
 
@@ -1011,13 +1008,13 @@ def test_generated_stage_backend_counts_pair_launch_configs():
     )
     backend._record_pair_launch_config(
         PairLaunchConfig(
-            traversal="resident_hbucket", n=13824, block_size=128, grid_x=108
+            traversal="sorted_hbucket", n=13824, block_size=128, grid_x=108
         )
     )
 
     assert backend.pair_launch_config_counts == {
         ("hbucket", 513, 128, 5): 2,
-        ("resident_hbucket", 13824, 128, 108): 1,
+        ("sorted_hbucket", 13824, 128, 108): 1,
     }
 
 
@@ -1027,12 +1024,12 @@ def test_generated_stage_backend_records_pair_launch_counts():
     backend = object.__new__(GeneratedFusedCudaStageBackend)
     backend.traversal_launch_counts = {"hbucket": 2}
 
-    backend._record_pair_launch("hbucket_source_inline")
+    backend._record_pair_launch("sorted_hbucket")
     backend._record_pair_launch("hbucket")
 
     assert backend.traversal_launch_counts == {
         "hbucket": 3,
-        "hbucket_source_inline": 1,
+        "sorted_hbucket": 1,
     }
 
 
@@ -1264,41 +1261,6 @@ def test_fused_stage_backend_does_not_hoist_when_right_writes_left_source_read()
         (StageKind.PAIR_RATE, ("PrepPressure", "Diagnostic"), (0, -1)),
         (StageKind.PAIR_RATE, ("Acceleration", "Acceleration"), (1, -1)),
     ]
-
-
-def test_ctypes_kernel_argument_cache_reuses_storage_and_updates_values():
-    from pysph.sph.fused_cuda_stage_backend import _CtypesKernelArgumentCache
-
-    cache = _CtypesKernelArgumentCache()
-
-    first_args, first_storage = cache.arguments(
-        (np.uintp(11), np.int32(7), np.float32(1.5))
-    )
-    second_args, second_storage = cache.arguments(
-        (np.uintp(22), np.int32(9), np.float32(2.5))
-    )
-
-    assert second_args is first_args
-    assert second_storage is first_storage
-    assert len(second_storage) == 3
-    assert second_storage[0].value == 22
-    assert second_storage[1].value == 9
-    assert second_storage[2].value == np.float32(2.5)
-
-
-def test_resident_grid_sync_is_disabled_by_default(monkeypatch):
-    from pysph.sph import fused_cuda_stage_backend as backend_module
-
-    monkeypatch.setattr(backend_module, "_resident_grid_block_count", lambda: 170)
-    monkeypatch.setattr(backend_module, "_pair_block_size_for_count", lambda n: 128)
-
-    assert backend_module._resident_grid_sync_pair_window_policy() == "off"
-    assert not backend_module._resident_grid_sync_context_allowed(
-        SimpleNamespace(n=13824)
-    )
-    assert not backend_module._resident_grid_sync_context_allowed(
-        SimpleNamespace(n=71688)
-    )
 
 
 def test_fused_stage_backend_runs_device_convergence_super_stage_and_skips_legacy_calls():
@@ -2707,7 +2669,7 @@ def test_cuda_hbucket_cubic_gradient_kernel_matches_cubic_bruteforce():
     )
 
 
-def test_cuda_cell_tile_hbucket_add_mass_matches_hbucket():
+def test_cuda_sorted_hbucket_add_mass_matches_hbucket():
     cuda = require_cuda()
     import pycuda.gpuarray as gpuarray
     from pycuda.compiler import SourceModule
@@ -2757,8 +2719,8 @@ def test_cuda_cell_tile_hbucket_add_mass_matches_hbucket():
     old_outline = generate_hbucket_pair_stage_outline_from_equations(
         "old", stage, (equation,), precompute
     )
-    new_outline = generate_cell_tile_hbucket_pair_stage_outline_from_equations(
-        "new", stage, (equation,), precompute
+    new_outline = generate_sorted_hbucket_pair_stage_outline_from_equations(
+        "new", stage, (equation,), precompute, None
     )
     old_module = SourceModule(old_outline.source, no_extern_c=True)
     new_module = SourceModule(new_outline.source, no_extern_c=True)
@@ -2766,7 +2728,7 @@ def test_cuda_cell_tile_hbucket_add_mass_matches_hbucket():
     launch_hbucket_pair_kernel_with_context(
         old_module, old_outline.name, context, (np.uintp(0), d_old, d_mass)
     )
-    launch_cell_tile_hbucket_pair_kernel_with_context(
+    launch_sorted_hbucket_pair_kernel_with_context(
         new_module, new_outline.name, context, (np.uintp(0), d_new, d_mass)
     )
     got = d_new.get_async(stream=stream)
