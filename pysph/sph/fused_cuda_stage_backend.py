@@ -1049,7 +1049,7 @@ def _assume_converged_after_min_iterations():
 
 
 def _hbucket_bucket_count():
-    return 4
+    return 1
 
 
 def _stage_timing_key(stage, traversal):
@@ -1357,7 +1357,7 @@ def _resident_grid_block_count():
 
 
 def _pair_block_size_for_count(n):
-    full_block_size = 256
+    full_block_size = 128
     full_particle_blocks = (int(n) + full_block_size - 1) // full_block_size
     if full_particle_blocks < _resident_grid_block_count():
         return 128

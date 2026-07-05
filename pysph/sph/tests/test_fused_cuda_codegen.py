@@ -7,6 +7,7 @@ import numpy as np
 
 from pysph.sph.fused_cuda_codegen import (
     CudaPairPrecompute,
+    _force_cuda_source_fp32,
     fused_kernel_specs,
     generate_fused_kernel_outline,
     generate_hbucket_pair_stage_outline_from_equations,
@@ -153,6 +154,23 @@ def test_pointwise_kernel_outline_can_reuse_pysph_cuda_equation_wrapper():
     assert "sorted_ids" not in outline.source
 
 
+def test_fp32_wrapper_uses_fast_dim_power_helpers():
+    source = "\n".join(
+        (
+            "double rho = d_m[d_idx] / pow((d_h[d_idx] / self->k), self->dim);",
+            "double h = self->k * pow((d_m[d_idx] / d_rho[d_idx]), (1.0f / self->dim));",
+        )
+    )
+
+    fp32_source = _force_cuda_source_fp32(source)
+
+    assert "double" not in fp32_source
+    assert "fused_codegen_pow_dim(d_h[d_idx] / self->k, self->dim)" in fp32_source
+    assert (
+        "fused_codegen_pow_inv_dim(d_m[d_idx] / d_rho[d_idx], self->dim)" in fp32_source
+    )
+
+
 def test_hbucket_pair_outline_keeps_variable_h_bucket_traversal():
     deps = _sum_reduction_deps("AddMass", "au")
     stage = _stage(StageKind.PAIR_RATE, (deps,))
@@ -168,9 +186,12 @@ def test_hbucket_pair_outline_keeps_variable_h_bucket_traversal():
     for declaration in hbucket_context_argument_declarations():
         assert declaration in outline.source
     assert "for (int bucket = 0; bucket < bucket_count; ++bucket)" in outline.source
+    assert "int dst = sorted_ids[fused_dst_linear];" in outline.source
     assert "cell_bucket_h_max_bits[flat]" in outline.source
     assert "cell_bucket_starts[flat]" in outline.source
-    assert "AddMass_loop(add_mass0, dst, src, d_au, s_m);" in outline.source
+    assert "float fused_acc_d_au = 0.0f;" in outline.source
+    assert "AddMass_loop(add_mass0, dst, src, fused_local_d_au, s_m);" in outline.source
+    assert "d_au[dst] += fused_acc_d_au;" in outline.source
 
 
 def test_resident_hbucket_pair_window_uses_cooperative_grid_sync():
@@ -190,8 +211,15 @@ def test_resident_hbucket_pair_window_uses_cooperative_grid_sync():
     assert outline.name == "fused_plan0_fluid_resident_hbucket_pair_window"
     assert "#include <cooperative_groups.h>" in outline.source
     assert "cooperative_groups::this_grid()" in outline.source
+    assert "int dst = sorted_ids[fused_dst_linear];" in outline.source
     assert "grid.sync();" in outline.source
-    assert outline.source.count("AddMass_loop(add_mass0, dst, src, d_au, s_m);") == 2
+    assert (
+        outline.source.count(
+            "AddMass_loop(add_mass0, dst, src, fused_local_d_au, s_m);"
+        )
+        == 2
+    )
+    assert outline.source.count("d_au[dst] += fused_acc_d_au;") == 2
 
 
 def test_snapshot_pair_window_snapshots_left_read_before_right_write():
@@ -239,10 +267,13 @@ def test_snapshot_pair_window_outline_reads_snapshotted_left_arguments():
     assert "GLOBAL_MEM float* fused_snapshot_au" in outline.source
     assert (
         "ReadDestAndSourceAcceleration_loop("
-        "read_dest_and_source_acceleration0, dst, src, d_alpha, "
+        "read_dest_and_source_acceleration0, dst, src, fused_local_d_alpha, "
         "fused_snapshot_au, fused_snapshot_au);"
     ) in outline.source
-    assert "InitLoopPost_loop(init_loop_post0, dst, src, d_au, s_m);" in outline.source
+    assert (
+        "InitLoopPost_loop(init_loop_post0, dst, src, fused_local_d_au, s_m);"
+        in outline.source
+    )
 
 
 def test_pair_traversal_uses_hbucket_context():

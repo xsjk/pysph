@@ -1,6 +1,7 @@
 """Generic fused CUDA kernel planning helpers."""
 
 import inspect
+import re
 from dataclasses import dataclass
 
 import numpy as np
@@ -368,10 +369,11 @@ def _generate_hbucket_pair_loop_outline_with_equation_calls(
             _argument_block(arguments),
             ")",
             "{",
-            "    int dst = blockIdx.x * blockDim.x + threadIdx.x;",
-            "    if (dst >= n) {",
+            "    int fused_dst_linear = blockIdx.x * blockDim.x + threadIdx.x;",
+            "    if (fused_dst_linear >= n) {",
             "        return;",
             "    }",
+            "    int dst = sorted_ids[fused_dst_linear];",
             *segment_lines,
             *convergence_flag_lines,
             "}",
@@ -398,9 +400,10 @@ def _generate_resident_hbucket_pair_window_outline_with_equation_calls(
             stage, calls_by_stage[index], precomputes[index]
         )
         stage_lines.append(
-            "    for (int dst = blockIdx.x * blockDim.x + threadIdx.x; "
-            "dst < n; dst += blockDim.x * gridDim.x) {"
+            "    for (int fused_dst_linear = blockIdx.x * blockDim.x + threadIdx.x; "
+            "fused_dst_linear < n; fused_dst_linear += blockDim.x * gridDim.x) {"
         )
+        stage_lines.append("        int dst = sorted_ids[fused_dst_linear];")
         stage_lines.extend(f"    {line}" for line in segment_lines)
         stage_lines.append("    }")
         if index < len(stages) - 1:
@@ -470,10 +473,11 @@ def _generate_snapshot_hbucket_pair_window_outline_with_equation_calls(
             _argument_block(arguments),
             ")",
             "{",
-            "    int dst = blockIdx.x * blockDim.x + threadIdx.x;",
-            "    if (dst >= n) {",
+            "    int fused_dst_linear = blockIdx.x * blockDim.x + threadIdx.x;",
+            "    if (fused_dst_linear >= n) {",
             "        return;",
             "    }",
+            "    int dst = sorted_ids[fused_dst_linear];",
             *segment_lines,
             "}",
             "}",
@@ -993,7 +997,7 @@ def _launch_hbucket_pair_kernel_with_context(
 
 
 def _pair_block_size_for_count(n: int) -> int:
-    full_block_size = 256
+    full_block_size = 128
     full_particle_blocks = (int(n) + full_block_size - 1) // full_block_size
     if full_particle_blocks < _cuda_multiprocessor_count():
         return 128
@@ -1377,28 +1381,11 @@ def _local_reduction_methods_for_stages(
 def _local_reduction_methods_for_segment(
     loop_methods: tuple[object, ...],
 ) -> tuple[object, ...]:
-    reduction_methods = tuple(
+    return tuple(
         method
         for method in loop_methods
         if method.dest_reduction_writes or method.dest_max_reduction_writes
     )
-    if not _has_shared_reduction_write(reduction_methods):
-        return ()
-    return reduction_methods
-
-
-def _has_shared_reduction_write(methods: tuple[object, ...]) -> bool:
-    fields = []
-    for method in methods:
-        for field in sorted(method.dest_reduction_writes):
-            if field in fields:
-                return True
-            fields.append(field)
-        for field in sorted(method.dest_max_reduction_writes):
-            if field in fields:
-                return True
-            fields.append(field)
-    return False
 
 
 def _is_pair_pre_loop_method(method: object) -> bool:
@@ -1875,7 +1862,17 @@ def _argument_name_from_declaration(declaration: str) -> str:
 
 def _force_cuda_source_fp32(source: str) -> str:
     """Force generated fused wrapper source to FP32 for this backend path."""
-    return source.replace("double", "float")
+    fp32_source = source.replace("double", "float")
+    fp32_source = re.sub(
+        r"pow\(\(([^,\n]+)\), \(1\.0f / self->dim\)\)",
+        r"fused_codegen_pow_inv_dim(\1, self->dim)",
+        fp32_source,
+    )
+    return re.sub(
+        r"pow\(\(([^,\n]+)\), self->dim\)",
+        r"fused_codegen_pow_dim(\1, self->dim)",
+        fp32_source,
+    )
 
 
 def _convergence_flag_argument_declarations(
@@ -2437,4 +2434,32 @@ _FUSED_CUDA_COMPYLE_PREAMBLE = r"""
 #define abs fabsf
 #define max(x, y) fmaxf((float)(x), (float)(y))
 #define min(x, y) fminf((float)(x), (float)(y))
+
+WITHIN_KERNEL float fused_codegen_pow_dim(float value, float dim)
+{
+    if (dim == 1.0f) {
+        return value;
+    }
+    if (dim == 2.0f) {
+        return value * value;
+    }
+    if (dim == 3.0f) {
+        return value * value * value;
+    }
+    return powf(value, dim);
+}
+
+WITHIN_KERNEL float fused_codegen_pow_inv_dim(float value, float dim)
+{
+    if (dim == 1.0f) {
+        return value;
+    }
+    if (dim == 2.0f) {
+        return sqrtf(value);
+    }
+    if (dim == 3.0f) {
+        return cbrtf(value);
+    }
+    return powf(value, 1.0f / dim);
+}
 """
