@@ -11,22 +11,6 @@ _SCAN_KERNEL = None
 CUDA_SOURCE = r"""
 extern "C" {
 
-	__global__ void fused_reset_int(int *values, int n)
-	{
-	    int i = blockIdx.x * blockDim.x + threadIdx.x;
-	    if (i < n) {
-	        values[i] = 0;
-	    }
-	}
-
-	__global__ void fused_reset_uint(unsigned int *values, int n)
-	{
-	    int i = blockIdx.x * blockDim.x + threadIdx.x;
-	    if (i < n) {
-	        values[i] = 0u;
-	    }
-	}
-
 	__global__ void fused_reset_hbucket_metadata(
 	    int *cell_bucket_counts,
 	    unsigned int *bucket_h_max_bits,
@@ -162,17 +146,6 @@ __device__ int fused_linear_cell(int cx, int cy, int cz, int nx, int ny)
     return ((cz * ny) + cy) * nx + cx;
 }
 
-__device__ bool fused_valid_offset(int offset, int count)
-{
-    if (count == 1) {
-        return offset == 0;
-    }
-    if (count == 2) {
-        return offset <= 0;
-    }
-    return true;
-}
-
 __device__ int fused_wrapped_cell(int cell, int count)
 {
     if (cell < 0) {
@@ -303,48 +276,6 @@ __device__ float fused_minimum_image(float delta, float length, int periodic)
 	    return dx * dx + dy * dy + dz * dz;
 	}
 
-__global__ void fused_compute_cell_ids_counts_xyz(
-    const float *x,
-    const float *y,
-    const float *z,
-    int n,
-    const float *lower,
-    const float *upper,
-    int nx,
-    int ny,
-    int nz,
-    int *cell_counts,
-    int *particle_cell,
-    int *particle_local_index
-)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        int cx = fused_clamp_cell(x[i], lower[0], upper[0], nx);
-        int cy = fused_clamp_cell(y[i], lower[1], upper[1], ny);
-        int cz = fused_clamp_cell(z[i], lower[2], upper[2], nz);
-        int cell = fused_linear_cell(cx, cy, cz, nx, ny);
-        particle_cell[i] = cell;
-        particle_local_index[i] = atomicAdd(&cell_counts[cell], 1);
-    }
-}
-
-	__global__ void fused_scatter_sorted_particles(
-    int n,
-    const int *particle_cell,
-    const int *particle_local_index,
-    const int *cell_starts,
-    int *sorted_ids
-)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        int cell = particle_cell[i];
-        int out = cell_starts[cell] + particle_local_index[i];
-        sorted_ids[out] = i;
-	    }
-	}
-
 	__device__ int fused_hbucket_index(float hi, float h_min, int bucket_count)
 	{
 	    float ratio = fmaxf(hi / h_min, 1.0f);
@@ -430,96 +361,6 @@ __global__ void fused_compute_cell_ids_counts_xyz(
 	        int out = cell_bucket_starts[flat] + particle_local_index[i];
 	        sorted_ids[out] = i;
 	    }
-	}
-
-	__global__ void fused_count_neighbors_from_context(
-    const float *x,
-    const float *y,
-    const float *z,
-    const float *h,
-    int n,
-    float xmin,
-    float xmax,
-    float ymin,
-    float ymax,
-    float zmin,
-    float zmax,
-    int periodic_x,
-    int periodic_y,
-    int periodic_z,
-    float radius_scale,
-    int search_radius_cells,
-    int nx,
-    int ny,
-    int nz,
-    const int *cell_counts,
-    const int *cell_starts,
-    const int *sorted_ids,
-    int *neighbor_counts
-)
-{
-    int dst = blockIdx.x * blockDim.x + threadIdx.x;
-    if (dst >= n) {
-        return;
-    }
-    int base_cx = fused_clamp_cell(x[dst], xmin, xmax, nx);
-    int base_cy = fused_clamp_cell(y[dst], ymin, ymax, ny);
-    int base_cz = fused_clamp_cell(z[dst], zmin, zmax, nz);
-    int count = 0;
-    for (int oz = -search_radius_cells; oz <= search_radius_cells; ++oz) {
-        if (!fused_valid_offset(oz, nz)) {
-            continue;
-        }
-        int cz = 0;
-        if (!fused_neighbor_cell(base_cz, oz, nz, periodic_z, &cz)) {
-            continue;
-        }
-        for (int oy = -search_radius_cells; oy <= search_radius_cells; ++oy) {
-            if (!fused_valid_offset(oy, ny)) {
-                continue;
-            }
-            int cy = 0;
-            if (!fused_neighbor_cell(base_cy, oy, ny, periodic_y, &cy)) {
-                continue;
-            }
-            for (int ox = -search_radius_cells; ox <= search_radius_cells; ++ox) {
-                if (!fused_valid_offset(ox, nx)) {
-                    continue;
-                }
-                int cx = 0;
-                if (!fused_neighbor_cell(base_cx, ox, nx, periodic_x, &cx)) {
-                    continue;
-                }
-                int cell = fused_linear_cell(cx, cy, cz, nx, ny);
-                int begin = cell_starts[cell];
-                int end = begin + cell_counts[cell];
-                for (int pos = begin; pos < end; ++pos) {
-                    int src = sorted_ids[pos];
-                    if (fused_in_support_xyz(
-                        dst,
-                        src,
-                        x,
-                        y,
-                        z,
-                        h,
-                        xmin,
-                        xmax,
-                        ymin,
-                        ymax,
-                        zmin,
-                        zmax,
-                        periodic_x,
-                        periodic_y,
-                        periodic_z,
-                        radius_scale
-                    )) {
-                        count += 1;
-                    }
-                }
-            }
-        }
-    }
-	    neighbor_counts[dst] = count;
 	}
 
 	__global__ void fused_count_neighbors_from_hbucket_context(
@@ -818,87 +659,6 @@ __global__ void fused_compute_cell_ids_counts_xyz(
 
 
 @dataclass(frozen=True)
-class FusedCudaNeighborContext:
-    """Opaque neighbor metadata shared by fused CUDA stages.
-
-    The context stores separate coordinate device arrays because that is the
-    layout used by PySPH particle arrays and by the fastest prototype path.
-    """
-
-    n: int
-    x: object
-    y: object
-    z: object
-    h: object
-    lower: np.ndarray
-    upper: np.ndarray
-    periodic: np.ndarray
-    radius_scale: np.float32
-    search_radius_cells: np.int32
-    cell_counts: np.ndarray
-    total_cells: int
-    stream: object
-    sorted_ids: object
-    cell_starts: object
-    cell_particle_counts: object
-    timings_ms: tuple[tuple[str, float], ...]
-
-    def __post_init__(self):
-        """Validate the metadata contract used by fused kernels."""
-        assert self.n > 0
-        assert self.lower.dtype == np.float32
-        assert self.upper.dtype == np.float32
-        assert self.periodic.dtype == np.bool_
-        assert isinstance(self.search_radius_cells, np.int32)
-        assert self.search_radius_cells >= np.int32(1)
-        assert self.cell_counts.dtype == np.int32
-        assert self.total_cells == int(np.prod(self.cell_counts))
-        assert self.lower.shape == (3,)
-        assert self.upper.shape == (3,)
-        assert self.periodic.shape == (3,)
-        assert self.cell_counts.shape == (3,)
-        assert self.x.dtype == np.float32
-        assert self.y.dtype == np.float32
-        assert self.z.dtype == np.float32
-        assert self.h.dtype == np.float32
-        assert self.sorted_ids.dtype == np.int32
-        assert self.cell_starts.dtype == np.int32
-        assert self.cell_particle_counts.dtype == np.int32
-
-    @property
-    def materializes_csr(self):
-        """Return whether this context owns per-particle CSR neighbor lists."""
-        return False
-
-    @property
-    def coordinate_layout(self):
-        """Return the coordinate array ABI used by fused pair kernels."""
-        return "separate_xyz"
-
-    @property
-    def uses_device_metadata(self):
-        """Return whether traversal metadata is represented by device arrays."""
-        return all(
-            hasattr(array, "gpudata")
-            for array in (
-                self.sorted_ids,
-                self.cell_starts,
-                self.cell_particle_counts,
-            )
-        )
-
-    @property
-    def cell_count_tuple(self):
-        """Return integer cell counts in x/y/z order."""
-        return tuple(int(value) for value in self.cell_counts)
-
-    @property
-    def timing_total_ms(self):
-        """Return the total measured metadata build time."""
-        return sum(value for _name, value in self.timings_ms)
-
-
-@dataclass(frozen=True)
 class FusedCudaHBucketNeighborContext:
     """Device h-bucket metadata shared by fused CUDA pair stages."""
 
@@ -985,16 +745,11 @@ class FusedCudaHBucketNeighborContext:
 
 
 class FusedCudaNeighborWorkspace:
-    """Reusable device buffers for sorted-cell metadata builds."""
+    """Reusable device buffers for fused h-bucket metadata builds."""
 
     def __init__(self):
         self.lower = None
         self.upper = None
-        self.cell_particle_counts = None
-        self.cell_starts = None
-        self.sorted_ids = None
-        self.particle_cell = None
-        self.particle_local_index = None
         self.hbucket_cell_bucket_counts = None
         self.hbucket_cell_bucket_starts = None
         self.hbucket_sorted_ids = None
@@ -1005,19 +760,6 @@ class FusedCudaNeighborWorkspace:
         self.hbucket_cell_bucket_h_max_bits = None
         self.hbucket_h_min_ref = None
         self.hbucket_h_max_ref = None
-
-    def ensure_base(self, n: int, total_cells: int) -> None:
-        self.lower = _ensure_gpu_array(self.lower, 3, np.float32)
-        self.upper = _ensure_gpu_array(self.upper, 3, np.float32)
-        self.cell_particle_counts = _ensure_gpu_array(
-            self.cell_particle_counts, total_cells, np.int32
-        )
-        self.cell_starts = _ensure_gpu_array(self.cell_starts, total_cells, np.int32)
-        self.sorted_ids = _ensure_gpu_array(self.sorted_ids, n, np.int32)
-        self.particle_cell = _ensure_gpu_array(self.particle_cell, n, np.int32)
-        self.particle_local_index = _ensure_gpu_array(
-            self.particle_local_index, n, np.int32
-        )
 
     def ensure_hbucket(self, n: int, flat_total: int, bucket_count: int) -> None:
         self.lower = _ensure_gpu_array(self.lower, 3, np.float32)
@@ -1048,143 +790,6 @@ class FusedCudaNeighborWorkspace:
         )
 
 
-def build_fused_cuda_cell_context_with_workspace(
-    x: object,
-    y: object,
-    z: object,
-    h: object,
-    n: int,
-    lower: np.ndarray,
-    upper: np.ndarray,
-    periodic: np.ndarray,
-    radius_scale: np.float32,
-    h_max: np.float32,
-    stream: object,
-    workspace: FusedCudaNeighborWorkspace,
-) -> FusedCudaNeighborContext:
-    """Build a fixed-stencil sorted-cell context from maximum smoothing length."""
-    assert isinstance(h_max, np.float32)
-    cell_counts = cell_counts_from_hmax(lower, upper, h_max, radius_scale)
-    return build_fused_cuda_context_with_workspace(
-        x,
-        y,
-        z,
-        h,
-        n,
-        lower,
-        upper,
-        periodic,
-        radius_scale,
-        cell_counts,
-        stream,
-        workspace,
-    )
-
-
-def build_fused_cuda_context_with_workspace(
-    x: object,
-    y: object,
-    z: object,
-    h: object,
-    n: int,
-    lower: np.ndarray,
-    upper: np.ndarray,
-    periodic: np.ndarray,
-    radius_scale: np.float32,
-    cell_counts: np.ndarray,
-    stream: object,
-    workspace: FusedCudaNeighborWorkspace,
-) -> FusedCudaNeighborContext:
-    """Build sorted-cell context using caller-owned reusable device buffers."""
-    _ensure_cuda_context()
-    assert x.dtype == np.float32
-    assert y.dtype == np.float32
-    assert z.dtype == np.float32
-    assert h.dtype == np.float32
-    assert n > 0
-    assert lower.dtype == np.float32
-    assert upper.dtype == np.float32
-    assert periodic.dtype == np.bool_
-    assert isinstance(radius_scale, np.float32)
-    assert cell_counts.dtype == np.int32
-
-    import pycuda.driver as cuda
-
-    total_cells = int(np.prod(cell_counts))
-    workspace.ensure_base(n, total_cells)
-    d_lower = workspace.lower
-    d_upper = workspace.upper
-    d_cell_particle_counts = workspace.cell_particle_counts
-    d_cell_starts = workspace.cell_starts
-    d_sorted_ids = workspace.sorted_ids
-    d_particle_cell = workspace.particle_cell
-    d_particle_local_index = workspace.particle_local_index
-    cuda.memcpy_htod_async(_device_ptr(d_lower), np.ascontiguousarray(lower), stream)
-    cuda.memcpy_htod_async(_device_ptr(d_upper), np.ascontiguousarray(upper), stream)
-
-    kernels = _module()
-    reset_int = kernels.get_function("fused_reset_int")
-    compute_cell_ids_counts = kernels.get_function("fused_compute_cell_ids_counts_xyz")
-    scatter_sorted_particles = kernels.get_function("fused_scatter_sorted_particles")
-
-    start, stop = _event_pair(stream)
-    reset_int(
-        _device_ptr(d_cell_particle_counts),
-        np.int32(total_cells),
-        block=(256, 1, 1),
-        grid=_grid_size(total_cells),
-        stream=stream,
-    )
-    compute_cell_ids_counts(
-        _device_ptr(x),
-        _device_ptr(y),
-        _device_ptr(z),
-        np.int32(n),
-        _device_ptr(d_lower),
-        _device_ptr(d_upper),
-        np.int32(cell_counts[0]),
-        np.int32(cell_counts[1]),
-        np.int32(cell_counts[2]),
-        _device_ptr(d_cell_particle_counts),
-        _device_ptr(d_particle_cell),
-        _device_ptr(d_particle_local_index),
-        block=(256, 1, 1),
-        grid=_grid_size(n),
-        stream=stream,
-    )
-    _scan_int32(d_cell_particle_counts, d_cell_starts, stream)
-    scatter_sorted_particles(
-        np.int32(n),
-        _device_ptr(d_particle_cell),
-        _device_ptr(d_particle_local_index),
-        _device_ptr(d_cell_starts),
-        _device_ptr(d_sorted_ids),
-        block=(256, 1, 1),
-        grid=_grid_size(n),
-        stream=stream,
-    )
-    build_cells_ms = _finish_event(start, stop, stream)
-    return FusedCudaNeighborContext(
-        n=n,
-        x=x,
-        y=y,
-        z=z,
-        h=h,
-        lower=lower,
-        upper=upper,
-        periodic=periodic,
-        radius_scale=radius_scale,
-        search_radius_cells=np.int32(1),
-        cell_counts=cell_counts,
-        total_cells=total_cells,
-        stream=stream,
-        sorted_ids=d_sorted_ids,
-        cell_starts=d_cell_starts,
-        cell_particle_counts=d_cell_particle_counts,
-        timings_ms=(("build_cells_ms", build_cells_ms),),
-    )
-
-
 def build_fused_cuda_neighbor_context_with_workspace(
     x: object,
     y: object,
@@ -1199,25 +804,10 @@ def build_fused_cuda_neighbor_context_with_workspace(
     stream: object,
     workspace: FusedCudaNeighborWorkspace,
     h_reduce_scratch: list[object],
-) -> FusedCudaNeighborContext | FusedCudaHBucketNeighborContext:
-    """Build the fastest fused CUDA neighbor context for current h variation."""
+) -> FusedCudaHBucketNeighborContext:
+    """Build the fused CUDA h-bucket neighbor context."""
     h_min, h_max = _cached_h_bounds(h, n, stream, workspace, h_reduce_scratch)
     active_bucket_count = _effective_hbucket_count(bucket_count, h_min, h_max)
-    if active_bucket_count == 1:
-        return build_fused_cuda_cell_context_with_workspace(
-            x,
-            y,
-            z,
-            h,
-            n,
-            lower,
-            upper,
-            periodic,
-            radius_scale,
-            h_max,
-            stream,
-            workspace,
-        )
     return _build_fused_cuda_hbucket_context_from_hmin(
         x,
         y,
@@ -1435,44 +1025,6 @@ def _build_fused_cuda_hbucket_context_from_hmin(
         cell_bucket_counts=d_cell_bucket_counts,
         timings_ms=(("hbucket_build_ms", hbucket_build_ms),),
     )
-
-
-def count_neighbors_from_context(context: FusedCudaNeighborContext) -> object:
-    """Return per-particle neighbor counts from no-CSR context traversal."""
-    _ensure_cuda_context()
-    import pycuda.gpuarray as gpuarray
-
-    d_neighbor_counts = gpuarray.empty((context.n,), np.int32)
-    kernel = _module().get_function("fused_count_neighbors_from_context")
-    kernel(
-        _device_ptr(context.x),
-        _device_ptr(context.y),
-        _device_ptr(context.z),
-        _device_ptr(context.h),
-        np.int32(context.n),
-        np.float32(context.lower[0]),
-        np.float32(context.upper[0]),
-        np.float32(context.lower[1]),
-        np.float32(context.upper[1]),
-        np.float32(context.lower[2]),
-        np.float32(context.upper[2]),
-        np.int32(context.periodic[0]),
-        np.int32(context.periodic[1]),
-        np.int32(context.periodic[2]),
-        context.radius_scale,
-        np.int32(context.search_radius_cells),
-        np.int32(context.cell_counts[0]),
-        np.int32(context.cell_counts[1]),
-        np.int32(context.cell_counts[2]),
-        _device_ptr(context.cell_particle_counts),
-        _device_ptr(context.cell_starts),
-        _device_ptr(context.sorted_ids),
-        _device_ptr(d_neighbor_counts),
-        block=(256, 1, 1),
-        grid=_grid_size(context.n),
-        stream=context.stream,
-    )
-    return d_neighbor_counts
 
 
 def count_neighbors_from_hbucket_context(
@@ -1697,21 +1249,6 @@ def read_fused_cuda_convergence_flag(flag: object, stream: object) -> bool:
     return bool(host_flag[0] > np.int32(0))
 
 
-def cell_counts_from_hmax(
-    lower: np.ndarray,
-    upper: np.ndarray,
-    hmax: np.float32,
-    radius_scale: np.float32,
-) -> np.ndarray:
-    """Return uniform grid cell counts from maximum smoothing length."""
-    assert lower.dtype == np.float32
-    assert upper.dtype == np.float32
-    assert isinstance(hmax, np.float32)
-    assert isinstance(radius_scale, np.float32)
-    cell_size = np.float32(radius_scale * hmax)
-    return cell_counts_from_cell_size(lower, upper, cell_size)
-
-
 def cell_counts_from_hmin(
     lower: np.ndarray,
     upper: np.ndarray,
@@ -1725,17 +1262,6 @@ def cell_counts_from_hmin(
     assert isinstance(radius_scale, np.float32)
     cell_size = np.float32(radius_scale * h_min)
     counts = np.ceil((upper - lower) / cell_size).astype(np.int32)
-    return np.maximum(counts, np.ones((3,), dtype=np.int32)).astype(np.int32)
-
-
-def cell_counts_from_cell_size(
-    lower: np.ndarray, upper: np.ndarray, cell_size: np.float32
-) -> np.ndarray:
-    """Return uniform grid cell counts from a host-side binning cell size."""
-    assert lower.dtype == np.float32
-    assert upper.dtype == np.float32
-    assert isinstance(cell_size, np.float32)
-    counts = np.floor((upper - lower) / cell_size).astype(np.int32)
     return np.maximum(counts, np.ones((3,), dtype=np.int32)).astype(np.int32)
 
 

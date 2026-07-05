@@ -1,7 +1,10 @@
 """Stage-level execution protocol for generic fused CUDA kernels."""
 
+import ctypes
+import ctypes.util
 import inspect
 import os
+from dataclasses import replace
 
 import numpy as np
 
@@ -18,11 +21,10 @@ from pysph.sph.fused_cuda_codegen import (
     cubic_spline_pair_precompute_for_symbols,
     generate_hbucket_pair_stage_outline_from_equations,
     generate_hbucket_pair_stage_outline_from_equations_with_convergence_flag,
-    generate_sorted_cell_pair_stage_outline_from_equations,
+    generate_resident_hbucket_pair_window_outline_from_equations,
     PairLaunchConfig,
     generate_pointwise_stage_outline_from_equations,
     launch_hbucket_pair_kernel_with_context,
-    launch_sorted_cell_pair_kernel_with_context,
     launch_pointwise_kernel,
     precompute_argument_names,
     quintic_spline_pair_precompute_for_symbols,
@@ -42,6 +44,10 @@ class FusedCudaStageBackend:
             self.covered_stage_groups,
             self.stage_group_by_plan_index,
         ) = _stage_group_mapping(helper)
+        (
+            self.resident_window_by_group,
+            self.resident_window_covered_groups,
+        ) = _resident_window_mapping(helper, self.stage_group_by_plan_index)
         self.has_device_convergence = _has_device_convergence(helper)
         self.launched_groups = set()
         self.device_convergence_skip_groups = set()
@@ -80,14 +86,21 @@ class FusedCudaStageBackend:
         stage_group = info["stage_group"]
         if stage_group in self.device_convergence_skip_groups:
             return True
+        if stage_group in self.resident_window_covered_groups:
+            return True
         if stage_group in self.covered_stage_groups:
             return True
         if stage_group not in self.stage_by_group:
             return False
         if stage_group in self.launched_groups:
             return True
-        stage = self.stage_by_group[stage_group]
-        self._launch_stage(evaluator, stage, info, extra_args)
+        if stage_group in self.resident_window_by_group:
+            self._launch_resident_window(
+                evaluator, self.resident_window_by_group[stage_group], extra_args
+            )
+        else:
+            stage = self.stage_by_group[stage_group]
+            self._launch_stage(evaluator, stage, info, extra_args)
         self.launched_groups.add(stage_group)
         return True
 
@@ -102,6 +115,12 @@ class FusedCudaStageBackend:
 
     def _launch_stage(self, evaluator, stage, info, extra_args):
         raise NotImplementedError("subclasses must launch the fused CUDA stage")
+
+    def _launch_resident_window(self, evaluator, stage_indices, extra_args):
+        for stage_index in stage_indices:
+            info = self._kernel_info_for_plan_stage_index(stage_index)
+            stage = self.helper.cuda_stage_plan.stages[stage_index]
+            self._launch_stage(evaluator, stage, info, extra_args)
 
     def _launch_device_convergence_super_stage(
         self, evaluator, info, extra_args, t, dt
@@ -223,7 +242,10 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
 
         self.stream = cuda.Stream()
         self.modules = {}
+        self.cooperative_modules = {}
         self.outlines = {}
+        self.cooperative_outlines = {}
+        self.cooperative_extra_arg_names = {}
         self.neighbor_contexts = {}
         self.neighbor_workspaces = {}
         self.device_convergence_flag = None
@@ -241,6 +263,76 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
 
     def _launch_stage(self, evaluator, stage, info, extra_args):
         self._launch_single_stage(evaluator, stage, info, extra_args)
+
+    def _launch_resident_window(self, evaluator, stage_indices, extra_args):
+        stages = tuple(
+            self.helper.cuda_stage_plan.stages[index] for index in stage_indices
+        )
+        infos = tuple(
+            self._kernel_info_for_plan_stage_index(index) for index in stage_indices
+        )
+        equations_by_stage = tuple(
+            _equations_for_stage(self.helper, stage, info["stage_group"])
+            for stage, info in zip(stages, infos)
+        )
+        precomputes = tuple(
+            _precompute_for_stage(stage, self.helper.object.kernel) for stage in stages
+        )
+        context = self._neighbor_context_for_stage(evaluator, infos[0])
+        if not _resident_window_preserves_particle_grid(context.n):
+            super()._launch_resident_window(evaluator, stage_indices, extra_args)
+            return
+        outline = self._outline_for_resident_hbucket_pair_window(
+            stages, equations_by_stage, precomputes
+        )
+        module = self._cooperative_module_for_outline(outline)
+        stage_args = self._resident_hbucket_pair_window_extra_args(
+            stages, equations_by_stage, infos, extra_args, precomputes
+        )
+        timer = _stage_timer(self.stream)
+        launch_config = _launch_cooperative_hbucket_pair_window_kernel(
+            module,
+            outline.name,
+            context,
+            _cooperative_grid_block_count_for_context(context.n),
+            stage_args,
+            self.stream,
+        )
+        self._record_pair_launch("resident_hbucket")
+        self._record_pair_launch_config(launch_config)
+        for stage in stages:
+            self._finish_launched_stage(stage)
+        self._record_stage_timing(
+            _resident_hbucket_pair_window_stage(stages), "resident_hbucket", timer
+        )
+        self.launch_count += 1
+
+    def _outline_for_resident_hbucket_pair_window(
+        self, stages, equations_by_stage, precomputes
+    ):
+        outline_key = _resident_hbucket_pair_window_key(stages, precomputes)
+        if outline_key in self.cooperative_outlines:
+            return self.cooperative_outlines[outline_key]
+        outline = generate_resident_hbucket_pair_window_outline_from_equations(
+            "cuda_eval", stages, equations_by_stage, precomputes
+        )
+        self.cooperative_outlines[outline_key] = outline
+        return outline
+
+    def _resident_hbucket_pair_window_extra_args(
+        self, stages, equations_by_stage, infos, extra_args, precomputes
+    ):
+        names_key = _resident_hbucket_pair_window_key(stages, precomputes)
+        if names_key not in self.cooperative_extra_arg_names:
+            self.cooperative_extra_arg_names[names_key] = (
+                _resident_hbucket_pair_window_extra_arg_names(
+                    stages, equations_by_stage, precomputes
+                )
+            )
+        return tuple(
+            _stage_extra_arg_value(self.helper, name, infos[0], extra_args)
+            for name in self.cooperative_extra_arg_names[names_key]
+        )
 
     def _launch_single_stage(self, evaluator, stage, info, extra_args):
         equations = _equations_for_stage(self.helper, stage, info["stage_group"])
@@ -261,14 +353,9 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
             if convergence_field is not None:
                 stage_args = (self.device_convergence_flag,) + stage_args
             self._record_pair_launch(traversal)
-            if traversal == "sorted_cell":
-                launch_config = launch_sorted_cell_pair_kernel_with_context(
-                    module, outline.name, context, stage_args
-                )
-            else:
-                launch_config = launch_hbucket_pair_kernel_with_context(
-                    module, outline.name, context, stage_args
-                )
+            launch_config = launch_hbucket_pair_kernel_with_context(
+                module, outline.name, context, stage_args
+            )
             self._record_pair_launch_config(launch_config)
         elif _stage_can_use_pointwise_kernel(stage):
             outline = self._outline_for_stage(
@@ -450,11 +537,7 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
         if outline_key in self.outlines:
             return self.outlines[outline_key]
         if stage.kind in (StageKind.PAIR_DENSITY, StageKind.PAIR_RATE):
-            if traversal == "sorted_cell":
-                outline = generate_sorted_cell_pair_stage_outline_from_equations(
-                    "cuda_eval", stage, equations, precompute, convergence_field
-                )
-            elif convergence_field is None:
+            if convergence_field is None:
                 outline = generate_hbucket_pair_stage_outline_from_equations(
                     "cuda_eval", stage, equations, precompute
                 )
@@ -491,6 +574,14 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
         self.modules[module_key] = module
         return module
 
+    def _cooperative_module_for_outline(self, outline):
+        module_key = (outline.name, outline.source, tuple(_source_module_options()))
+        if module_key in self.cooperative_modules:
+            return self.cooperative_modules[module_key]
+        module = _CtypesCooperativeCudaModule(outline.source, _source_module_options())
+        self.cooperative_modules[module_key] = module
+        return module
+
 
 def _stage_group_mapping(helper):
     stage_groups = []
@@ -517,6 +608,44 @@ def _stage_group_mapping(helper):
     return stage_by_group, covered_stage_groups, stage_group_by_plan_index
 
 
+def _resident_window_mapping(helper, stage_group_by_plan_index):
+    window_by_group = {}
+    covered_groups = set()
+    for stage_indices in _resident_pair_windows(helper.cuda_stage_plan.stages):
+        if not all(index in stage_group_by_plan_index for index in stage_indices):
+            continue
+        first_group = stage_group_by_plan_index[stage_indices[0]]
+        window_by_group[first_group] = stage_indices
+        for stage_index in stage_indices[1:]:
+            covered_groups.add(stage_group_by_plan_index[stage_index])
+    return window_by_group, covered_groups
+
+
+def _resident_pair_windows(stages):
+    windows = []
+    index = 0
+    while index < len(stages) - 1:
+        left = stages[index]
+        right = stages[index + 1]
+        if _can_launch_resident_pair_window(left, right):
+            windows.append((index, index + 1))
+            index += 2
+        else:
+            index += 1
+    return tuple(windows)
+
+
+def _can_launch_resident_pair_window(left, right):
+    return (
+        left.kind in (StageKind.PAIR_DENSITY, StageKind.PAIR_RATE)
+        and right.kind in (StageKind.PAIR_DENSITY, StageKind.PAIR_RATE)
+        and left.dest == right.dest
+        and left.sources == right.sources
+        and not _stage_invalidates_neighbor_context(left)
+        and bool(_stage_source_reads(right).intersection(_stage_dest_writes(left)))
+    )
+
+
 def _has_device_convergence(helper):
     return any(
         stage.kind is StageKind.DEVICE_CONVERGENCE
@@ -536,6 +665,38 @@ def _stage_invalidates_neighbor_context(stage):
         if method.source_writes.intersection(invalidating_fields):
             return True
     return False
+
+
+def _stage_dest_writes(stage):
+    writes = set()
+    for method in stage.methods:
+        writes.update(method.dest_writes)
+    return frozenset(writes)
+
+
+def _stage_source_reads(stage):
+    reads = set()
+    for method in stage.methods:
+        reads.update(method.source_reads)
+        reads.update(_precomputed_source_reads(method.precomputed_symbols))
+    return frozenset(reads)
+
+
+def _precomputed_source_reads(symbols):
+    reads = set()
+    if "VIJ" in symbols:
+        reads.update(("u", "v", "w"))
+    if "RHOIJ" in symbols or "RHOIJ1" in symbols:
+        reads.add("rho")
+    if symbols.intersection(frozenset(("XIJ", "R2IJ", "RIJ"))):
+        reads.update(("x", "y", "z"))
+    if symbols.intersection(
+        frozenset(
+            ("HIJ", "WIJ", "WI", "WJ", "DWIJ", "DWI", "DWJ", "GHI", "GHJ", "GHIJ")
+        )
+    ):
+        reads.add("h")
+    return frozenset(reads)
 
 
 def _stage_convergence_particle_field(stage):
@@ -560,13 +721,8 @@ def _stage_can_use_pointwise_kernel(stage):
 
 
 def _pair_traversal_for_stage(context):
-    if _stage_uses_sorted_cell_context(context):
-        return "sorted_cell"
+    assert hasattr(context, "cell_bucket_counts")
     return "hbucket"
-
-
-def _stage_uses_sorted_cell_context(context):
-    return hasattr(context, "cell_particle_counts")
 
 
 class _CudaStageTimer:
@@ -804,3 +960,263 @@ def _domain_bounds_and_periodicity_from_manager(domain_manager):
         dtype=np.float32,
     )
     return lower, upper, periodic
+
+
+def _resident_hbucket_pair_window_extra_arg_names(
+    stages, equations_by_stage, precomputes
+):
+    names = []
+    for precompute in precomputes:
+        for name in precompute_argument_names(precompute):
+            _append_once(names, name)
+    for stage, equations, precompute in zip(stages, equations_by_stage, precomputes):
+        for name in _stage_equation_extra_arg_names(stage, equations, precompute):
+            _append_once(names, name)
+    return tuple(names)
+
+
+def _resident_hbucket_pair_window_stage(stages):
+    methods = tuple(method for stage in stages for method in stage.methods)
+    method_segments = tuple(stage.methods for stage in stages)
+    reason = "; ".join(stage.reason for stage in stages)
+    return replace(
+        stages[0],
+        methods=methods,
+        reason=f"resident hbucket pair window: {reason}",
+        legacy_group_count=sum(stage.legacy_group_count for stage in stages),
+        method_segments=method_segments,
+    )
+
+
+def _resident_hbucket_pair_window_key(stages, precomputes):
+    return (
+        tuple(
+            tuple(
+                (method.equation_name, method.method_kind.value)
+                for method in stage.methods
+            )
+            for stage in stages
+        ),
+        tuple(tuple(sorted(precompute.symbols)) for precompute in precomputes),
+    )
+
+
+def _resident_window_preserves_particle_grid(n):
+    block_size = _pair_block_size_for_count(n)
+    particle_blocks = (int(n) + block_size - 1) // block_size
+    return particle_blocks <= _resident_grid_block_count()
+
+
+def _cooperative_grid_block_count_for_context(n):
+    block_size = _pair_block_size_for_count(n)
+    particle_blocks = (int(n) + block_size - 1) // block_size
+    return min(_resident_grid_block_count(), particle_blocks)
+
+
+def _resident_grid_block_count():
+    import pycuda.driver as cuda
+
+    device = cuda.Context.get_device()
+    return int(device.get_attribute(cuda.device_attribute.MULTIPROCESSOR_COUNT))
+
+
+def _pair_block_size_for_count(n):
+    full_block_size = 256
+    full_particle_blocks = (int(n) + full_block_size - 1) // full_block_size
+    if full_particle_blocks < _resident_grid_block_count():
+        return 128
+    return full_block_size
+
+
+class _CtypesCooperativeCudaModule:
+    def __init__(self, source, options):
+        from pycuda.compiler import compile
+
+        self._driver = _cuda_driver()
+        image = compile(source, no_extern_c=True, options=list(options))
+        self._image = ctypes.create_string_buffer(image)
+        self._module = ctypes.c_void_p()
+        result = self._driver.cuModuleLoadData(
+            ctypes.byref(self._module),
+            ctypes.cast(self._image, ctypes.c_void_p),
+        )
+        assert result == 0
+        self._functions = {}
+        self._argument_caches = {}
+
+    def get_function(self, name):
+        if name not in self._functions:
+            function = ctypes.c_void_p()
+            result = self._driver.cuModuleGetFunction(
+                ctypes.byref(function),
+                self._module,
+                name.encode("ascii"),
+            )
+            assert result == 0
+            self._functions[name] = function
+        return self._functions[name]
+
+    def kernel_arguments(self, name, values):
+        if name not in self._argument_caches:
+            self._argument_caches[name] = _CtypesKernelArgumentCache()
+        return self._argument_caches[name].arguments(values)
+
+
+def _cuda_driver():
+    driver = ctypes.CDLL(ctypes.util.find_library("cuda") or "libcuda.so.1")
+    driver.cuModuleLoadData.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+    ]
+    driver.cuModuleLoadData.restype = ctypes.c_int
+    driver.cuModuleGetFunction.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+    ]
+    driver.cuModuleGetFunction.restype = ctypes.c_int
+    driver.cuLaunchCooperativeKernel.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint,
+        ctypes.c_uint,
+        ctypes.c_uint,
+        ctypes.c_uint,
+        ctypes.c_uint,
+        ctypes.c_uint,
+        ctypes.c_uint,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    driver.cuLaunchCooperativeKernel.restype = ctypes.c_int
+    return driver
+
+
+def _launch_cooperative_hbucket_pair_window_kernel(
+    module, kernel_name, context, grid_blocks, extra_args, stream
+):
+    function = module.get_function(kernel_name)
+    block_size = _pair_block_size_for_count(context.n)
+    values = _cooperative_hbucket_pair_window_kernel_values(context, extra_args)
+    kernel_args, argument_storage = module.kernel_arguments(kernel_name, values)
+    result = module._driver.cuLaunchCooperativeKernel(
+        function,
+        ctypes.c_uint(grid_blocks),
+        ctypes.c_uint(1),
+        ctypes.c_uint(1),
+        ctypes.c_uint(block_size),
+        ctypes.c_uint(1),
+        ctypes.c_uint(1),
+        ctypes.c_uint(0),
+        ctypes.c_void_p(int(stream.handle)),
+        kernel_args,
+    )
+    assert result == 0
+    assert argument_storage
+    return PairLaunchConfig(
+        traversal="resident_hbucket",
+        n=int(context.n),
+        block_size=int(block_size),
+        grid_x=int(grid_blocks),
+    )
+
+
+def _cooperative_hbucket_pair_window_kernel_values(context, extra_args):
+    return (
+        _kernel_arg(context.x),
+        _kernel_arg(context.y),
+        _kernel_arg(context.z),
+        _kernel_arg(context.h),
+        np.int32(context.n),
+        np.float32(context.lower[0]),
+        np.float32(context.upper[0]),
+        np.float32(context.lower[1]),
+        np.float32(context.upper[1]),
+        np.float32(context.lower[2]),
+        np.float32(context.upper[2]),
+        np.int32(context.periodic[0]),
+        np.int32(context.periodic[1]),
+        np.int32(context.periodic[2]),
+        context.radius_scale,
+        np.int32(context.cell_counts[0]),
+        np.int32(context.cell_counts[1]),
+        np.int32(context.cell_counts[2]),
+        np.int32(context.total_cells),
+        np.int32(context.bucket_count),
+        np.float32(context.cell_width[0]),
+        np.float32(context.cell_width[1]),
+        np.float32(context.cell_width[2]),
+        _kernel_arg(context.bucket_h_max_bits),
+        _kernel_arg(context.cell_bucket_h_max_bits),
+        _kernel_arg(context.cell_bucket_counts),
+        _kernel_arg(context.cell_bucket_starts),
+        _kernel_arg(context.sorted_ids),
+        *tuple(_kernel_arg(arg) for arg in extra_args),
+    )
+
+
+class _CtypesKernelArgumentCache:
+    def __init__(self):
+        self.args = None
+        self.storage = None
+        self.value_types = None
+
+    def arguments(self, values):
+        value_types = tuple(type(value) for value in values)
+        if self.storage is None:
+            self.args, self.storage = _ctypes_kernel_arguments(values)
+            self.value_types = value_types
+            return self.args, self.storage
+        assert value_types == self.value_types
+        assert len(values) == len(self.storage)
+        for storage, value in zip(self.storage, values):
+            _update_ctypes_kernel_argument(storage, value)
+        return self.args, self.storage
+
+
+def _ctypes_kernel_arguments(values):
+    storage = tuple(_ctypes_kernel_argument(value) for value in values)
+    args = (ctypes.c_void_p * len(storage))()
+    for index, value in enumerate(storage):
+        args[index] = ctypes.cast(ctypes.byref(value), ctypes.c_void_p)
+    return args, storage
+
+
+def _ctypes_kernel_argument(value):
+    if isinstance(value, np.float32):
+        return ctypes.c_float(float(value))
+    if isinstance(value, np.int32):
+        return ctypes.c_int(int(value))
+    if isinstance(value, np.uint32):
+        return ctypes.c_uint(int(value))
+    if isinstance(value, np.uintp):
+        return ctypes.c_void_p(int(value))
+    if isinstance(value, float):
+        return ctypes.c_float(value)
+    if isinstance(value, int):
+        return ctypes.c_void_p(value)
+    return ctypes.c_void_p(int(value))
+
+
+def _update_ctypes_kernel_argument(storage, value):
+    if isinstance(storage, ctypes.c_float):
+        storage.value = float(value)
+        return
+    if isinstance(storage, ctypes.c_int):
+        storage.value = int(value)
+        return
+    if isinstance(storage, ctypes.c_uint):
+        storage.value = int(value)
+        return
+    if isinstance(storage, ctypes.c_void_p):
+        storage.value = int(value)
+        return
+    assert False
+
+
+def _kernel_arg(arg):
+    if hasattr(arg, "gpudata"):
+        gpudata = arg.gpudata
+        if isinstance(gpudata, int):
+            return np.uintp(gpudata)
+        return gpudata
+    return arg
