@@ -22,14 +22,18 @@ from pysph.sph.fused_cuda_codegen import (
     generate_hbucket_pair_stage_outline_from_equations,
     generate_hbucket_pair_stage_outline_from_equations_with_convergence_flag,
     generate_resident_hbucket_pair_window_outline_from_equations,
+    generate_snapshot_hbucket_pair_window_outline_from_equations,
     PairLaunchConfig,
     generate_pointwise_stage_outline_from_equations,
     launch_hbucket_pair_kernel_with_context,
     launch_pointwise_kernel,
+    launch_snapshot_hbucket_pair_window_kernel_with_context,
     precompute_argument_names,
     quintic_spline_pair_precompute_for_symbols,
+    snapshot_hbucket_pair_window_stage,
 )
 from pysph.sph.fused_cuda_stage_plan import (
+    MethodKind,
     StageKind,
 )
 
@@ -48,6 +52,10 @@ class FusedCudaStageBackend:
             self.resident_window_by_group,
             self.resident_window_covered_groups,
         ) = _resident_window_mapping(helper, self.stage_group_by_plan_index)
+        (
+            self.snapshot_window_by_group,
+            self.snapshot_window_covered_groups,
+        ) = _snapshot_window_mapping(helper, self.stage_group_by_plan_index)
         self.has_device_convergence = _has_device_convergence(helper)
         self.launched_groups = set()
         self.device_convergence_skip_groups = set()
@@ -86,6 +94,8 @@ class FusedCudaStageBackend:
         stage_group = info["stage_group"]
         if stage_group in self.device_convergence_skip_groups:
             return True
+        if stage_group in self.snapshot_window_covered_groups:
+            return True
         if stage_group in self.resident_window_covered_groups:
             return True
         if stage_group in self.covered_stage_groups:
@@ -94,7 +104,11 @@ class FusedCudaStageBackend:
             return False
         if stage_group in self.launched_groups:
             return True
-        if stage_group in self.resident_window_by_group:
+        if stage_group in self.snapshot_window_by_group:
+            self._launch_snapshot_window(
+                evaluator, self.snapshot_window_by_group[stage_group], extra_args
+            )
+        elif stage_group in self.resident_window_by_group:
             self._launch_resident_window(
                 evaluator, self.resident_window_by_group[stage_group], extra_args
             )
@@ -121,6 +135,9 @@ class FusedCudaStageBackend:
             info = self._kernel_info_for_plan_stage_index(stage_index)
             stage = self.helper.cuda_stage_plan.stages[stage_index]
             self._launch_stage(evaluator, stage, info, extra_args)
+
+    def _launch_snapshot_window(self, evaluator, stage_indices, extra_args):
+        self._launch_resident_window(evaluator, stage_indices, extra_args)
 
     def _launch_device_convergence_super_stage(
         self, evaluator, info, extra_args, t, dt
@@ -248,6 +265,7 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
         self.cooperative_extra_arg_names = {}
         self.neighbor_contexts = {}
         self.neighbor_workspaces = {}
+        self.snapshot_arrays = {}
         self.device_convergence_flag = None
         self.device_convergence_uses_particle_flag = False
         self.launch_count = 0
@@ -264,7 +282,66 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
     def _launch_stage(self, evaluator, stage, info, extra_args):
         self._launch_single_stage(evaluator, stage, info, extra_args)
 
+    def _launch_snapshot_window(self, evaluator, stage_indices, extra_args):
+        stages = tuple(
+            self.helper.cuda_stage_plan.stages[index] for index in stage_indices
+        )
+        infos = tuple(
+            self._kernel_info_for_plan_stage_index(index) for index in stage_indices
+        )
+        context = self._neighbor_context_for_stage(evaluator, infos[0])
+        if not _snapshot_window_is_profitable(context.n):
+            self._launch_resident_hbucket_pair_window(
+                evaluator, stage_indices, extra_args
+            )
+            return
+        equations_by_stage = tuple(
+            _equations_for_stage(self.helper, stage, info["stage_group"])
+            for stage, info in zip(stages, infos)
+        )
+        combined_stage = snapshot_hbucket_pair_window_stage(stages)
+        precompute = _precompute_for_stage(combined_stage, self.helper.object.kernel)
+        snapshot_fields = _snapshot_pair_window_fields(stages)
+        outline = self._outline_for_snapshot_hbucket_pair_window(
+            stages, equations_by_stage, precompute, snapshot_fields
+        )
+        module = self._module_for_stage(outline, infos[0], combined_stage)
+        combined_equations = _unique_equations_for_window(equations_by_stage)
+        stage_args = _stage_extra_args(
+            self.helper,
+            combined_stage,
+            combined_equations,
+            infos[0],
+            extra_args,
+            precompute,
+        )
+        snapshot_args = tuple(
+            self._snapshot_field_arg(infos[0], field) for field in snapshot_fields
+        )
+        timer = _stage_timer(self.stream)
+        launch_config = launch_snapshot_hbucket_pair_window_kernel_with_context(
+            module,
+            outline.name,
+            context,
+            snapshot_args,
+            stage_args,
+        )
+        traversal = "snapshot_hbucket"
+        self._record_pair_launch(traversal)
+        self._record_pair_launch_config(launch_config)
+        for stage in stages:
+            self._finish_launched_stage(stage)
+        self._record_stage_timing(
+            _snapshot_hbucket_pair_window_stage(stages), traversal, timer
+        )
+        self.launch_count += 1
+
     def _launch_resident_window(self, evaluator, stage_indices, extra_args):
+        self._launch_resident_hbucket_pair_window(evaluator, stage_indices, extra_args)
+
+    def _launch_resident_hbucket_pair_window(
+        self, evaluator, stage_indices, extra_args
+    ):
         stages = tuple(
             self.helper.cuda_stage_plan.stages[index] for index in stage_indices
         )
@@ -307,6 +384,20 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
         )
         self.launch_count += 1
 
+    def _outline_for_snapshot_hbucket_pair_window(
+        self, stages, equations_by_stage, precompute, snapshot_fields
+    ):
+        outline_key = _snapshot_hbucket_pair_window_key(
+            stages, precompute, snapshot_fields
+        )
+        if outline_key in self.outlines:
+            return self.outlines[outline_key]
+        outline = generate_snapshot_hbucket_pair_window_outline_from_equations(
+            "cuda_eval", stages, equations_by_stage, precompute, snapshot_fields
+        )
+        self.outlines[outline_key] = outline
+        return outline
+
     def _outline_for_resident_hbucket_pair_window(
         self, stages, equations_by_stage, precomputes
     ):
@@ -333,6 +424,26 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
             _stage_extra_arg_value(self.helper, name, infos[0], extra_args)
             for name in self.cooperative_extra_arg_names[names_key]
         )
+
+    def _snapshot_field_arg(self, info, field):
+        import pycuda.driver as cuda
+        import pycuda.gpuarray as gpuarray
+
+        source = getattr(info["dest"].gpu, field).dev
+        key = (id(info["dest"]), field)
+        nreal = info["dest"].get_number_of_particles(True)
+        if key not in self.snapshot_arrays:
+            self.snapshot_arrays[key] = gpuarray.empty(source.shape, source.dtype)
+        if self.snapshot_arrays[key].shape[0] < nreal:
+            self.snapshot_arrays[key] = gpuarray.empty(source.shape, source.dtype)
+        target = self.snapshot_arrays[key]
+        cuda.memcpy_dtod_async(
+            _device_pointer_int(target),
+            _device_pointer_int(source),
+            int(nreal) * source.dtype.itemsize,
+            self.stream,
+        )
+        return target
 
     def _launch_single_stage(self, evaluator, stage, info, extra_args):
         equations = _equations_for_stage(self.helper, stage, info["stage_group"])
@@ -621,6 +732,68 @@ def _resident_window_mapping(helper, stage_group_by_plan_index):
     return window_by_group, covered_groups
 
 
+def _snapshot_window_mapping(helper, stage_group_by_plan_index):
+    window_by_group = {}
+    covered_groups = set()
+    for stage_indices in _snapshot_pair_windows(helper.cuda_stage_plan.stages):
+        if not all(index in stage_group_by_plan_index for index in stage_indices):
+            continue
+        first_group = stage_group_by_plan_index[stage_indices[0]]
+        window_by_group[first_group] = stage_indices
+        for stage_index in stage_indices[1:]:
+            covered_groups.add(stage_group_by_plan_index[stage_index])
+    return window_by_group, covered_groups
+
+
+def _snapshot_pair_windows(stages):
+    windows = []
+    index = 0
+    while index < len(stages) - 1:
+        left = stages[index]
+        right = stages[index + 1]
+        if _can_launch_snapshot_pair_window(left, right):
+            windows.append((index, index + 1))
+            index += 2
+        else:
+            index += 1
+    return tuple(windows)
+
+
+def _can_launch_snapshot_pair_window(left, right):
+    if not (
+        left.kind in (StageKind.PAIR_DENSITY, StageKind.PAIR_RATE)
+        and right.kind in (StageKind.PAIR_DENSITY, StageKind.PAIR_RATE)
+        and left.dest == right.dest
+        and left.sources == right.sources
+        and not _stage_invalidates_neighbor_context(left)
+        and not _stage_invalidates_neighbor_context(right)
+    ):
+        return False
+    left_pre, left_loop, left_post = _pair_segment_methods_for_backend(left.methods)
+    right_pre, right_loop, _right_post = _pair_segment_methods_for_backend(
+        right.methods
+    )
+    hoisted_left_post, remaining_left_post = _snapshot_hoisted_left_post_methods(
+        left_loop, left_post
+    )
+    snapshot_fields = _snapshot_pair_window_fields_from_parts(
+        left_loop, right_pre, right_loop
+    )
+    if _methods_read_written_fields(right_pre, left_loop):
+        return False
+    if _methods_read_written_fields(right_loop, left_loop + remaining_left_post):
+        return False
+    if _methods_read_written_fields(remaining_left_post, right_pre + right_loop):
+        return False
+    if _methods_precomputed_source_reads(left_loop).intersection(snapshot_fields):
+        return False
+    if snapshot_fields and _method_identities(left_loop).intersection(
+        _method_identities(right.methods)
+    ):
+        return False
+    return bool(left_pre or left_loop or hoisted_left_post)
+
+
 def _resident_pair_windows(stages):
     windows = []
     index = 0
@@ -665,6 +838,126 @@ def _stage_invalidates_neighbor_context(stage):
         if method.source_writes.intersection(invalidating_fields):
             return True
     return False
+
+
+def _pair_segment_methods_for_backend(methods):
+    pair_loop_indices = tuple(
+        index for index, method in enumerate(methods) if _is_pair_loop_method(method)
+    )
+    assert pair_loop_indices
+    first_pair_loop_index = pair_loop_indices[0]
+    pre_methods = []
+    loop_methods = []
+    post_methods = []
+    for index, method in enumerate(methods):
+        if _is_pair_loop_method(method):
+            loop_methods.append(method)
+        elif _is_source_free_method(method):
+            if index < first_pair_loop_index:
+                pre_methods.append(method)
+            else:
+                post_methods.append(method)
+        elif _is_pair_pre_loop_method(method):
+            pre_methods.append(method)
+        elif _is_pair_post_loop_method(method):
+            post_methods.append(method)
+        else:
+            assert False
+    return tuple(pre_methods), tuple(loop_methods), tuple(post_methods)
+
+
+def _snapshot_hoisted_left_post_methods(left_loop, left_post):
+    left_loop_writes = _methods_written_fields(left_loop)
+    hoisted = []
+    remaining = []
+    for method in left_post:
+        if _is_source_free_method(method) and not _method_read_fields(
+            method
+        ).intersection(left_loop_writes):
+            hoisted.append(method)
+        else:
+            remaining.append(method)
+    return tuple(hoisted), tuple(remaining)
+
+
+def _snapshot_pair_window_fields(stages):
+    left_pre, left_loop, _left_post = _pair_segment_methods_for_backend(
+        stages[0].methods
+    )
+    right_pre, right_loop, _right_post = _pair_segment_methods_for_backend(
+        stages[1].methods
+    )
+    assert left_pre or left_loop
+    return _snapshot_pair_window_fields_from_parts(left_loop, right_pre, right_loop)
+
+
+def _snapshot_pair_window_fields_from_parts(left_loop, right_pre, right_loop):
+    fields = _methods_read_fields(left_loop).intersection(
+        _methods_written_fields(right_pre + right_loop)
+    )
+    return tuple(sorted(fields))
+
+
+def _methods_read_written_fields(readers, writers):
+    return bool(
+        _methods_read_fields(readers).intersection(_methods_written_fields(writers))
+    )
+
+
+def _methods_read_fields(methods):
+    fields = set()
+    for method in methods:
+        fields.update(_method_read_fields(method))
+    return frozenset(fields)
+
+
+def _method_read_fields(method):
+    fields = set(method.dest_reads.difference(method.dest_reduction_reads))
+    fields.update(method.source_reads)
+    fields.update(_precomputed_source_reads(method.precomputed_symbols))
+    return frozenset(fields)
+
+
+def _methods_written_fields(methods):
+    fields = set()
+    for method in methods:
+        fields.update(method.dest_writes)
+        fields.update(method.source_writes)
+        fields.update(method.dest_reduction_writes)
+        fields.update(method.dest_max_reduction_writes)
+    return frozenset(fields)
+
+
+def _methods_precomputed_source_reads(methods):
+    reads = set()
+    for method in methods:
+        reads.update(_precomputed_source_reads(method.precomputed_symbols))
+    return frozenset(reads)
+
+
+def _method_identities(methods):
+    return frozenset((method.equation_name, method.method_kind) for method in methods)
+
+
+def _is_pair_pre_loop_method(method):
+    return bool(method.sources) and method.method_kind in (
+        MethodKind.INITIALIZE,
+        MethodKind.LOOP_ALL,
+    )
+
+
+def _is_pair_loop_method(method):
+    return bool(method.sources) and method.method_kind is MethodKind.LOOP
+
+
+def _is_pair_post_loop_method(method):
+    return (
+        bool(method.sources) and method.method_kind is MethodKind.POST_LOOP
+    ) or not bool(method.sources)
+
+
+def _is_source_free_method(method):
+    return not bool(method.sources)
 
 
 def _stage_dest_writes(stage):
@@ -988,6 +1281,12 @@ def _resident_hbucket_pair_window_stage(stages):
     )
 
 
+def _snapshot_hbucket_pair_window_stage(stages):
+    reason = "; ".join(stage.reason for stage in stages)
+    stage = snapshot_hbucket_pair_window_stage(stages)
+    return replace(stage, reason=f"snapshot hbucket pair window: {reason}")
+
+
 def _resident_hbucket_pair_window_key(stages, precomputes):
     return (
         tuple(
@@ -999,6 +1298,43 @@ def _resident_hbucket_pair_window_key(stages, precomputes):
         ),
         tuple(tuple(sorted(precompute.symbols)) for precompute in precomputes),
     )
+
+
+def _snapshot_hbucket_pair_window_key(stages, precompute, snapshot_fields):
+    return (
+        tuple(
+            tuple(
+                (method.equation_name, method.method_kind.value)
+                for method in stage.methods
+            )
+            for stage in stages
+        ),
+        tuple(sorted(precompute.symbols)),
+        snapshot_fields,
+    )
+
+
+def _snapshot_window_is_profitable(n):
+    return int(n) >= 32768
+
+
+def _unique_equations_for_window(equations_by_stage):
+    equations = []
+    names = []
+    for stage_equations in equations_by_stage:
+        for equation in stage_equations:
+            name = equation.__class__.__name__
+            if name not in names:
+                names.append(name)
+                equations.append(equation)
+    return tuple(equations)
+
+
+def _device_pointer_int(array):
+    gpudata = array.gpudata
+    if isinstance(gpudata, int):
+        return gpudata
+    return int(gpudata)
 
 
 def _resident_window_preserves_particle_grid(n):

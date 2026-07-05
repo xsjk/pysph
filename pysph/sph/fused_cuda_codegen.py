@@ -262,6 +262,34 @@ def generate_resident_hbucket_pair_window_outline_from_equations(
     )
 
 
+def generate_snapshot_hbucket_pair_window_outline_from_equations(
+    plan_id: str,
+    stages: tuple[StageNode, ...],
+    equations_by_stage: tuple[tuple[object, ...], ...],
+    precompute: CudaPairPrecompute,
+    snapshot_fields: tuple[str, ...],
+) -> FusedKernelOutline:
+    """Return one h-bucket traversal for two dependency-compatible pair stages."""
+    assert len(stages) == 2
+    assert len(equations_by_stage) == 2
+    stage = snapshot_hbucket_pair_window_stage(stages)
+    equations = _unique_equations(equations_by_stage)
+    known_types = _cuda_known_types_for_stage(stage, equations, precompute.symbols)
+    group = CUDAGroup(list(equations))
+    wrapper_source = group.get_equation_wrappers(known_types)
+    calls = _cuda_equation_calls_for_snapshot_window(
+        stage,
+        stages[0],
+        equations,
+        known_types,
+        precompute.symbols,
+        snapshot_fields,
+    )
+    return _generate_snapshot_hbucket_pair_window_outline_with_equation_calls(
+        plan_id, stage, wrapper_source, precompute, calls, snapshot_fields
+    )
+
+
 def generate_hbucket_pair_stage_outline_from_equations_with_convergence_flag(
     plan_id: str,
     stage: StageNode,
@@ -404,6 +432,49 @@ def _generate_resident_hbucket_pair_window_outline_with_equation_calls(
             ")",
             "{",
             *stage_lines,
+            "}",
+            "}",
+        )
+    )
+    return FusedKernelOutline(name=name, source=source)
+
+
+def _generate_snapshot_hbucket_pair_window_outline_with_equation_calls(
+    plan_id: str,
+    stage: StageNode,
+    wrapper_source: str,
+    precompute: CudaPairPrecompute,
+    calls: tuple[CudaEquationMethodCall, ...],
+    snapshot_fields: tuple[str, ...],
+) -> FusedKernelOutline:
+    assert _stage_uses_neighbors(stage)
+    name = f"fused_{plan_id}_{stage.dest}_snapshot_hbucket_pair_window"
+    segment_lines = _hbucket_pair_segment_lines(stage, calls, precompute)
+    arguments = (
+        hbucket_context_argument_declarations()
+        + _snapshot_argument_declarations(snapshot_fields)
+        + _unique_argument_declarations(
+            _precompute_argument_declarations(precompute),
+            _equation_call_arguments(calls),
+        )
+    )
+    fp32_wrapper_source = _hbucket_pair_wrapper_source(wrapper_source, stage)
+    source = "\n".join(
+        (
+            'extern "C" {',
+            _FUSED_CUDA_COMPYLE_PREAMBLE,
+            _PAIR_TRAVERSAL_HELPERS,
+            precompute.helper_source,
+            fp32_wrapper_source,
+            f"__global__ void {name}(",
+            _argument_block(arguments),
+            ")",
+            "{",
+            "    int dst = blockIdx.x * blockDim.x + threadIdx.x;",
+            "    if (dst >= n) {",
+            "        return;",
+            "    }",
+            *segment_lines,
             "}",
             "}",
         )
@@ -847,6 +918,35 @@ def launch_hbucket_pair_kernel_with_context(
     extra_args: tuple[object, ...],
 ) -> PairLaunchConfig:
     """Launch a generated h-bucket pair kernel."""
+    return _launch_hbucket_pair_kernel_with_context(
+        module, kernel_name, context, extra_args, "hbucket"
+    )
+
+
+def launch_snapshot_hbucket_pair_window_kernel_with_context(
+    module: object,
+    kernel_name: str,
+    context: object,
+    snapshot_args: tuple[object, ...],
+    extra_args: tuple[object, ...],
+) -> PairLaunchConfig:
+    """Launch a generated snapshot h-bucket pair-window kernel."""
+    return _launch_hbucket_pair_kernel_with_context(
+        module,
+        kernel_name,
+        context,
+        snapshot_args + extra_args,
+        "snapshot_hbucket",
+    )
+
+
+def _launch_hbucket_pair_kernel_with_context(
+    module: object,
+    kernel_name: str,
+    context: object,
+    extra_args: tuple[object, ...],
+    traversal: str,
+) -> PairLaunchConfig:
     kernel = module.get_function(kernel_name)
     block_size = _pair_block_size_for_count(context.n)
     grid_x = (context.n + block_size - 1) // block_size
@@ -885,7 +985,7 @@ def launch_hbucket_pair_kernel_with_context(
         stream=context.stream,
     )
     return PairLaunchConfig(
-        traversal="hbucket",
+        traversal=traversal,
         n=int(context.n),
         block_size=int(block_size),
         grid_x=int(grid_x),
@@ -975,6 +1075,56 @@ def _hbucket_pair_segment_lines(
             for line in post_loop_method_lines
         )
     return tuple(lines)
+
+
+def snapshot_hbucket_pair_window_stage(stages: tuple[StageNode, ...]) -> StageNode:
+    """Return the synthetic single-traversal stage for a snapshot pair window."""
+    assert len(stages) == 2
+    left = stages[0]
+    right = stages[1]
+    left_pre, left_loop, left_post = _pair_segment_methods(left.methods)
+    right_pre, right_loop, right_post = _pair_segment_methods(right.methods)
+    hoisted_left_post, remaining_left_post = _snapshot_hoisted_left_post_methods(
+        left_loop, left_post
+    )
+    assert not _methods_read_written_fields(right_pre, left_loop)
+    assert not _methods_read_written_fields(right_loop, left_loop + remaining_left_post)
+    assert not _methods_read_written_fields(remaining_left_post, right_pre + right_loop)
+    methods = (
+        left_pre
+        + hoisted_left_post
+        + right_pre
+        + left_loop
+        + right_loop
+        + remaining_left_post
+        + right_post
+    )
+    return StageNode(
+        kind=right.kind,
+        dest=right.dest,
+        sources=right.sources,
+        methods=methods,
+        reason=f"snapshot hbucket pair window: {left.reason}; {right.reason}",
+        convergence_policy=None,
+        legacy_group_count=left.legacy_group_count + right.legacy_group_count,
+        method_segments=(methods,),
+    )
+
+
+def _snapshot_hoisted_left_post_methods(
+    left_loop: tuple[object, ...], left_post: tuple[object, ...]
+) -> tuple[tuple[object, ...], tuple[object, ...]]:
+    left_loop_writes = _methods_written_fields(left_loop)
+    hoisted = []
+    remaining = []
+    for method in left_post:
+        if _is_source_free_method(method) and not _method_read_fields(
+            method
+        ).intersection(left_loop_writes):
+            hoisted.append(method)
+        else:
+            remaining.append(method)
+    return tuple(hoisted), tuple(remaining)
 
 
 def _stage_method_segments(stage: StageNode) -> tuple[tuple[object, ...], ...]:
@@ -1272,6 +1422,59 @@ def _is_source_free_method(method: object) -> bool:
     return not bool(method.sources)
 
 
+def _methods_read_written_fields(
+    readers: tuple[object, ...], writers: tuple[object, ...]
+) -> bool:
+    return bool(
+        _methods_read_fields(readers).intersection(_methods_written_fields(writers))
+    )
+
+
+def _methods_read_fields(methods: tuple[object, ...]) -> frozenset[str]:
+    fields = set()
+    for method in methods:
+        fields.update(_method_read_fields(method))
+    return frozenset(fields)
+
+
+def _method_read_fields(method: object) -> frozenset[str]:
+    fields = set(method.dest_reads.difference(method.dest_reduction_reads))
+    fields.update(method.source_reads)
+    fields.update(_precomputed_source_reads(method.precomputed_symbols))
+    return frozenset(fields)
+
+
+def _methods_written_fields(methods: tuple[object, ...]) -> frozenset[str]:
+    fields = set()
+    for method in methods:
+        fields.update(method.dest_writes)
+        fields.update(method.source_writes)
+        fields.update(method.dest_reduction_writes)
+        fields.update(method.dest_max_reduction_writes)
+    return frozenset(fields)
+
+
+def _method_identity(method: object) -> tuple[str, MethodKind]:
+    return method.equation_name, method.method_kind
+
+
+def _precomputed_source_reads(symbols: frozenset[str]) -> frozenset[str]:
+    reads = set()
+    if "VIJ" in symbols:
+        reads.update(("u", "v", "w"))
+    if "RHOIJ" in symbols or "RHOIJ1" in symbols:
+        reads.add("rho")
+    if symbols.intersection(frozenset(("XIJ", "R2IJ", "RIJ"))):
+        reads.update(("x", "y", "z"))
+    if symbols.intersection(
+        frozenset(
+            ("HIJ", "WIJ", "WI", "WJ", "DWIJ", "DWI", "DWJ", "GHI", "GHJ", "GHIJ")
+        )
+    ):
+        reads.add("h")
+    return frozenset(reads)
+
+
 def _hbucket_pair_precompute_lines(
     precompute: CudaPairPrecompute,
 ) -> tuple[str, ...]:
@@ -1467,6 +1670,51 @@ def _cuda_equation_calls_for_stage(
     return tuple(calls)
 
 
+def _cuda_equation_calls_for_snapshot_window(
+    stage: StageNode,
+    left_stage: StageNode,
+    equations: tuple[object, ...],
+    known_types: dict[str, KnownType],
+    precomputed_symbols: frozenset[str],
+    snapshot_fields: tuple[str, ...],
+) -> tuple[CudaEquationMethodCall, ...]:
+    left_loop_methods = _pair_segment_methods(left_stage.methods)[1]
+    calls = []
+    for method in stage.methods:
+        equation = _equation_for_method(method.equation_name, equations)
+        call = cuda_equation_method_call_from_equation_with_precomputed(
+            equation, method.method_kind.value, known_types, precomputed_symbols
+        )
+        if _method_identity(method) in tuple(
+            _method_identity(item) for item in left_loop_methods
+        ):
+            call = _snapshot_call_for_fields(call, snapshot_fields)
+        calls.append(call)
+    return tuple(calls)
+
+
+def _snapshot_call_for_fields(
+    call: CudaEquationMethodCall, snapshot_fields: tuple[str, ...]
+) -> CudaEquationMethodCall:
+    arguments = tuple(
+        _snapshot_argument(argument, snapshot_fields) for argument in call.arguments
+    )
+    return CudaEquationMethodCall(
+        equation_name=call.equation_name,
+        method_kind=call.method_kind,
+        function_name=call.function_name,
+        argument_declarations=call.argument_declarations,
+        arguments=arguments,
+    )
+
+
+def _snapshot_argument(argument: str, snapshot_fields: tuple[str, ...]) -> str:
+    for field in snapshot_fields:
+        if argument in (f"d_{field}", f"s_{field}"):
+            return f"fused_snapshot_{field}"
+    return argument
+
+
 def _cuda_known_types_for_stage(
     stage: StageNode,
     equations: tuple[object, ...],
@@ -1580,6 +1828,14 @@ def _precompute_argument_declarations(
 ) -> tuple[str, ...]:
     return tuple(
         f"GLOBAL_MEM float* {name}" for name in precompute_argument_names(precompute)
+    )
+
+
+def _snapshot_argument_declarations(
+    snapshot_fields: tuple[str, ...],
+) -> tuple[str, ...]:
+    return tuple(
+        f"GLOBAL_MEM float* fused_snapshot_{field}" for field in snapshot_fields
     )
 
 

@@ -12,16 +12,21 @@ from pysph.sph.fused_cuda_codegen import (
     generate_hbucket_pair_stage_outline_from_equations,
     generate_pointwise_kernel_outline_with_equation_calls,
     generate_resident_hbucket_pair_window_outline_from_equations,
+    generate_snapshot_hbucket_pair_window_outline_from_equations,
     hbucket_context_argument_declarations,
     launch_budget_for_specs,
     PairLaunchConfig,
+    snapshot_hbucket_pair_window_stage,
 )
 from pysph.sph.equation import CUDAGroup, KnownType
 from pysph.sph.fused_cuda_stage_backend import (
     _neighbor_context_bounds_and_periodicity,
     _pair_traversal_for_stage,
+    _snapshot_pair_window_fields,
+    _snapshot_pair_windows,
 )
 from pysph.sph.fused_cuda_stage_plan import (
+    analyze_equation_method,
     CudaStagePlan,
     MethodDeps,
     MethodKind,
@@ -31,6 +36,8 @@ from pysph.sph.fused_cuda_stage_plan import (
 from pysph.sph.tests.fused_cuda_codegen_equations import (
     AddMass,
     CopyAcceleration,
+    InitLoopPost,
+    ReadDestAndSourceAcceleration,
 )
 
 
@@ -187,6 +194,57 @@ def test_resident_hbucket_pair_window_uses_cooperative_grid_sync():
     assert outline.source.count("AddMass_loop(add_mass0, dst, src, d_au, s_m);") == 2
 
 
+def test_snapshot_pair_window_snapshots_left_read_before_right_write():
+    left = _stage(
+        StageKind.PAIR_RATE,
+        _method_deps(ReadDestAndSourceAcceleration(dest="fluid", sources=["fluid"])),
+    )
+    right = _stage(
+        StageKind.PAIR_RATE,
+        _method_deps(InitLoopPost(dest="fluid", sources=["fluid"])),
+    )
+
+    assert _snapshot_pair_windows((left, right)) == ((0, 1),)
+    assert _snapshot_pair_window_fields((left, right)) == ("au",)
+
+    combined = snapshot_hbucket_pair_window_stage((left, right))
+
+    assert [
+        (method.equation_name, method.method_kind) for method in combined.methods
+    ] == [
+        ("ReadDestAndSourceAcceleration", MethodKind.INITIALIZE),
+        ("InitLoopPost", MethodKind.INITIALIZE),
+        ("ReadDestAndSourceAcceleration", MethodKind.LOOP),
+        ("InitLoopPost", MethodKind.LOOP),
+        ("ReadDestAndSourceAcceleration", MethodKind.POST_LOOP),
+        ("InitLoopPost", MethodKind.POST_LOOP),
+    ]
+
+
+def test_snapshot_pair_window_outline_reads_snapshotted_left_arguments():
+    left_equation = ReadDestAndSourceAcceleration(dest="fluid", sources=["fluid"])
+    right_equation = InitLoopPost(dest="fluid", sources=["fluid"])
+    left = _stage(StageKind.PAIR_RATE, _method_deps(left_equation))
+    right = _stage(StageKind.PAIR_RATE, _method_deps(right_equation))
+
+    outline = generate_snapshot_hbucket_pair_window_outline_from_equations(
+        "plan0",
+        (left, right),
+        ((left_equation,), (right_equation,)),
+        CudaPairPrecompute(symbols=frozenset(), helper_source="", lines=()),
+        ("au",),
+    )
+
+    assert outline.name == "fused_plan0_fluid_snapshot_hbucket_pair_window"
+    assert "GLOBAL_MEM float* fused_snapshot_au" in outline.source
+    assert (
+        "ReadDestAndSourceAcceleration_loop("
+        "read_dest_and_source_acceleration0, dst, src, d_alpha, "
+        "fused_snapshot_au, fused_snapshot_au);"
+    ) in outline.source
+    assert "InitLoopPost_loop(init_loop_post0, dst, src, d_au, s_m);" in outline.source
+
+
 def test_pair_traversal_uses_hbucket_context():
     assert (
         _pair_traversal_for_stage(SimpleNamespace(cell_bucket_counts=object()))
@@ -247,4 +305,11 @@ def _call(equation, method_name, known_types, precomputed_symbols):
 
     return cuda_equation_method_call_from_equation_with_precomputed(
         equation, method_name, known_types, precomputed_symbols
+    )
+
+
+def _method_deps(equation):
+    return tuple(
+        analyze_equation_method(equation, method_name)
+        for method_name in ("initialize", "loop", "post_loop")
     )
