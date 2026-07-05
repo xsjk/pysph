@@ -19,10 +19,12 @@ from pysph.base.fused_cuda_nnps import (
 from pysph.sph.fused_cuda_codegen import (
     CudaPairPrecompute,
     cubic_spline_pair_precompute_for_symbols,
+    generate_cell_tile_hbucket_pair_stage_outline_from_equations,
     generate_hbucket_pair_stage_outline_from_equations,
     generate_hbucket_pair_stage_outline_from_equations_with_convergence_flag,
     generate_hbucket_source_inline_pair_window_outline_from_equations,
     hbucket_source_inline_pair_window_argument_names,
+    launch_cell_tile_hbucket_pair_kernel_with_context,
     PairLaunchConfig,
     generate_pointwise_stage_outline_from_equations,
     generate_resident_hbucket_pair_window_outline_from_equations,
@@ -549,26 +551,38 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
         equations = _equations_for_stage(self.helper, stage, info["stage_group"])
         precompute = _precompute_for_stage(stage, self.helper.object.kernel)
         convergence_field = self._device_convergence_field_for_stage(stage)
-        outline = self._outline_for_stage(
-            stage, equations, precompute, info, convergence_field
-        )
-        module = self._module_for_stage(outline, info, stage)
-        stage_args = _stage_extra_args(
-            self.helper, stage, equations, info, extra_args, precompute
-        )
-        if convergence_field is not None:
-            stage_args = (self.device_convergence_flag,) + stage_args
         timer = _stage_timer(self.stream)
         traversal = "pointwise"
         if stage.kind in (StageKind.PAIR_DENSITY, StageKind.PAIR_RATE):
             context = self._neighbor_context_for_stage(evaluator, info)
-            traversal = "hbucket"
-            self._record_pair_launch(traversal)
-            launch_config = launch_hbucket_pair_kernel_with_context(
-                module, outline.name, context, stage_args
+            traversal = _pair_traversal_for_stage(stage, context, convergence_field)
+            outline = self._outline_for_stage(
+                stage, equations, precompute, info, convergence_field, traversal
             )
+            module = self._module_for_stage(outline, info, stage)
+            stage_args = _stage_extra_args(
+                self.helper, stage, equations, info, extra_args, precompute
+            )
+            if convergence_field is not None:
+                stage_args = (self.device_convergence_flag,) + stage_args
+            self._record_pair_launch(traversal)
+            if traversal == "cell_tile_hbucket":
+                launch_config = launch_cell_tile_hbucket_pair_kernel_with_context(
+                    module, outline.name, context, stage_args
+                )
+            else:
+                launch_config = launch_hbucket_pair_kernel_with_context(
+                    module, outline.name, context, stage_args
+                )
             self._record_pair_launch_config(launch_config)
         elif _stage_can_use_pointwise_kernel(stage):
+            outline = self._outline_for_stage(
+                stage, equations, precompute, info, convergence_field, traversal
+            )
+            module = self._module_for_stage(outline, info, stage)
+            stage_args = _stage_extra_args(
+                self.helper, stage, equations, info, extra_args, precompute
+            )
             n = info["dest"].get_number_of_particles(True)
             launch_pointwise_kernel(module, outline.name, n, self.stream, stage_args)
         else:
@@ -724,9 +738,10 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
         self.neighbor_contexts = {}
         return True
 
-    def _outline_for_stage(self, stage, equations, precompute, info, convergence_field):
+    def _outline_for_stage(
+        self, stage, equations, precompute, info, convergence_field, traversal
+    ):
         stage_group = info["stage_group"]
-        traversal = "hbucket"
         outline_key = (
             stage_group,
             stage.kind.value,
@@ -740,15 +755,18 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
         if outline_key in self.outlines:
             return self.outlines[outline_key]
         if stage.kind in (StageKind.PAIR_DENSITY, StageKind.PAIR_RATE):
-            if convergence_field is None:
+            if traversal == "cell_tile_hbucket":
+                assert convergence_field is None
+                outline = generate_cell_tile_hbucket_pair_stage_outline_from_equations(
+                    "cuda_eval", stage, equations, precompute
+                )
+            elif convergence_field is None:
                 outline = generate_hbucket_pair_stage_outline_from_equations(
                     "cuda_eval", stage, equations, precompute
                 )
             else:
-                outline = (
-                    generate_hbucket_pair_stage_outline_from_equations_with_convergence_flag(
-                        "cuda_eval", stage, equations, precompute, convergence_field
-                    )
+                outline = generate_hbucket_pair_stage_outline_from_equations_with_convergence_flag(
+                    "cuda_eval", stage, equations, precompute, convergence_field
                 )
         elif _stage_can_use_pointwise_kernel(stage):
             outline = generate_pointwise_stage_outline_from_equations(
@@ -1156,6 +1174,43 @@ def _stage_can_use_pointwise_kernel(stage):
     return False
 
 
+def _pair_traversal_for_stage(stage, context, convergence_field):
+    if _stage_can_use_cell_tile_hbucket(stage, context, convergence_field):
+        return "cell_tile_hbucket"
+    return "hbucket"
+
+
+def _stage_can_use_cell_tile_hbucket(stage, context, convergence_field):
+    if convergence_field is not None:
+        return False
+    if context.bucket_count != 1:
+        return False
+    if not _cell_tile_hbucket_context_allowed(context):
+        return False
+    pair_loop_methods = tuple(
+        method
+        for method in stage.methods
+        if method.method_kind is MethodKind.LOOP and method.sources
+    )
+    if not pair_loop_methods:
+        return False
+    for method in pair_loop_methods:
+        if method.source_writes:
+            return False
+        if not (method.dest_reduction_writes or method.dest_max_reduction_writes):
+            return False
+    return True
+
+
+def _cell_tile_hbucket_context_allowed(context):
+    occupancy = float(context.n) / float(context.total_cells)
+    return occupancy >= _cell_tile_hbucket_min_particles_per_cell()
+
+
+def _cell_tile_hbucket_min_particles_per_cell():
+    return 16.0
+
+
 class _CudaStageTimer:
     def __init__(self, stream):
         import pycuda.driver as cuda
@@ -1191,7 +1246,7 @@ def _hbucket_bucket_count():
 
 
 def _source_inline_pair_windows():
-    return True
+    return False
 
 
 def _resident_grid_sync_pair_windows():
@@ -1199,11 +1254,13 @@ def _resident_grid_sync_pair_windows():
 
 
 def _resident_grid_sync_pair_window_policy():
-    return "auto"
+    return "off"
 
 
 def _resident_grid_sync_context_allowed(context):
     policy = _resident_grid_sync_pair_window_policy()
+    if policy == "off":
+        return False
     if policy == "always":
         return True
     assert policy == "auto"
@@ -1575,9 +1632,7 @@ def _resident_hbucket_pair_window_key(stages, precomputes):
     )
 
 
-def _hbucket_source_inline_pair_window_key(
-    stages, precomputes, inline_methods
-):
+def _hbucket_source_inline_pair_window_key(stages, precomputes, inline_methods):
     return (
         _resident_hbucket_pair_window_key(stages, precomputes),
         tuple(

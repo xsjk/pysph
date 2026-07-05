@@ -351,6 +351,25 @@ def generate_hbucket_pair_stage_outline_from_equations(
     )
 
 
+def generate_cell_tile_hbucket_pair_stage_outline_from_equations(
+    plan_id: str,
+    stage: StageNode,
+    equations: tuple[object, ...],
+    precompute: CudaPairPrecompute,
+) -> FusedKernelOutline:
+    """Return a cell-tiled h-bucket pair outline generated from PySPH equations."""
+    assert _stage_uses_neighbors(stage)
+    known_types = _cuda_known_types_for_stage(stage, equations, precompute.symbols)
+    group = CUDAGroup(list(equations))
+    wrapper_source = group.get_equation_wrappers(known_types)
+    calls = _cuda_equation_calls_for_stage(
+        stage, equations, known_types, precompute.symbols
+    )
+    return _generate_cell_tile_hbucket_pair_loop_outline_with_equation_calls(
+        plan_id, stage, wrapper_source, precompute, calls
+    )
+
+
 def generate_resident_hbucket_pair_window_outline_from_equations(
     plan_id: str,
     stages: tuple[StageNode, ...],
@@ -700,6 +719,45 @@ def _generate_hbucket_pair_loop_outline_with_equation_calls(
             "    }",
             *segment_lines,
             *convergence_flag_lines,
+            "}",
+            "}",
+        )
+    )
+    return FusedKernelOutline(name=name, source=source)
+
+
+def _generate_cell_tile_hbucket_pair_loop_outline_with_equation_calls(
+    plan_id: str,
+    stage: StageNode,
+    wrapper_source: str,
+    precompute: CudaPairPrecompute,
+    calls: tuple[CudaEquationMethodCall, ...],
+) -> FusedKernelOutline:
+    assert _stage_uses_neighbors(stage)
+    name = f"{fused_kernel_name(plan_id, stage)}_cell_tile"
+    source_fields = _cell_tile_source_fields(stage, precompute, calls)
+    segment_lines = _cell_tile_hbucket_pair_segment_lines(
+        stage, calls, precompute, source_fields
+    )
+    arguments = hbucket_context_argument_declarations() + _unique_argument_declarations(
+        _precompute_argument_declarations(precompute),
+        _equation_call_arguments(calls),
+    )
+    fp32_wrapper_source = _cell_tile_pair_wrapper_source(
+        wrapper_source, stage, source_fields
+    )
+    source = "\n".join(
+        (
+            'extern "C" {',
+            _FUSED_CUDA_COMPYLE_PREAMBLE,
+            _DIRECT_PAIR_HELPERS,
+            precompute.helper_source,
+            fp32_wrapper_source,
+            f"__global__ void {name}(",
+            _argument_block(arguments),
+            ")",
+            "{",
+            *segment_lines,
             "}",
             "}",
         )
@@ -1415,12 +1473,69 @@ def launch_hbucket_pair_kernel_with_context(
     )
 
 
+def launch_cell_tile_hbucket_pair_kernel_with_context(
+    module: object,
+    kernel_name: str,
+    context: object,
+    extra_args: tuple[object, ...],
+) -> PairLaunchConfig:
+    """Launch a generated cell-tiled h-bucket pair kernel."""
+    assert context.bucket_count == 1
+    kernel = module.get_function(kernel_name)
+    block_size = _cell_tile_hbucket_block_size()
+    grid_x = int(context.total_cells)
+    kernel(
+        _kernel_arg(context.x),
+        _kernel_arg(context.y),
+        _kernel_arg(context.z),
+        _kernel_arg(context.h),
+        np.int32(context.n),
+        np.float32(context.lower[0]),
+        np.float32(context.upper[0]),
+        np.float32(context.lower[1]),
+        np.float32(context.upper[1]),
+        np.float32(context.lower[2]),
+        np.float32(context.upper[2]),
+        np.int32(context.periodic[0]),
+        np.int32(context.periodic[1]),
+        np.int32(context.periodic[2]),
+        context.radius_scale,
+        np.int32(context.cell_counts[0]),
+        np.int32(context.cell_counts[1]),
+        np.int32(context.cell_counts[2]),
+        np.int32(context.total_cells),
+        np.int32(context.bucket_count),
+        np.float32(context.cell_width[0]),
+        np.float32(context.cell_width[1]),
+        np.float32(context.cell_width[2]),
+        _kernel_arg(context.bucket_h_max_bits),
+        _kernel_arg(context.cell_bucket_h_max_bits),
+        _kernel_arg(context.cell_bucket_counts),
+        _kernel_arg(context.cell_bucket_starts),
+        _kernel_arg(context.sorted_ids),
+        *tuple(_kernel_arg(arg) for arg in extra_args),
+        block=(block_size, 1, 1),
+        grid=(grid_x, 1, 1),
+        stream=context.stream,
+    )
+    return PairLaunchConfig(
+        traversal="cell_tile_hbucket",
+        n=int(context.n),
+        block_size=int(block_size),
+        grid_x=int(grid_x),
+    )
+
+
 def _pair_block_size_for_count(n: int) -> int:
     full_block_size = 256
     full_particle_blocks = (int(n) + full_block_size - 1) // full_block_size
     if full_particle_blocks < _cuda_multiprocessor_count():
         return 128
     return full_block_size
+
+
+def _cell_tile_hbucket_block_size() -> int:
+    return 128
 
 
 def _cuda_multiprocessor_count() -> int:
@@ -1684,6 +1799,219 @@ def _hbucket_pair_segment_lines(
             for line in post_loop_method_lines
         )
     return tuple(lines)
+
+
+def _cell_tile_hbucket_pair_segment_lines(
+    stage: StageNode,
+    calls: tuple[CudaEquationMethodCall, ...],
+    precompute: CudaPairPrecompute,
+    source_fields: tuple[str, ...],
+) -> tuple[str, ...]:
+    lines = [
+        *_cell_tile_shared_source_declarations(source_fields),
+        "    if (bucket_count != 1 || blockIdx.x >= total_cells) {",
+        "        return;",
+        "    }",
+        "    int dest_cell = blockIdx.x;",
+        "    int dst_begin = cell_bucket_starts[dest_cell];",
+        "    int dst_count = cell_bucket_counts[dest_cell];",
+        "    if (dst_count <= 0) {",
+        "        return;",
+        "    }",
+        "    int base_cx = 0;",
+        "    int base_cy = 0;",
+        "    int base_cz = 0;",
+        "    fused_codegen_decode_cell(dest_cell, nx, ny, &base_cx, &base_cy, &base_cz);",
+        "    float dest_cell_h = __uint_as_float(cell_bucket_h_max_bits[dest_cell]);",
+        "    float bucket_h = __uint_as_float(bucket_h_max_bits[0]);",
+        "    if (dest_cell_h <= 0.0f || bucket_h <= 0.0f) {",
+        "        return;",
+        "    }",
+        "    float bucket_support = radius_scale * fmaxf(dest_cell_h, bucket_h);",
+        "    int max_x = (int)ceilf(bucket_support / cell_width_x);",
+        "    int max_y = (int)ceilf(bucket_support / cell_width_y);",
+        "    int max_z = (int)ceilf(bucket_support / cell_width_z);",
+        "    int full_x = periodic_x && nx <= 2 * max_x + 1;",
+        "    int full_y = periodic_y && ny <= 2 * max_y + 1;",
+        "    int full_z = periodic_z && nz <= 2 * max_z + 1;",
+        "    int loops_x = full_x ? nx : 2 * max_x + 1;",
+        "    int loops_y = full_y ? ny : 2 * max_y + 1;",
+        "    int loops_z = full_z ? nz : 2 * max_z + 1;",
+        "    for (int dest_local_base = 0; dest_local_base < dst_count; dest_local_base += blockDim.x) {",
+        "        int dest_local = dest_local_base + threadIdx.x;",
+        "        int fused_active_dst = dest_local < dst_count;",
+        "        int dst = 0;",
+        "        float dst_x = 0.0f;",
+        "        float dst_y = 0.0f;",
+        "        float dst_z = 0.0f;",
+        "        float dst_h = 0.0f;",
+        "        if (fused_active_dst) {",
+        "            dst = sorted_ids[dst_begin + dest_local];",
+        "            dst_x = x[dst];",
+        "            dst_y = y[dst];",
+        "            dst_z = z[dst];",
+        "            dst_h = h[dst];",
+        "        }",
+    ]
+    for methods in _stage_method_segments(stage):
+        pre_methods, loop_methods, post_methods = _pair_segment_methods(methods)
+        reduction_methods = _local_reduction_methods_for_segment(loop_methods)
+        reduced_fields = _local_reduction_fields(reduction_methods)
+        pre_loop_method_lines = _direct_pair_equation_call_lines(pre_methods, calls)
+        loop_method_lines = _cell_tile_pair_loop_call_lines(
+            loop_methods, calls, reduction_methods, source_fields
+        )
+        post_loop_method_lines = _direct_pair_equation_call_lines(post_methods, calls)
+        lines.append("        if (fused_active_dst) {")
+        lines.extend(
+            line.replace("                                        ", "            ")
+            for line in pre_loop_method_lines
+        )
+        lines.append("        }")
+        lines.extend(
+            line.replace("    ", "        ", 1)
+            for line in _local_reduction_initialization_lines(reduced_fields)
+        )
+        lines.extend(
+            _cell_tile_hbucket_neighbor_traversal_lines(
+                _cell_tile_pair_precompute_lines(precompute, source_fields),
+                precompute,
+                source_fields,
+                loop_method_lines,
+            )
+        )
+        lines.append("        if (fused_active_dst) {")
+        lines.extend(
+            line.replace("    ", "            ", 1)
+            for line in _local_reduction_commit_lines(reduced_fields)
+        )
+        lines.extend(
+            line.replace("                                        ", "            ")
+            for line in post_loop_method_lines
+        )
+        lines.append("        }")
+    lines.append("    }")
+    return tuple(lines)
+
+
+def _cell_tile_shared_source_declarations(
+    source_fields: tuple[str, ...],
+) -> tuple[str, ...]:
+    return tuple(
+        f"    __shared__ float fused_tile_s_{field}[128];" for field in source_fields
+    )
+
+
+def _cell_tile_hbucket_neighbor_traversal_lines(
+    precompute_lines: tuple[str, ...],
+    precompute: CudaPairPrecompute,
+    source_fields: tuple[str, ...],
+    loop_method_lines: tuple[str, ...],
+) -> tuple[str, ...]:
+    return (
+        "        for (int iz = 0; iz < loops_z; ++iz) {",
+        "            int cz = iz;",
+        "            if (!full_z && !fused_codegen_neighbor_cell(base_cz, iz - max_z, nz, periodic_z, &cz)) {",
+        "                continue;",
+        "            }",
+        "            for (int iy = 0; iy < loops_y; ++iy) {",
+        "                int cy = iy;",
+        "                if (!full_y && !fused_codegen_neighbor_cell(base_cy, iy - max_y, ny, periodic_y, &cy)) {",
+        "                    continue;",
+        "                }",
+        "                for (int ix = 0; ix < loops_x; ++ix) {",
+        "                    int cx = ix;",
+        "                    if (!full_x && !fused_codegen_neighbor_cell(base_cx, ix - max_x, nx, periodic_x, &cx)) {",
+        "                        continue;",
+        "                    }",
+        "                    int cell = fused_codegen_linear_cell(cx, cy, cz, nx, ny);",
+        "                    int begin = cell_bucket_starts[cell];",
+        "                    int count = cell_bucket_counts[cell];",
+        "                    for (int tile = 0; tile < count; tile += blockDim.x) {",
+        "                        int local = tile + threadIdx.x;",
+        "                        if (local < count) {",
+        "                            int src_id = sorted_ids[begin + local];",
+        *_cell_tile_source_load_lines(source_fields),
+        "                        }",
+        "                        __syncthreads();",
+        "                        int tile_count = count - tile;",
+        "                        if (tile_count > blockDim.x) {",
+        "                            tile_count = blockDim.x;",
+        "                        }",
+        "                        if (fused_active_dst) {",
+        "                            for (int tile_j = 0; tile_j < tile_count; ++tile_j) {",
+        *_cell_tile_pair_support_lines(precompute, "                                "),
+        *tuple(
+            line.replace(
+                "                                        ",
+                "                                    ",
+            )
+            for line in precompute_lines
+        ),
+        *tuple(
+            line.replace(
+                "                                        ",
+                "                                    ",
+            )
+            for line in loop_method_lines
+        ),
+        "                                }",
+        "                            }",
+        "                        }",
+        "                        __syncthreads();",
+        "                    }",
+        "                }",
+        "            }",
+        "        }",
+    )
+
+
+def _cell_tile_source_load_lines(source_fields: tuple[str, ...]) -> tuple[str, ...]:
+    lines = []
+    for field in source_fields:
+        source = _cell_tile_source_expression(field)
+        lines.append(
+            f"                            fused_tile_s_{field}[threadIdx.x] = {source};"
+        )
+    return tuple(lines)
+
+
+def _cell_tile_source_expression(field: str) -> str:
+    if field == "x":
+        return "x[src_id]"
+    if field == "y":
+        return "y[src_id]"
+    if field == "z":
+        return "z[src_id]"
+    if field == "h":
+        return "h[src_id]"
+    return f"s_{field}[src_id]"
+
+
+def _cell_tile_pair_support_lines(
+    precompute: CudaPairPrecompute, indent: str
+) -> tuple[str, ...]:
+    if not _hbucket_pair_reuses_support_distance(precompute):
+        return (
+            f"{indent}float src_h = fused_tile_s_h[tile_j];",
+            f"{indent}float XIJ[3];",
+            f"{indent}XIJ[0] = fused_codegen_minimum_image(dst_x - fused_tile_s_x[tile_j], xmax - xmin, periodic_x);",
+            f"{indent}XIJ[1] = fused_codegen_minimum_image(dst_y - fused_tile_s_y[tile_j], ymax - ymin, periodic_y);",
+            f"{indent}XIJ[2] = fused_codegen_minimum_image(dst_z - fused_tile_s_z[tile_j], zmax - zmin, periodic_z);",
+            f"{indent}float R2IJ = XIJ[0] * XIJ[0] + XIJ[1] * XIJ[1] + XIJ[2] * XIJ[2];",
+            f"{indent}float fused_support = radius_scale * fmaxf(dst_h, src_h);",
+            f"{indent}if (R2IJ < fused_support * fused_support) {{",
+        )
+    return (
+        f"{indent}float src_h = fused_tile_s_h[tile_j];",
+        f"{indent}float XIJ[3];",
+        f"{indent}XIJ[0] = fused_codegen_minimum_image(dst_x - fused_tile_s_x[tile_j], xmax - xmin, periodic_x);",
+        f"{indent}XIJ[1] = fused_codegen_minimum_image(dst_y - fused_tile_s_y[tile_j], ymax - ymin, periodic_y);",
+        f"{indent}XIJ[2] = fused_codegen_minimum_image(dst_z - fused_tile_s_z[tile_j], zmax - zmin, periodic_z);",
+        f"{indent}float R2IJ = XIJ[0] * XIJ[0] + XIJ[1] * XIJ[1] + XIJ[2] * XIJ[2];",
+        f"{indent}float fused_support = radius_scale * fmaxf(dst_h, src_h);",
+        f"{indent}if (R2IJ < fused_support * fused_support) {{",
+    )
 
 
 def _hbucket_source_inline_first_segment_lines(
@@ -2032,6 +2360,44 @@ def _local_reduction_pair_loop_call_lines(
     return tuple(lines)
 
 
+def _cell_tile_pair_loop_call_lines(
+    methods: tuple[object, ...],
+    calls: tuple[CudaEquationMethodCall, ...],
+    reduction_methods: tuple[object, ...],
+    source_fields: tuple[str, ...],
+) -> tuple[str, ...]:
+    lines = []
+    for method in methods:
+        if not _is_pair_loop_method(method):
+            continue
+        call = _equation_call_for_method(
+            method.equation_name, method.method_kind, calls
+        )
+        reduction = _optional_reduction_method_for_method(
+            method.equation_name, method.method_kind, reduction_methods
+        )
+        arguments = ", ".join(
+            _cell_tile_call_argument(argument, reduction, source_fields)
+            for argument in call.arguments
+        )
+        lines.append(
+            f"                                        {call.function_name}({arguments});"
+        )
+    return tuple(lines)
+
+
+def _cell_tile_call_argument(
+    argument: str,
+    reduction: object | None,
+    source_fields: tuple[str, ...],
+) -> str:
+    if argument == "src":
+        return "tile_j"
+    if argument.startswith("s_") and argument[2:] in source_fields:
+        return f"fused_tile_s_{argument[2:]}"
+    return _local_reduction_call_argument(argument, reduction)
+
+
 def _local_reduction_call_argument(argument: str, reduction: object | None) -> str:
     if reduction is None:
         return argument
@@ -2161,6 +2527,61 @@ def _hbucket_pair_precompute_lines(
     return tuple(f"                                        {line}" for line in lines)
 
 
+def _cell_tile_pair_precompute_lines(
+    precompute: CudaPairPrecompute,
+    source_fields: tuple[str, ...],
+) -> tuple[str, ...]:
+    lines = _hbucket_pair_precompute_lines(precompute)
+    return tuple(_cell_tile_source_read_line(line, source_fields) for line in lines)
+
+
+def _cell_tile_source_read_line(line: str, source_fields: tuple[str, ...]) -> str:
+    rewritten = line
+    for field in source_fields:
+        rewritten = rewritten.replace(
+            f"s_{field}[src]", f"fused_tile_s_{field}[tile_j]"
+        )
+        rewritten = rewritten.replace(
+            f"s_{field}[s_idx]", f"fused_tile_s_{field}[tile_j]"
+        )
+    return rewritten
+
+
+def _cell_tile_source_fields(
+    stage: StageNode,
+    precompute: CudaPairPrecompute,
+    calls: tuple[CudaEquationMethodCall, ...],
+) -> tuple[str, ...]:
+    fields = ["x", "y", "z", "h"]
+    for method in stage.methods:
+        for field in sorted(method.source_reads):
+            _append_once(fields, field)
+        for field in sorted(_precomputed_source_reads(precompute.symbols)):
+            _append_once(fields, field)
+    for call in calls:
+        for argument in call.arguments:
+            if argument.startswith("s_"):
+                _append_once(fields, argument[2:])
+    return tuple(fields)
+
+
+def _precomputed_source_reads(symbols: frozenset[str]) -> frozenset[str]:
+    reads = set()
+    if "VIJ" in symbols:
+        reads.update(("u", "v", "w"))
+    if "RHOIJ" in symbols or "RHOIJ1" in symbols:
+        reads.add("rho")
+    if symbols.intersection(frozenset(("XIJ", "R2IJ", "RIJ"))):
+        reads.update(("x", "y", "z"))
+    if symbols.intersection(
+        frozenset(
+            ("HIJ", "WIJ", "WI", "WJ", "DWIJ", "DWI", "DWJ", "GHI", "GHJ", "GHIJ")
+        )
+    ):
+        reads.add("h")
+    return frozenset(reads)
+
+
 def _hbucket_pair_reuses_support_distance(precompute: CudaPairPrecompute) -> bool:
     return "XIJ" in precompute.symbols
 
@@ -2284,6 +2705,15 @@ def _hbucket_pair_wrapper_source(wrapper_source: str, stage: StageNode) -> str:
         _force_cuda_source_fp32(wrapper_source),
         _local_reduction_methods_for_stage(stage),
     )
+
+
+def _cell_tile_pair_wrapper_source(
+    wrapper_source: str,
+    stage: StageNode,
+    source_fields: tuple[str, ...],
+) -> str:
+    assert source_fields
+    return _hbucket_pair_wrapper_source(wrapper_source, stage)
 
 
 def _hbucket_pair_window_wrapper_source(
@@ -2962,6 +3392,21 @@ __device__ int fused_codegen_clamp_cell(float value, float lower, float upper, i
 __device__ int fused_codegen_linear_cell(int cx, int cy, int cz, int nx, int ny)
 {
     return ((cz * ny) + cy) * nx + cx;
+}
+
+__device__ void fused_codegen_decode_cell(
+    int cell,
+    int nx,
+    int ny,
+    int *cx,
+    int *cy,
+    int *cz
+)
+{
+    *cx = cell % nx;
+    int tmp = cell / nx;
+    *cy = tmp % ny;
+    *cz = tmp / ny;
 }
 
 __device__ bool fused_codegen_valid_offset(int offset, int count)

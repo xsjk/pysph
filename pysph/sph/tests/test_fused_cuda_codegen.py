@@ -33,11 +33,14 @@ from pysph.sph.fused_cuda_codegen import (
     generate_direct_pair_loop_outline_with_equation_calls_and_precompute,
     generate_direct_pair_loop_outline_with_equation_calls,
     generate_direct_pair_loop_outline_with_inline_bodies,
+    generate_cell_tile_hbucket_pair_stage_outline_from_equations,
     generate_pointwise_stage_outline_from_equations,
     generate_pointwise_kernel_outline_with_equation_calls,
     generate_fused_kernel_outline,
+    generate_hbucket_pair_stage_outline_from_equations,
     launch_budget_for_specs,
     launch_direct_pair_kernel_with_context,
+    launch_cell_tile_hbucket_pair_kernel_with_context,
     launch_hbucket_pair_kernel_with_context,
     launch_pointwise_kernel,
     lower_equation_method_to_cuda,
@@ -67,15 +70,11 @@ from pysph.sph.tests.fused_cuda_codegen_equations import (
     AddMass,
     AddScaledMass,
     CopyAcceleration,
-    PreserveThenSetDensity,
-    PrepPressure,
-    SetDensity,
 )
 from pysph.sph.tests.fused_cuda_codegen_equations import (
     AccumulateDWIAndDWJ,
     AccumulateDWIJ,
     AccumulateGradientH,
-    AccumulateRhoIJ,
     DensityConvergenceFlag,
     InitLoopPost,
     InitializeTimeStepCandidate,
@@ -832,6 +831,102 @@ def test_hbucket_pair_outline_uses_local_accumulator_for_shared_reduction_writes
     assert "d_au[dst] += fused_acc_d_au;" in outline.source
 
 
+def test_cell_tile_hbucket_outline_uses_shared_source_tiles():
+    stage = replace(
+        _stage(
+            StageKind.PAIR_RATE,
+            (_sum_reduction_deps("AddMass", "au"),),
+        ),
+        method_segments=((_sum_reduction_deps("AddMass", "au"),),),
+    )
+
+    outline = generate_cell_tile_hbucket_pair_stage_outline_from_equations(
+        "test",
+        stage,
+        (AddMass(dest="fluid", sources=["fluid"]),),
+        CudaPairPrecompute(symbols=frozenset(), helper_source="", lines=()),
+    )
+
+    assert "__shared__ float fused_tile_s_m[128];" in outline.source
+    assert "for (int dest_local_base = 0; dest_local_base < dst_count;" in (
+        outline.source
+    )
+    assert "int dest_local = dest_local_base + threadIdx.x;" in outline.source
+    assert "fused_tile_s_m[threadIdx.x] = s_m[src_id];" in outline.source
+    assert "AddMass_loop(add_mass0, dst, tile_j, d_au, fused_tile_s_m);" in (
+        outline.source
+    )
+
+
+def test_cell_tile_hbucket_pair_launch_uses_cell_grid(monkeypatch):
+    from pysph.sph import fused_cuda_codegen as codegen
+
+    monkeypatch.setattr(
+        codegen, "_cell_tile_hbucket_block_size", lambda: 128, raising=False
+    )
+
+    class FakeGpuArray:
+        gpudata = 7
+
+    class FakeKernel:
+        def __call__(self, *args, block, grid, stream):
+            self.args = args
+            self.block = block
+            self.grid = grid
+            self.stream = stream
+
+    class FakeModule:
+        def __init__(self):
+            self.kernel = FakeKernel()
+            self.requested_name = ""
+
+        def get_function(self, name):
+            self.requested_name = name
+            return self.kernel
+
+    stream = object()
+    context = SimpleNamespace(
+        x=FakeGpuArray(),
+        y=FakeGpuArray(),
+        z=FakeGpuArray(),
+        h=FakeGpuArray(),
+        n=513,
+        lower=np.array([0.0, 0.0, 0.0], dtype=np.float32),
+        upper=np.array([1.0, 1.0, 1.0], dtype=np.float32),
+        periodic=np.array([True, False, False], dtype=np.bool_),
+        radius_scale=np.float32(2.0),
+        cell_counts=np.array([7, 2, 1], dtype=np.int32),
+        total_cells=14,
+        bucket_count=1,
+        cell_width=np.array([1.0 / 7.0, 0.5, 1.0], dtype=np.float32),
+        bucket_h_max_bits=FakeGpuArray(),
+        cell_bucket_h_max_bits=FakeGpuArray(),
+        cell_bucket_counts=FakeGpuArray(),
+        cell_bucket_starts=FakeGpuArray(),
+        sorted_ids=FakeGpuArray(),
+        stream=stream,
+    )
+    module = FakeModule()
+    normal_arg = FakeGpuArray()
+
+    launch_config = launch_cell_tile_hbucket_pair_kernel_with_context(
+        module,
+        "kernel0",
+        context,
+        (normal_arg,),
+    )
+
+    assert module.requested_name == "kernel0"
+    assert launch_config.traversal == "cell_tile_hbucket"
+    assert launch_config.n == 513
+    assert launch_config.block_size == 128
+    assert launch_config.grid_x == 14
+    assert module.kernel.block == (128, 1, 1)
+    assert module.kernel.grid == (14, 1, 1)
+    assert module.kernel.stream is stream
+    assert module.kernel.args[-1:] == (normal_arg.gpudata,)
+
+
 def test_hbucket_pair_launch_uses_bucket_context_stream_and_grid(monkeypatch):
     from pysph.sph import fused_cuda_codegen as codegen
 
@@ -1013,81 +1108,6 @@ def test_direct_pair_stage_outline_can_mark_device_convergence_flag():
     ) < outline.source.index("atomicExch(fused_convergence_flag, 0);")
 
 
-def test_resident_hbucket_pair_window_outline_uses_cooperative_grid_sync():
-    from pysph.sph import fused_cuda_codegen as codegen
-
-    assert hasattr(
-        codegen, "generate_resident_hbucket_pair_window_outline_from_equations"
-    )
-    add_mass = AddMass(dest="fluid", sources=["fluid"])
-    pressure = PressureAcceleration(dest="fluid", sources=["fluid"])
-    first_stage = _stage(
-        StageKind.PAIR_RATE,
-        (
-            MethodDeps(
-                equation_name="AddMass",
-                method_kind=MethodKind.LOOP,
-                dest="fluid",
-                sources=("fluid",),
-                dest_reads=frozenset(("au",)),
-                source_reads=frozenset(("m",)),
-                dest_writes=frozenset(("au",)),
-                source_writes=frozenset(),
-                precomputed_symbols=frozenset(),
-                precomputed_writes=frozenset(),
-                unsupported_reasons=(),
-                dest_reduction_writes=frozenset(),
-                dest_max_reduction_writes=frozenset(),
-                dest_reduction_reads=frozenset(),
-            ),
-        ),
-    )
-    second_stage = _stage(
-        StageKind.PAIR_RATE,
-        (
-            MethodDeps(
-                equation_name="PressureAcceleration",
-                method_kind=MethodKind.LOOP,
-                dest="fluid",
-                sources=("fluid",),
-                dest_reads=frozenset(("au", "p", "rho")),
-                source_reads=frozenset(("p", "rho", "m")),
-                dest_writes=frozenset(("au",)),
-                source_writes=frozenset(),
-                precomputed_symbols=frozenset(("DWIJ",)),
-                precomputed_writes=frozenset(),
-                unsupported_reasons=(),
-                dest_reduction_writes=frozenset(),
-                dest_max_reduction_writes=frozenset(),
-                dest_reduction_reads=frozenset(),
-            ),
-        ),
-    )
-
-    outline = codegen.generate_resident_hbucket_pair_window_outline_from_equations(
-        "plan0",
-        (first_stage, second_stage),
-        ((add_mass,), (pressure,)),
-        (
-            CudaPairPrecompute(symbols=frozenset(), helper_source="", lines=()),
-            cubic_spline_gradient_precompute(np.int32(1)),
-        ),
-    )
-
-    assert outline.name == "fused_plan0_fluid_resident_hbucket_pair_window"
-    assert "#include <cooperative_groups.h>" in outline.source
-    assert (
-        "cooperative_groups::grid_group grid = cooperative_groups::this_grid();"
-        in outline.source
-    )
-    assert (
-        "for (int dst = blockIdx.x * blockDim.x + threadIdx.x; dst < n; dst += blockDim.x * gridDim.x)"
-    ) in outline.source
-    barrier = outline.source.index("grid.sync();")
-    first_call = outline.source.rindex("AddMass_loop", 0, barrier)
-    second_call = outline.source.index("PressureAcceleration_loop", barrier)
-    assert first_call < barrier < second_call
-
 def test_fused_stage_backend_launches_group_once_and_skips_legacy_calls():
     from pysph.sph.fused_cuda_stage_backend import FusedCudaStageBackend
 
@@ -1136,242 +1156,6 @@ def test_fused_stage_backend_launches_group_once_and_skips_legacy_calls():
     assert backend.launched == [(StageKind.PAIR_RATE, (0, -1), ("t", "dt"))]
     assert not backend.end_compute("evaluator", 0.0, 0.1)
 
-
-def test_fused_stage_backend_launches_resident_rhs_window_from_first_group():
-    from pysph.sph.fused_cuda_stage_backend import FusedCudaStageBackend
-
-    class RecordingBackend(FusedCudaStageBackend):
-        def __init__(self, helper):
-            super().__init__(helper)
-            self.launched = []
-            self.windows = []
-
-        def _launch_stage(self, evaluator, stage, info, extra_args):
-            self.launched.append((stage.kind, info["stage_group"], tuple(extra_args)))
-
-        def _launch_resident_window(self, evaluator, stage_indices, extra_args):
-            stages = tuple(
-                self.helper.cuda_stage_plan.stages[index] for index in stage_indices
-            )
-            infos = tuple(
-                self._kernel_info_for_plan_stage_index(index) for index in stage_indices
-            )
-            self.windows.append(
-                (
-                    tuple(stage.kind for stage in stages),
-                    tuple(info["stage_group"] for info in infos),
-                )
-            )
-            super()._launch_resident_window(evaluator, stage_indices, extra_args)
-
-    density_stage = _stage(
-        StageKind.PAIR_DENSITY,
-        (_deps("Density", MethodKind.LOOP),),
-    )
-    eos_stage = _stage(
-        StageKind.POINTWISE,
-        (_deps("EOS", MethodKind.LOOP),),
-    )
-    rate_stage = _stage(
-        StageKind.PAIR_RATE,
-        (_deps("Rate", MethodKind.LOOP),),
-    )
-    helper = SimpleNamespace(
-        cuda_stage_plan=CudaStagePlan(
-            stages=(density_stage, eos_stage, rate_stage),
-            strict=True,
-        ),
-        calls=(
-            {"type": "kernel", "stage_group": (0, -1)},
-            {"type": "kernel", "stage_group": (1, -1)},
-            {"type": "kernel", "stage_group": (2, -1)},
-        ),
-    )
-    backend = RecordingBackend(helper)
-    backend.begin_compute("evaluator", 0.0, 0.1)
-
-    first = backend.handle_call("evaluator", helper.calls[0], ("t", "dt"), 0.0, 0.1)
-    second = backend.handle_call("evaluator", helper.calls[1], ("t", "dt"), 0.0, 0.1)
-    third = backend.handle_call("evaluator", helper.calls[2], ("t", "dt"), 0.0, 0.1)
-
-    assert first
-    assert second
-    assert third
-    assert backend.windows == [
-        (
-            (StageKind.PAIR_DENSITY, StageKind.POINTWISE, StageKind.PAIR_RATE),
-            ((0, -1), (1, -1), (2, -1)),
-        )
-    ]
-    assert backend.launched == [
-        (StageKind.PAIR_DENSITY, (0, -1), ("t", "dt")),
-        (StageKind.POINTWISE, (1, -1), ("t", "dt")),
-        (StageKind.PAIR_RATE, (2, -1), ("t", "dt")),
-    ]
-
-
-def test_fused_stage_backend_launches_cooperative_pair_window_from_resident_window():
-    from pysph.sph.fused_cuda_stage_backend import FusedCudaStageBackend
-
-    class RecordingBackend(FusedCudaStageBackend):
-        def __init__(self, helper):
-            super().__init__(helper)
-            self.launched = []
-            self.cooperative_windows = []
-
-        def _launch_stage(self, evaluator, stage, info, extra_args):
-            self.launched.append((stage.kind, info["stage_group"], tuple(extra_args)))
-
-        def _launch_cooperative_grid_sync_window(
-            self, evaluator, stage_indices, extra_args
-        ):
-            infos = tuple(
-                self._kernel_info_for_plan_stage_index(index) for index in stage_indices
-            )
-            self.cooperative_windows.append(
-                (
-                    stage_indices,
-                    tuple(info["stage_group"] for info in infos),
-                    tuple(extra_args),
-                )
-            )
-
-    first_method = MethodDeps(
-        equation_name="Predict",
-        method_kind=MethodKind.LOOP,
-        dest="fluid",
-        sources=("fluid",),
-        dest_reads=frozenset(),
-        source_reads=frozenset(),
-        dest_writes=frozenset(("u",)),
-        source_writes=frozenset(),
-        precomputed_symbols=frozenset(),
-        precomputed_writes=frozenset(),
-        unsupported_reasons=(),
-        dest_reduction_writes=frozenset(),
-        dest_max_reduction_writes=frozenset(),
-        dest_reduction_reads=frozenset(),
-    )
-    second_method = MethodDeps(
-        equation_name="Rate",
-        method_kind=MethodKind.LOOP,
-        dest="fluid",
-        sources=("fluid",),
-        dest_reads=frozenset(),
-        source_reads=frozenset(("u",)),
-        dest_writes=frozenset(("au",)),
-        source_writes=frozenset(),
-        precomputed_symbols=frozenset(),
-        precomputed_writes=frozenset(),
-        unsupported_reasons=(),
-        dest_reduction_writes=frozenset(),
-        dest_max_reduction_writes=frozenset(),
-        dest_reduction_reads=frozenset(),
-    )
-    first_stage = _stage(StageKind.PAIR_RATE, (first_method,))
-    second_stage = _stage(StageKind.PAIR_RATE, (second_method,))
-    helper = SimpleNamespace(
-        cuda_stage_plan=CudaStagePlan(
-            stages=(first_stage, second_stage),
-            strict=True,
-        ),
-        calls=(
-            {"type": "kernel", "stage_group": (0, -1)},
-            {"type": "kernel", "stage_group": (1, -1)},
-        ),
-    )
-    backend = RecordingBackend(helper)
-    backend.begin_compute("evaluator", 0.0, 0.1)
-
-    first = backend.handle_call("evaluator", helper.calls[0], ("t", "dt"), 0.0, 0.1)
-    second = backend.handle_call("evaluator", helper.calls[1], ("t", "dt"), 0.0, 0.1)
-
-    assert first
-    assert second
-    assert backend.cooperative_windows == [((0, 1), ((0, -1), (1, -1)), ("t", "dt"))]
-    assert backend.launched == []
-
-
-def test_fused_stage_backend_launches_source_inline_precompute_window_from_resident_window():
-    from pysph.sph.fused_cuda_stage_backend import FusedCudaStageBackend
-
-    class RecordingBackend(FusedCudaStageBackend):
-        def __init__(self, helper):
-            super().__init__(helper)
-            self.launched = []
-            self.inline_windows = []
-
-        def _launch_stage(self, evaluator, stage, info, extra_args):
-            self.launched.append((stage.kind, info["stage_group"], tuple(extra_args)))
-
-        def _launch_cooperative_grid_sync_window(
-            self, evaluator, stage_indices, extra_args
-        ):
-            infos = tuple(
-                self._kernel_info_for_plan_stage_index(index) for index in stage_indices
-            )
-            self.inline_windows.append(
-                (
-                    stage_indices,
-                    tuple(info["stage_group"] for info in infos),
-                    tuple(extra_args),
-                )
-            )
-
-    prep_method = MethodDeps(
-        equation_name="PrepPressure",
-        method_kind=MethodKind.LOOP,
-        dest="fluid",
-        sources=(),
-        dest_reads=frozenset(("rho",)),
-        source_reads=frozenset(),
-        dest_writes=frozenset(("p",)),
-        source_writes=frozenset(),
-        precomputed_symbols=frozenset(),
-        precomputed_writes=frozenset(),
-        unsupported_reasons=(),
-        dest_reduction_writes=frozenset(),
-        dest_max_reduction_writes=frozenset(),
-        dest_reduction_reads=frozenset(),
-    )
-    acceleration_method = MethodDeps(
-        equation_name="PressureAcceleration",
-        method_kind=MethodKind.LOOP,
-        dest="fluid",
-        sources=("fluid",),
-        dest_reads=frozenset(("au", "p")),
-        source_reads=frozenset(("p",)),
-        dest_writes=frozenset(("au",)),
-        source_writes=frozenset(),
-        precomputed_symbols=frozenset(),
-        precomputed_writes=frozenset(),
-        unsupported_reasons=(),
-        dest_reduction_writes=frozenset(),
-        dest_max_reduction_writes=frozenset(),
-        dest_reduction_reads=frozenset(),
-    )
-    prep_stage = replace(_stage(StageKind.POINTWISE, (prep_method,)), sources=())
-    rate_stage = _stage(StageKind.PAIR_RATE, (acceleration_method,))
-    helper = SimpleNamespace(
-        cuda_stage_plan=CudaStagePlan(
-            stages=(prep_stage, rate_stage),
-            strict=True,
-        ),
-        calls=(
-            {"type": "kernel", "stage_group": (0, -1)},
-            {"type": "kernel", "stage_group": (1, -1)},
-        ),
-    )
-    backend = RecordingBackend(helper)
-    backend.begin_compute("evaluator", 0.0, 0.1)
-
-    first = backend.handle_call("evaluator", helper.calls[0], ("t", "dt"), 0.0, 0.1)
-    second = backend.handle_call("evaluator", helper.calls[1], ("t", "dt"), 0.0, 0.1)
-
-    assert first
-    assert second
-    assert backend.inline_windows == [((0, 1), ((0, -1), (1, -1)), ("t", "dt"))]
-    assert backend.launched == []
 
 def test_fused_stage_backend_does_not_hoist_when_right_writes_left_source_read():
     from pysph.sph.fused_cuda_stage_backend import FusedCudaStageBackend
@@ -1482,606 +1266,6 @@ def test_fused_stage_backend_does_not_hoist_when_right_writes_left_source_read()
     ]
 
 
-def test_hbucket_source_inline_pair_window_replaces_source_field_reads():
-    from pysph.sph import fused_cuda_codegen as codegen
-
-    prep_method = MethodDeps(
-        equation_name="PrepPressure",
-        method_kind=MethodKind.LOOP,
-        dest="fluid",
-        sources=(),
-        dest_reads=frozenset(("rho",)),
-        source_reads=frozenset(),
-        dest_writes=frozenset(("p",)),
-        source_writes=frozenset(),
-        precomputed_symbols=frozenset(),
-        precomputed_writes=frozenset(),
-        unsupported_reasons=(),
-        dest_reduction_writes=frozenset(),
-        dest_max_reduction_writes=frozenset(),
-        dest_reduction_reads=frozenset(),
-    )
-    diagnostic_method = MethodDeps(
-        equation_name="AddMass",
-        method_kind=MethodKind.LOOP,
-        dest="fluid",
-        sources=("fluid",),
-        dest_reads=frozenset(("au",)),
-        source_reads=frozenset(("m",)),
-        dest_writes=frozenset(("au",)),
-        source_writes=frozenset(),
-        precomputed_symbols=frozenset(),
-        precomputed_writes=frozenset(),
-        unsupported_reasons=(),
-        dest_reduction_writes=frozenset(),
-        dest_max_reduction_writes=frozenset(),
-        dest_reduction_reads=frozenset(),
-    )
-    acceleration_method = MethodDeps(
-        equation_name="PressureAcceleration",
-        method_kind=MethodKind.LOOP,
-        dest="fluid",
-        sources=("fluid",),
-        dest_reads=frozenset(("au", "p", "rho")),
-        source_reads=frozenset(("m", "p", "rho")),
-        dest_writes=frozenset(("au",)),
-        source_writes=frozenset(),
-        precomputed_symbols=frozenset(("DWIJ",)),
-        precomputed_writes=frozenset(),
-        unsupported_reasons=(),
-        dest_reduction_writes=frozenset(),
-        dest_max_reduction_writes=frozenset(),
-        dest_reduction_reads=frozenset(),
-    )
-    left_stage = _stage(StageKind.PAIR_RATE, (prep_method, diagnostic_method))
-    right_stage = _stage(StageKind.PAIR_RATE, (acceleration_method,))
-    precomputes = (
-        CudaPairPrecompute(symbols=frozenset(), helper_source="", lines=()),
-        cubic_spline_gradient_precompute(np.int32(1)),
-    )
-
-    outline = codegen.generate_hbucket_source_inline_pair_window_outline_from_equations(
-        "plan0",
-        (left_stage, right_stage),
-        (
-            (
-                PrepPressure(dest="fluid", sources=None),
-                AddMass(dest="fluid", sources=["fluid"]),
-            ),
-            (PressureAcceleration(dest="fluid", sources=["fluid"]),),
-        ),
-        precomputes,
-        (prep_method,),
-    )
-
-    assert "PrepPressure_loop(prep_pressure0, dst, d_p, d_rho);" in outline.source
-    assert "float fused_inline_s_p[1];" in outline.source
-    assert "float fused_inline_s_rho[1];" in outline.source
-    assert "fused_inline_s_rho[0] = s_rho[src];" in outline.source
-    assert (
-        "PrepPressure_loop(prep_pressure0, 0, fused_inline_s_p, fused_inline_s_rho);"
-        in outline.source
-    )
-    assert "PressureAcceleration_loop_source_inline" in outline.source
-    assert "fused_inline_s_p_value" in outline.source
-    assert "s_p[s_idx]" not in outline.source
-
-
-def test_hbucket_source_inline_pair_window_accepts_pointwise_producer():
-    from pysph.sph import fused_cuda_codegen as codegen
-
-    prep_method = MethodDeps(
-        equation_name="PrepPressure",
-        method_kind=MethodKind.LOOP,
-        dest="fluid",
-        sources=(),
-        dest_reads=frozenset(("rho",)),
-        source_reads=frozenset(),
-        dest_writes=frozenset(("p",)),
-        source_writes=frozenset(),
-        precomputed_symbols=frozenset(),
-        precomputed_writes=frozenset(),
-        unsupported_reasons=(),
-        dest_reduction_writes=frozenset(),
-        dest_max_reduction_writes=frozenset(),
-        dest_reduction_reads=frozenset(),
-    )
-    acceleration_method = MethodDeps(
-        equation_name="PressureAcceleration",
-        method_kind=MethodKind.LOOP,
-        dest="fluid",
-        sources=("fluid",),
-        dest_reads=frozenset(("au", "p", "rho")),
-        source_reads=frozenset(("m", "p", "rho")),
-        dest_writes=frozenset(("au",)),
-        source_writes=frozenset(),
-        precomputed_symbols=frozenset(("DWIJ",)),
-        precomputed_writes=frozenset(),
-        unsupported_reasons=(),
-        dest_reduction_writes=frozenset(),
-        dest_max_reduction_writes=frozenset(),
-        dest_reduction_reads=frozenset(),
-    )
-    producer_stage = replace(
-        _stage(StageKind.POINTWISE, (prep_method,)),
-        sources=(),
-    )
-    consumer_stage = _stage(StageKind.PAIR_RATE, (acceleration_method,))
-    precomputes = (
-        CudaPairPrecompute(symbols=frozenset(), helper_source="", lines=()),
-        cubic_spline_gradient_precompute(np.int32(1)),
-    )
-
-    outline = codegen.generate_hbucket_source_inline_pair_window_outline_from_equations(
-        "plan0",
-        (producer_stage, consumer_stage),
-        (
-            (PrepPressure(dest="fluid", sources=None),),
-            (PressureAcceleration(dest="fluid", sources=["fluid"]),),
-        ),
-        precomputes,
-        (prep_method,),
-    )
-
-    assert "PrepPressure_loop(prep_pressure0, dst, d_p, d_rho);" in outline.source
-    assert "float fused_inline_s_p[1];" in outline.source
-    assert "float fused_inline_s_rho[1];" in outline.source
-    assert "fused_inline_s_rho[0] = s_rho[src];" in outline.source
-    assert (
-        "PrepPressure_loop(prep_pressure0, 0, fused_inline_s_p, fused_inline_s_rho);"
-        in outline.source
-    )
-    assert "PressureAcceleration_loop_source_inline" in outline.source
-    assert "s_p[s_idx]" not in outline.source
-
-def test_hbucket_source_inline_pair_window_uses_local_slot_in_precompute():
-    from pysph.sph import fused_cuda_codegen as codegen
-
-    prep_method = MethodDeps(
-        equation_name="SetDensity",
-        method_kind=MethodKind.LOOP,
-        dest="fluid",
-        sources=(),
-        dest_reads=frozenset(),
-        source_reads=frozenset(),
-        dest_writes=frozenset(("rho",)),
-        source_writes=frozenset(),
-        precomputed_symbols=frozenset(),
-        precomputed_writes=frozenset(),
-        unsupported_reasons=(),
-        dest_reduction_writes=frozenset(),
-        dest_max_reduction_writes=frozenset(),
-        dest_reduction_reads=frozenset(),
-    )
-    diagnostic_method = MethodDeps(
-        equation_name="AddMass",
-        method_kind=MethodKind.LOOP,
-        dest="fluid",
-        sources=("fluid",),
-        dest_reads=frozenset(("au",)),
-        source_reads=frozenset(("m",)),
-        dest_writes=frozenset(("au",)),
-        source_writes=frozenset(),
-        precomputed_symbols=frozenset(),
-        precomputed_writes=frozenset(),
-        unsupported_reasons=(),
-        dest_reduction_writes=frozenset(),
-        dest_max_reduction_writes=frozenset(),
-        dest_reduction_reads=frozenset(),
-    )
-    acceleration_method = MethodDeps(
-        equation_name="AccumulateRhoIJ",
-        method_kind=MethodKind.LOOP,
-        dest="fluid",
-        sources=("fluid",),
-        dest_reads=frozenset(("au",)),
-        source_reads=frozenset(("m", "rho")),
-        dest_writes=frozenset(("au",)),
-        source_writes=frozenset(),
-        precomputed_symbols=frozenset(("RHOIJ",)),
-        precomputed_writes=frozenset(),
-        unsupported_reasons=(),
-        dest_reduction_writes=frozenset(),
-        dest_max_reduction_writes=frozenset(),
-        dest_reduction_reads=frozenset(),
-    )
-    left_stage = _stage(StageKind.PAIR_RATE, (prep_method, diagnostic_method))
-    right_stage = _stage(StageKind.PAIR_RATE, (acceleration_method,))
-    precomputes = (
-        CudaPairPrecompute(symbols=frozenset(), helper_source="", lines=()),
-        cubic_spline_pair_precompute_for_symbols(np.int32(1), frozenset(("RHOIJ",))),
-    )
-
-    outline = codegen.generate_hbucket_source_inline_pair_window_outline_from_equations(
-        "plan0",
-        (left_stage, right_stage),
-        (
-            (
-                SetDensity(dest="fluid", sources=None),
-                AddMass(dest="fluid", sources=["fluid"]),
-            ),
-            (AccumulateRhoIJ(dest="fluid", sources=["fluid"]),),
-        ),
-        precomputes,
-        (prep_method,),
-    )
-
-    assert "float fused_inline_s_rho[1];" in outline.source
-    assert "RHOIJ = 0.5f * (d_rho[dst] + fused_inline_s_rho[0]);" in outline.source
-    assert (
-        "RHOIJ = 0.5f * (d_rho[dst] + fused_inline_s_rho_value);" not in outline.source
-    )
-
-
-def test_hbucket_source_inline_pair_window_initializes_read_written_locals():
-    from pysph.sph import fused_cuda_codegen as codegen
-
-    prep_method = MethodDeps(
-        equation_name="PreserveThenSetDensity",
-        method_kind=MethodKind.LOOP,
-        dest="fluid",
-        sources=(),
-        dest_reads=frozenset(("rho",)),
-        source_reads=frozenset(),
-        dest_writes=frozenset(("rho", "rho_sum")),
-        source_writes=frozenset(),
-        precomputed_symbols=frozenset(),
-        precomputed_writes=frozenset(),
-        unsupported_reasons=(),
-        dest_reduction_writes=frozenset(),
-        dest_max_reduction_writes=frozenset(),
-        dest_reduction_reads=frozenset(),
-    )
-    diagnostic_method = MethodDeps(
-        equation_name="AddMass",
-        method_kind=MethodKind.LOOP,
-        dest="fluid",
-        sources=("fluid",),
-        dest_reads=frozenset(("au",)),
-        source_reads=frozenset(("m",)),
-        dest_writes=frozenset(("au",)),
-        source_writes=frozenset(),
-        precomputed_symbols=frozenset(),
-        precomputed_writes=frozenset(),
-        unsupported_reasons=(),
-        dest_reduction_writes=frozenset(),
-        dest_max_reduction_writes=frozenset(),
-        dest_reduction_reads=frozenset(),
-    )
-    acceleration_method = MethodDeps(
-        equation_name="AccumulateRhoIJ",
-        method_kind=MethodKind.LOOP,
-        dest="fluid",
-        sources=("fluid",),
-        dest_reads=frozenset(("au",)),
-        source_reads=frozenset(("m", "rho")),
-        dest_writes=frozenset(("au",)),
-        source_writes=frozenset(),
-        precomputed_symbols=frozenset(("RHOIJ",)),
-        precomputed_writes=frozenset(),
-        unsupported_reasons=(),
-        dest_reduction_writes=frozenset(),
-        dest_max_reduction_writes=frozenset(),
-        dest_reduction_reads=frozenset(),
-    )
-    left_stage = _stage(StageKind.PAIR_RATE, (prep_method, diagnostic_method))
-    right_stage = _stage(StageKind.PAIR_RATE, (acceleration_method,))
-    precomputes = (
-        CudaPairPrecompute(symbols=frozenset(), helper_source="", lines=()),
-        cubic_spline_pair_precompute_for_symbols(np.int32(1), frozenset(("RHOIJ",))),
-    )
-
-    outline = codegen.generate_hbucket_source_inline_pair_window_outline_from_equations(
-        "plan0",
-        (left_stage, right_stage),
-        (
-            (
-                PreserveThenSetDensity(dest="fluid", sources=None),
-                AddMass(dest="fluid", sources=["fluid"]),
-            ),
-            (AccumulateRhoIJ(dest="fluid", sources=["fluid"]),),
-        ),
-        precomputes,
-        (prep_method,),
-    )
-
-    initialization = "fused_inline_s_rho[0] = s_rho[src];"
-    call = "PreserveThenSetDensity_loop(preserve_then_set_density0, 0, fused_inline_s_rho, fused_inline_s_rho_sum);"
-    assert initialization in outline.source
-    assert call in outline.source
-    assert outline.source.index(initialization) < outline.source.index(call)
-
-def test_source_inline_pair_window_status_reports_blocked_window():
-    from pysph.sph.fused_cuda_stage_backend import source_inline_pair_window_status
-
-    prep_method = MethodDeps(
-        equation_name="PrepPressure",
-        method_kind=MethodKind.LOOP,
-        dest="fluid",
-        sources=(),
-        dest_reads=frozenset(("rho",)),
-        source_reads=frozenset(),
-        dest_writes=frozenset(("p",)),
-        source_writes=frozenset(),
-        precomputed_symbols=frozenset(),
-        precomputed_writes=frozenset(),
-        unsupported_reasons=(),
-        dest_reduction_writes=frozenset(),
-        dest_max_reduction_writes=frozenset(),
-        dest_reduction_reads=frozenset(),
-    )
-    diagnostic_method = MethodDeps(
-        equation_name="ReadSourceAcceleration",
-        method_kind=MethodKind.LOOP,
-        dest="fluid",
-        sources=("fluid",),
-        dest_reads=frozenset(("alpha",)),
-        source_reads=frozenset(("au",)),
-        dest_writes=frozenset(("alpha",)),
-        source_writes=frozenset(),
-        precomputed_symbols=frozenset(),
-        precomputed_writes=frozenset(),
-        unsupported_reasons=(),
-        dest_reduction_writes=frozenset(),
-        dest_max_reduction_writes=frozenset(),
-        dest_reduction_reads=frozenset(),
-    )
-    acceleration_method = MethodDeps(
-        equation_name="PressureAcceleration",
-        method_kind=MethodKind.LOOP,
-        dest="fluid",
-        sources=("fluid",),
-        dest_reads=frozenset(("au", "p")),
-        source_reads=frozenset(("p",)),
-        dest_writes=frozenset(("au",)),
-        source_writes=frozenset(),
-        precomputed_symbols=frozenset(),
-        precomputed_writes=frozenset(),
-        unsupported_reasons=(),
-        dest_reduction_writes=frozenset(),
-        dest_max_reduction_writes=frozenset(),
-        dest_reduction_reads=frozenset(),
-    )
-    plan = CudaStagePlan(
-        stages=(
-            _stage(StageKind.PAIR_RATE, (prep_method, diagnostic_method)),
-            _stage(StageKind.PAIR_RATE, (acceleration_method,)),
-        ),
-        strict=True,
-    )
-
-    status = source_inline_pair_window_status(plan, (0, 1))
-
-    assert status["status"] == "blocked"
-
-def test_source_inline_pair_window_blockers_report_prior_source_read_conflict():
-    from pysph.sph.fused_cuda_stage_backend import (
-        source_inline_pair_window_blockers,
-    )
-
-    prep_method = MethodDeps(
-        equation_name="PrepPressure",
-        method_kind=MethodKind.LOOP,
-        dest="fluid",
-        sources=(),
-        dest_reads=frozenset(("rho",)),
-        source_reads=frozenset(),
-        dest_writes=frozenset(("p",)),
-        source_writes=frozenset(),
-        precomputed_symbols=frozenset(),
-        precomputed_writes=frozenset(),
-        unsupported_reasons=(),
-        dest_reduction_writes=frozenset(),
-        dest_max_reduction_writes=frozenset(),
-        dest_reduction_reads=frozenset(),
-    )
-    diagnostic_method = MethodDeps(
-        equation_name="Diagnostic",
-        method_kind=MethodKind.LOOP,
-        dest="fluid",
-        sources=("fluid",),
-        dest_reads=frozenset(("alpha",)),
-        source_reads=frozenset(("au",)),
-        dest_writes=frozenset(("alpha",)),
-        source_writes=frozenset(),
-        precomputed_symbols=frozenset(),
-        precomputed_writes=frozenset(),
-        unsupported_reasons=(),
-        dest_reduction_writes=frozenset(),
-        dest_max_reduction_writes=frozenset(),
-        dest_reduction_reads=frozenset(),
-    )
-    acceleration_method = MethodDeps(
-        equation_name="Acceleration",
-        method_kind=MethodKind.LOOP,
-        dest="fluid",
-        sources=("fluid",),
-        dest_reads=frozenset(("au", "p")),
-        source_reads=frozenset(("p",)),
-        dest_writes=frozenset(("au",)),
-        source_writes=frozenset(),
-        precomputed_symbols=frozenset(),
-        precomputed_writes=frozenset(),
-        unsupported_reasons=(),
-        dest_reduction_writes=frozenset(),
-        dest_max_reduction_writes=frozenset(),
-        dest_reduction_reads=frozenset(),
-    )
-    plan = CudaStagePlan(
-        stages=(
-            _stage(StageKind.PAIR_RATE, (prep_method, diagnostic_method)),
-            _stage(StageKind.PAIR_RATE, (acceleration_method,)),
-        ),
-        strict=True,
-    )
-
-    blockers = source_inline_pair_window_blockers(plan, (0, 1))
-
-    assert blockers == (
-        {
-            "reason": "remaining_left_source_reads_right_writes",
-            "fields": ("au",),
-        },
-    )
-
-
-def test_source_inline_pair_window_blockers_report_non_inline_producer():
-    from pysph.sph.fused_cuda_stage_backend import (
-        source_inline_pair_window_blockers,
-    )
-
-    producer = MethodDeps(
-        equation_name="Producer",
-        method_kind=MethodKind.POST_LOOP,
-        dest="fluid",
-        sources=(),
-        dest_reads=frozenset(("rho",)),
-        source_reads=frozenset(),
-        dest_writes=frozenset(("p",)),
-        source_writes=frozenset(),
-        precomputed_symbols=frozenset(),
-        precomputed_writes=frozenset(),
-        unsupported_reasons=(),
-        dest_reduction_writes=frozenset(),
-        dest_max_reduction_writes=frozenset(),
-        dest_reduction_reads=frozenset(),
-    )
-    consumer = MethodDeps(
-        equation_name="Consumer",
-        method_kind=MethodKind.LOOP,
-        dest="fluid",
-        sources=("fluid",),
-        dest_reads=frozenset(),
-        source_reads=frozenset(("p",)),
-        dest_writes=frozenset(("au",)),
-        source_writes=frozenset(),
-        precomputed_symbols=frozenset(),
-        precomputed_writes=frozenset(),
-        unsupported_reasons=(),
-        dest_reduction_writes=frozenset(),
-        dest_max_reduction_writes=frozenset(),
-        dest_reduction_reads=frozenset(),
-    )
-    plan = CudaStagePlan(
-        stages=(
-            _stage(StageKind.PAIR_RATE, (producer,)),
-            _stage(StageKind.PAIR_RATE, (consumer,)),
-        ),
-        strict=True,
-    )
-
-    blockers = source_inline_pair_window_blockers(plan, (0, 1))
-
-    assert blockers == (
-        {
-            "reason": "producer_not_source_inline",
-            "fields": ("p",),
-        },
-    )
-
-def test_resident_hbucket_pair_window_extra_args_match_codegen_order():
-    from pysph.sph.fused_cuda_stage_backend import (
-        _resident_hbucket_pair_window_extra_args,
-    )
-
-    first = AddMass(dest="fluid", sources=["fluid"])
-    first.var_name = "add_mass0"
-    second = PressureAcceleration(dest="fluid", sources=["fluid"])
-    second.var_name = "pressure0"
-    first_stage = _stage(
-        StageKind.PAIR_RATE,
-        (
-            MethodDeps(
-                equation_name="AddMass",
-                method_kind=MethodKind.LOOP,
-                dest="fluid",
-                sources=("fluid",),
-                dest_reads=frozenset(("au",)),
-                source_reads=frozenset(("m",)),
-                dest_writes=frozenset(("au",)),
-                source_writes=frozenset(),
-                precomputed_symbols=frozenset(),
-                precomputed_writes=frozenset(),
-                unsupported_reasons=(),
-                dest_reduction_writes=frozenset(),
-                dest_max_reduction_writes=frozenset(),
-                dest_reduction_reads=frozenset(),
-            ),
-        ),
-    )
-    second_stage = _stage(
-        StageKind.PAIR_RATE,
-        (
-            MethodDeps(
-                equation_name="PressureAcceleration",
-                method_kind=MethodKind.LOOP,
-                dest="fluid",
-                sources=("fluid",),
-                dest_reads=frozenset(("au", "p", "rho")),
-                source_reads=frozenset(("p", "rho", "m")),
-                dest_writes=frozenset(("au",)),
-                source_writes=frozenset(),
-                precomputed_symbols=frozenset(("DWIJ", "RHOIJ", "VIJ")),
-                precomputed_writes=frozenset(),
-                unsupported_reasons=(),
-                dest_reduction_writes=frozenset(),
-                dest_max_reduction_writes=frozenset(),
-                dest_reduction_reads=frozenset(),
-            ),
-        ),
-    )
-    gpu = SimpleNamespace(
-        au=SimpleNamespace(dev="d_au"),
-        m=SimpleNamespace(dev="d_m"),
-        p=SimpleNamespace(dev="d_p"),
-        rho=SimpleNamespace(dev="d_rho"),
-        x=SimpleNamespace(dev="d_x"),
-        y=SimpleNamespace(dev="d_y"),
-        z=SimpleNamespace(dev="d_z"),
-        h=SimpleNamespace(dev="d_h"),
-        u=SimpleNamespace(dev="d_u"),
-        v=SimpleNamespace(dev="d_v"),
-        w=SimpleNamespace(dev="d_w"),
-    )
-    info = {"dest": SimpleNamespace(gpu=gpu), "src": SimpleNamespace(gpu=gpu)}
-    helper = SimpleNamespace(
-        _gpu_structs={"add_mass0": "add-struct", "pressure0": "pressure-struct"}
-    )
-
-    args = _resident_hbucket_pair_window_extra_args(
-        helper,
-        (first_stage, second_stage),
-        ((first,), (second,)),
-        (info, info),
-        (1.0, 0.1),
-        (
-            CudaPairPrecompute(symbols=frozenset(), helper_source="", lines=()),
-            cubic_spline_pair_precompute_for_symbols(
-                np.int32(1), frozenset(("DWIJ", "RHOIJ", "VIJ"))
-            ),
-        ),
-    )
-
-    assert args[:8] == (
-        "d_u",
-        "d_u",
-        "d_v",
-        "d_v",
-        "d_w",
-        "d_w",
-        "d_rho",
-        "d_rho",
-    )
-    assert args[8:] == (
-        "add-struct",
-        "d_au",
-        "d_m",
-        "pressure-struct",
-        "d_p",
-        "d_p",
-    )
-
-
 def test_ctypes_kernel_argument_cache_reuses_storage_and_updates_values():
     from pysph.sph.fused_cuda_stage_backend import _CtypesKernelArgumentCache
 
@@ -2102,24 +1286,16 @@ def test_ctypes_kernel_argument_cache_reuses_storage_and_updates_values():
     assert second_storage[2].value == np.float32(2.5)
 
 
-def test_cooperative_grid_block_count_is_capped_by_particle_grid(monkeypatch):
+def test_resident_grid_sync_is_disabled_by_default(monkeypatch):
     from pysph.sph import fused_cuda_stage_backend as backend_module
 
     monkeypatch.setattr(backend_module, "_resident_grid_block_count", lambda: 170)
     monkeypatch.setattr(backend_module, "_pair_block_size_for_count", lambda n: 128)
 
-    assert backend_module._cooperative_grid_block_count_for_context(13824) == 108
-    assert backend_module._cooperative_grid_block_count_for_context(1000000) == 170
-
-def test_auto_resident_grid_sync_only_allows_underfilled_particle_grids(
-    monkeypatch,
-):
-    from pysph.sph import fused_cuda_stage_backend as backend_module
-
-    monkeypatch.setattr(backend_module, "_resident_grid_block_count", lambda: 170)
-    monkeypatch.setattr(backend_module, "_pair_block_size_for_count", lambda n: 128)
-
-    assert backend_module._resident_grid_sync_context_allowed(SimpleNamespace(n=13824))
+    assert backend_module._resident_grid_sync_pair_window_policy() == "off"
+    assert not backend_module._resident_grid_sync_context_allowed(
+        SimpleNamespace(n=13824)
+    )
     assert not backend_module._resident_grid_sync_context_allowed(
         SimpleNamespace(n=71688)
     )
@@ -2348,6 +1524,7 @@ def test_fused_stage_backend_uses_convergence_policy_child_stage_indices():
         (StageKind.PAIR_DENSITY, (0, -1), ("t", "dt")),
     ]
 
+
 def test_generated_stage_backend_can_assume_convergence_after_min_iterations():
     from pysph.sph.fused_cuda_stage_backend import GeneratedFusedCudaStageBackend
 
@@ -2471,10 +1648,12 @@ def test_generated_stage_backend_handles_outer_nnps_update():
 
     assert backend.handle_outer_update_nnps("integrator", 0)
 
+
 def test_fused_stage_backend_fast_math_options_are_fixed_on():
     from pysph.sph import fused_cuda_stage_backend as backend_module
 
     assert backend_module._source_module_options() == ("--use_fast_math",)
+
 
 def test_fused_stage_backend_skips_legacy_groups_covered_by_merged_stage():
     from pysph.sph.fused_cuda_stage_backend import FusedCudaStageBackend
@@ -3526,6 +2705,75 @@ def test_cuda_hbucket_cubic_gradient_kernel_matches_cubic_bruteforce():
     np.testing.assert_allclose(
         got, np.asarray(expected, dtype=np.float32), rtol=2.0e-6, atol=2.0e-6
     )
+
+
+def test_cuda_cell_tile_hbucket_add_mass_matches_hbucket():
+    cuda = require_cuda()
+    import pycuda.gpuarray as gpuarray
+    from pycuda.compiler import SourceModule
+
+    lower = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    upper = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+    periodic = np.array([True, True, True], dtype=np.bool_)
+    rng = np.random.default_rng(20260705)
+    n = 4096
+    xyz = rng.random((n, 3), dtype=np.float32)
+    mass = rng.random(n, dtype=np.float32)
+    h = np.full(n, 0.06, dtype=np.float32)
+    stream = cuda.Stream()
+    d_x = gpuarray.to_gpu_async(xyz[:, 0], stream=stream)
+    d_y = gpuarray.to_gpu_async(xyz[:, 1], stream=stream)
+    d_z = gpuarray.to_gpu_async(xyz[:, 2], stream=stream)
+    d_h = gpuarray.to_gpu_async(h, stream=stream)
+    d_mass = gpuarray.to_gpu_async(mass, stream=stream)
+    d_old = gpuarray.to_gpu_async(np.zeros(n, dtype=np.float32), stream=stream)
+    d_new = gpuarray.to_gpu_async(np.zeros(n, dtype=np.float32), stream=stream)
+    context = build_fused_cuda_hbucket_context_with_workspace(
+        d_x,
+        d_y,
+        d_z,
+        d_h,
+        n,
+        lower,
+        upper,
+        periodic,
+        np.float32(2.0),
+        4,
+        stream,
+        FusedCudaNeighborWorkspace(),
+        [],
+    )
+    deps = replace(
+        _deps("AddMass", MethodKind.LOOP),
+        source_reads=frozenset(("m",)),
+        dest_reads=frozenset(("au",)),
+        dest_writes=frozenset(("au",)),
+        dest_reduction_writes=frozenset(("au",)),
+        dest_reduction_reads=frozenset(("au",)),
+    )
+    stage = _stage(StageKind.PAIR_RATE, (deps,))
+    equation = AddMass(dest="fluid", sources=["fluid"])
+    precompute = CudaPairPrecompute(symbols=frozenset(), helper_source="", lines=())
+    old_outline = generate_hbucket_pair_stage_outline_from_equations(
+        "old", stage, (equation,), precompute
+    )
+    new_outline = generate_cell_tile_hbucket_pair_stage_outline_from_equations(
+        "new", stage, (equation,), precompute
+    )
+    old_module = SourceModule(old_outline.source, no_extern_c=True)
+    new_module = SourceModule(new_outline.source, no_extern_c=True)
+
+    launch_hbucket_pair_kernel_with_context(
+        old_module, old_outline.name, context, (np.uintp(0), d_old, d_mass)
+    )
+    launch_cell_tile_hbucket_pair_kernel_with_context(
+        new_module, new_outline.name, context, (np.uintp(0), d_new, d_mass)
+    )
+    got = d_new.get_async(stream=stream)
+    expected = d_old.get_async(stream=stream)
+    stream.synchronize()
+
+    np.testing.assert_allclose(got, expected, rtol=0.0, atol=0.0)
 
 
 def test_cuda_summation_density_wij_kernel_matches_quintic_bruteforce():
