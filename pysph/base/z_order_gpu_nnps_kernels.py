@@ -80,6 +80,7 @@ def map_cid_to_idx(i, x, y, z, num_particles, cell_size, xmin, ymin, zmin,
 
     nbr_boxes_length = neighbor_boxes(c[0], c[1], c[2], nbr_boxes)
 
+    j = declare('int')
     for j in range(nbr_boxes_length):
         key = nbr_boxes[j]
         idx = find_idx(keys, num_particles, key)

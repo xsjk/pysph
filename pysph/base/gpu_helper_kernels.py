@@ -1,4 +1,4 @@
-from compyle.api import annotate, Elementwise
+from compyle.api import annotate, Elementwise, cast
 from compyle.parallel import Scan
 from math import floor
 from pytools import memoize
@@ -36,9 +36,9 @@ def norm2(x, y, z):
 
 @annotate
 def find_cell_id(x, y, z, h, c):
-    c[0] = floor((x) / h)
-    c[1] = floor((y) / h)
-    c[2] = floor((z) / h)
+    c[0] = cast(floor(x / h), "int")
+    c[1] = cast(floor(y / h), "int")
+    c[2] = cast(floor(z / h), "int")
 
 
 @annotate(p='ulong', return_='ulong')
@@ -118,6 +118,7 @@ def neighbor_boxes(c_x, c_y, c_z, nbr_boxes):
     nbr_boxes[0] = interleave3(c_x, c_y, c_z)
 
     key = declare('ulong')
+    j, k, m = declare('int', 3)
     for j in range(-1, 2):
         for k in range(-1, 2):
             for m in range(-1, 2):
