@@ -18,9 +18,11 @@ import itertools
 import numpy
 from textwrap import dedent, wrap
 
+from compyle.ast_utils import get_unknown_names_and_calls
 from compyle.api import (CythonGenerator, KnownType,
                          OpenCLConverter, get_symbols)
-from compyle.translator import CUDAConverter
+from compyle.translator import CUDAConverter, literal_to_float
+from compyle.transpiler import CY_BUILTIN_SYMBOLS, OCL_BUILTIN_SYMBOLS
 from compyle.config import get_config
 from pysph.base.utils import is_overloaded_method
 
@@ -389,6 +391,51 @@ def get_init_args(obj, method, ignore=None):
     keys = [k for k in spec.args[1:] if k not in ignore and k in obj.__dict__]
     args = ['%s=%r' % (k, getattr(obj, k)) for k in keys]
     return args
+
+
+def _get_module_constants(equations, hook_methods, backend):
+    ignore = CY_BUILTIN_SYMBOLS if backend == 'cython' \
+        else OCL_BUILTIN_SYMBOLS
+    result = OrderedDict()
+    for equation in equations:
+        for method_name in hook_methods:
+            if _has_overloaded_method(equation, method_name):
+                method = getattr(equation, method_name)
+                code = dedent(''.join(inspect.getsourcelines(method)[0]))
+                names, _calls = get_unknown_names_and_calls(code)
+                if hasattr(method, '__func__'):
+                    func = method.__func__
+                else:
+                    func = method.im_func
+                namespace = func.__globals__
+                for name in sorted(names - ignore):
+                    if name in namespace and isinstance(
+                        namespace[name],
+                        (bool, int, float, numpy.integer, numpy.floating)
+                    ):
+                        if name in result:
+                            assert result[name] == namespace[name]
+                        result[name] = namespace[name]
+    return result
+
+
+def _get_module_constant_declarations(constants, backend):
+    result = []
+    for name, value in constants.items():
+        if backend == 'cython':
+            if isinstance(value, bool):
+                result.append('cdef bint %s = %s' % (name, int(value)))
+            elif isinstance(value, (int, numpy.integer)):
+                result.append('cdef long %s = %s' % (name, value))
+            else:
+                result.append('cdef double %s = %s' % (name, value))
+        else:
+            if isinstance(value, bool):
+                value = int(value)
+            result.append('#define %s %s' % (
+                name, literal_to_float(value, get_config().use_double)
+            ))
+    return '\n'.join(result)
 
 
 ##############################################################################
@@ -899,6 +946,14 @@ class CythonGroup(Group):
             'initialize', 'initialize_pair', 'loop', 'loop_all', 'post_loop',
             'reduce', 'py_initialize'
         )
+        module_constants = _get_module_constants(
+            eqs.values(), hook_methods, 'cython'
+        )
+        declarations = _get_module_constant_declarations(
+            module_constants, 'cython'
+        )
+        if declarations:
+            wrappers.append(declarations)
         for cls in sorted(classes.keys()):
             code_gen.ignore_methods = ['_cython_code_']
             code_gen.ignore_methods.extend(
@@ -985,6 +1040,17 @@ class OpenCLGroup(Group):
             'initialize', 'initialize_pair', 'loop', 'loop_all', 'post_loop',
             'reduce', 'py_initialize'
         )
+        backend = 'cuda' if self._Converter_Class is CUDAConverter else \
+            'opencl'
+        module_constants = _get_module_constants(
+            eqs.values(), hook_methods, backend
+        )
+        declarations = _get_module_constant_declarations(
+            module_constants, backend
+        )
+        if declarations:
+            wrappers.append(declarations)
+            code_gen.add_known(module_constants)
         for cls in sorted(classes.keys()):
             ignore = ['reduce', 'converged']
             ignore.extend(

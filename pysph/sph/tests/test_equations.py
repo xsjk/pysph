@@ -8,7 +8,8 @@ import unittest
 from compyle.api import KnownType
 from pysph.base.utils import is_overloaded_method
 from pysph.sph.equation import (
-    BasicCodeBlock, Context, CythonGroup, Equation, Group, sort_precomputed
+    BasicCodeBlock, Context, CUDAGroup, CythonGroup, Equation, Group,
+    OpenCLGroup, sort_precomputed
 )
 
 
@@ -159,6 +160,18 @@ class Equation2(Equation):
         x += 1
 
 
+MODULE_FLOAT = 0.125
+MODULE_INT = 3
+
+
+class EquationWithModuleConstants(Equation):
+    def initialize(self, d_idx, d_p):
+        d_p[d_idx] = MODULE_FLOAT
+
+    def loop(self, d_idx, s_idx, d_p):
+        d_p[d_idx] += MODULE_FLOAT*MODULE_INT
+
+
 class TestGroup(TestBase):
     def setUp(self):
         from pysph.sph.basic_equations import SummationDensity
@@ -262,6 +275,21 @@ class TestGroup(TestBase):
             ''')
         msg = 'EXPECTED:\n%s\nGOT:\n%s' % (expect, result)
         self.assertEqual(result, expect, msg)
+
+    def test_cython_wrappers_define_module_level_numeric_constants(self):
+        g = CythonGroup([EquationWithModuleConstants('f', ['f'])])
+        result = g.get_equation_wrappers()
+        self.assertIn('cdef double MODULE_FLOAT = 0.125', result)
+        self.assertIn('cdef long MODULE_INT = 3', result)
+
+    def test_gpu_wrappers_define_module_level_numeric_constants(self):
+        for group_cls in (OpenCLGroup, CUDAGroup):
+            g = group_cls([EquationWithModuleConstants('f', ['f'])])
+            result = g.get_equation_wrappers()
+            self.assertIn('#define MODULE_FLOAT 0.125', result)
+            self.assertIn('#define MODULE_INT 3', result)
+            self.assertNotIn('double MODULE_FLOAT;', result)
+            self.assertNotIn('double MODULE_INT;', result)
 
 
 if __name__ == '__main__':
