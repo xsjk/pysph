@@ -164,7 +164,9 @@ class FusedCudaStageBackend:
             at_max_iterations = iter_count == max_iterations
             has_converged = False
             if has_min_iterations and not at_max_iterations:
-                has_converged = self._device_convergence_has_converged(info)
+                has_converged = self._device_convergence_has_converged(
+                    evaluator, info
+                )
             if has_min_iterations and (at_max_iterations or has_converged):
                 self.device_convergence_iteration_counts.append(iter_count)
                 return
@@ -172,7 +174,7 @@ class FusedCudaStageBackend:
                 self.device_convergence_rebuild_count += 1
                 self._update_device_convergence_nnps(evaluator, info)
 
-    def _device_convergence_has_converged(self, info):
+    def _device_convergence_has_converged(self, evaluator, info):
         return False
 
     def _begin_device_convergence_iteration(self, info):
@@ -425,6 +427,7 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
     def handle_update_domain(self, integrator):
         manager = integrator.nnps.domain.manager
         if not manager.minimum_image_periodic:
+            self.stream.synchronize()
             return False
         lower, upper, periodic = _domain_bounds_and_periodicity_from_manager(manager)
         for particle_array in integrator.acceleration_evals[0].particle_arrays:
@@ -445,20 +448,41 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
     def _finish_launched_stage(self, stage):
         if _stage_invalidates_neighbor_context(stage):
             self.neighbor_contexts = {}
+            self._invalidate_neighbor_h_bounds()
 
-    def _device_convergence_has_converged(self, info):
+    def _device_convergence_has_converged(self, evaluator, info):
+        self.stream.synchronize()
+        for equation in info["equations"]:
+            evaluator._sync_from_gpu(equation)
+            if equation.equation_has_converged <= 0:
+                return False
         return True
 
     def _update_device_convergence_nnps(self, evaluator, info):
+        self._refresh_ghost_domain(evaluator)
         self.neighbor_contexts = {}
 
     def handle_internal_update_nnps(self, evaluator):
+        self._refresh_ghost_domain(evaluator)
         self.neighbor_contexts = {}
         return True
 
     def handle_reorder_update_nnps(self, solver):
+        self.stream.synchronize()
         self.neighbor_contexts = {}
-        return True
+        self._invalidate_neighbor_h_bounds()
+        return False
+
+    def _refresh_ghost_domain(self, evaluator):
+        manager = evaluator.nnps.domain.manager
+        if not manager.minimum_image_periodic:
+            self.stream.synchronize()
+            evaluator.nnps.update_domain()
+        self._invalidate_neighbor_h_bounds()
+
+    def _invalidate_neighbor_h_bounds(self):
+        for workspace in self.neighbor_workspaces.values():
+            workspace.invalidate_h_bounds()
 
     def _outline_for_stage(self, stage, equations, precompute, info, traversal):
         stage_group = info["stage_group"]
@@ -953,12 +977,13 @@ def _neighbor_context_for_info(evaluator, info, stream, h_reduce_scratch, worksp
     lower, upper, periodic = _neighbor_context_bounds_and_periodicity(nnps)
     radius_scale = np.float32(nnps.radius_scale)
     nreal = dest.get_number_of_particles(True)
-    return build_fused_cuda_neighbor_context_with_workspace(
+    source_count = dest.get_number_of_particles()
+    context = build_fused_cuda_neighbor_context_with_workspace(
         dest.gpu.x.dev,
         dest.gpu.y.dev,
         dest.gpu.z.dev,
         dest.gpu.h.dev,
-        nreal,
+        source_count,
         lower,
         upper,
         periodic,
@@ -968,6 +993,7 @@ def _neighbor_context_for_info(evaluator, info, stream, h_reduce_scratch, worksp
         workspace,
         h_reduce_scratch,
     )
+    return replace(context, destination_count=nreal)
 
 
 def _neighbor_context_bounds_and_periodicity(nnps):

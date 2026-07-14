@@ -8,40 +8,12 @@ from compyle.config import get_config
 from compyle.array import get_backend, wrap_array, Array
 from compyle.parallel import Elementwise, Scan
 from compyle.api import declare, annotate
-from compyle.types import dtype_to_ctype
-from compyle.template import Template
+from compyle.types import dtype_to_ctype, dtype_to_knowntype
 import compyle.array as array
 import pysph.base.particle_array
 
 
 logger = logging.getLogger()
-
-
-class ExtractParticles(Template):
-    def __init__(self, name, prop_names):
-        super(ExtractParticles, self).__init__(name=name)
-        self.prop_names = prop_names
-
-    def extra_args(self):
-        args = []
-        for prop in self.prop_names:
-            args.append('stride_%s' % prop)
-            args.append('dst_%s' % prop)
-            args.append('src_%s' % prop)
-        return args, {}
-
-    def template(self, i, indices, start_idx):
-        '''
-        idx, s_idx, s_i, j, start = declare('int', 5)
-        idx = indices[i]
-        % for prop in obj.prop_names:
-        s_idx = stride_${prop} * idx
-        s_i = stride_${prop} * i
-        start = stride_${prop} * start_idx
-        for j in range(stride_${prop}):
-            dst_${prop}[start + s_i + j] = src_${prop}[s_idx + j]
-        % endfor
-        '''
 
 
 class DeviceHelper(object):
@@ -63,6 +35,7 @@ class DeviceHelper(object):
         self.properties = []
         self.constants = []
         self._strided_indices_knl = None
+        self.layout_version = 0
 
         for prop, ary in pa.properties.items():
             self.add_prop(prop, ary)
@@ -116,6 +89,7 @@ class DeviceHelper(object):
             stride = self._particle_array.stride.get(prop, 1)
             self._data[prop] = self._data[prop].align(indices.get(stride))
             setattr(self, prop, self._data[prop])
+        self.layout_version += 1
 
     def _make_strided_indices(self, indices_dict):
         '''Takes the indices in a dict assuming that the indices are for a
@@ -220,10 +194,24 @@ class DeviceHelper(object):
         if len(args) == 0:
             args = self._data.keys()
         for arg in args:
-            dev_arr = array.to_device(
-                self._get_array(self._get_prop_or_const(arg)),
-                backend=self.backend)
-            self._data[arg].set_data(dev_arr)
+            host_array = self._get_array(self._get_prop_or_const(arg))
+            device_array = self._data[arg]
+            device_size = len(device_array)
+            if host_array.size >= device_size:
+                device_array.set_data(
+                    array.to_device(host_array, backend=self.backend)
+                )
+                if host_array.size != device_size:
+                    self.layout_version += 1
+            else:
+                assert arg in self.properties
+                stride = (
+                    self._particle_array.stride[arg]
+                    if arg in self._particle_array.stride
+                    else 1
+                )
+                assert host_array.size == self.num_real_particles * stride
+                device_array[:host_array.size] = host_array
             setattr(self, arg, self._data[arg])
 
     def _check_property(self, prop):
@@ -245,6 +233,7 @@ class DeviceHelper(object):
             stride = self._particle_array.stride.get(prop, 1)
             self._data[prop].resize(new_size * stride)
             setattr(self, prop, self._data[prop])
+        self.layout_version += 1
 
     @memoize_method
     def _get_align_kernel_without_strides(self):
@@ -530,6 +519,7 @@ class DeviceHelper(object):
             arr.resize(new_size * stride)
             arr[old_size * stride:] = self._particle_array.default_values.get(prop, 0)
             self.update_prop(prop, arr)
+        self.layout_version += 1
 
     def append_parray(self, parray, align=True, update_constants=False):
         """ Add particles from a particle array
@@ -648,24 +638,36 @@ class DeviceHelper(object):
 
         dest_array.gpu.extend(len(indices))
 
-        args_list = [indices, start_idx]
-
         for prop in prop_names:
             stride = self._particle_array.stride.get(prop, 1)
             src_arr = self._data[prop]
             dst_arr = dest_array.gpu.get_device_array(prop)
-
-            args_list.append(stride)
-            args_list.append(dst_arr)
-            args_list.append(src_arr)
-
-        extract_particles_knl = ExtractParticles('extract_particles_knl',
-                                                 prop_names).function
-        extract_particles_elwise = Elementwise(extract_particles_knl,
-                                               backend=self.backend)
-        extract_particles_elwise(*args_list)
+            start = start_idx * stride
+            size = len(indices) * stride
+            dst_view = dst_arr.get_view(start, size)
+            extract_property = self._get_extract_property_kernel(
+                dst_arr.dtype, indices.dtype
+            )
+            extract_property(dst_view, src_arr, indices, stride)
 
         if align:
             dest_array.gpu.align_particles()
 
         return dest_array
+
+    @memoize_method
+    def _get_extract_property_kernel(self, dtype, index_dtype):
+        def extract_property(i, dst, src, indices, stride):
+            particle, component = declare('int', 2)
+            particle = i / stride
+            component = i % stride
+            dst[i] = src[indices[particle] * stride + component]
+
+        extract_property = annotate(
+            i='int',
+            dst=dtype_to_knowntype(dtype, 'global', self.backend),
+            src=dtype_to_knowntype(dtype, 'global', self.backend),
+            indices=dtype_to_knowntype(index_dtype, 'global', self.backend),
+            stride='int',
+        )(extract_property)
+        return Elementwise(extract_property, backend=self.backend)

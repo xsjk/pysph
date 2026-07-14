@@ -208,7 +208,10 @@ def _generate_hbucket_pair_loop_outline_with_equation_calls(
             "    if (fused_dst_linear >= n) {",
             "        return;",
             "    }",
-            "    int dst = sorted_ids[fused_dst_linear];",
+            (
+                "    int dst = n == source_count ? sorted_ids[fused_dst_linear] "
+                ": fused_dst_linear;"
+            ),
             *segment_lines,
             "}",
             "}",
@@ -252,7 +255,10 @@ def _generate_snapshot_hbucket_pair_window_outline_with_equation_calls(
             "    if (fused_dst_linear >= n) {",
             "        return;",
             "    }",
-            "    int dst = sorted_ids[fused_dst_linear];",
+            (
+                "    int dst = n == source_count ? sorted_ids[fused_dst_linear] "
+                ": fused_dst_linear;"
+            ),
             *segment_lines,
             "}",
             "}",
@@ -727,13 +733,14 @@ def _launch_hbucket_pair_kernel_with_context(
     traversal: str,
 ) -> PairLaunchConfig:
     kernel = module.get_function(kernel_name)
-    block_size = _pair_block_size_for_count(context.n)
-    grid_x = (context.n + block_size - 1) // block_size
+    block_size = _pair_block_size_for_count(context.destination_count)
+    grid_x = (context.destination_count + block_size - 1) // block_size
     kernel(
         _kernel_arg(context.x),
         _kernel_arg(context.y),
         _kernel_arg(context.z),
         _kernel_arg(context.h),
+        np.int32(context.destination_count),
         np.int32(context.n),
         np.float32(context.lower[0]),
         np.float32(context.upper[0]),
@@ -765,7 +772,7 @@ def _launch_hbucket_pair_kernel_with_context(
     )
     return PairLaunchConfig(
         traversal=traversal,
-        n=int(context.n),
+        n=int(context.destination_count),
         block_size=int(block_size),
         grid_x=int(grid_x),
     )
@@ -1623,6 +1630,7 @@ def hbucket_context_argument_declarations() -> tuple[str, ...]:
         "const float *z",
         "const float *h",
         "int n",
+        "int source_count",
         "float xmin",
         "float xmax",
         "float ymin",

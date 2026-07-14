@@ -33,7 +33,7 @@ class GPUDomainManager(DomainManagerBase):
         self.dtype_max = np.finfo(self.dtype).max
         self.backend = get_backend(backend)
 
-        self.ghosts = None
+        self._ghost_layout_versions = None
 
     def _periodic_flags(self):
         return (
@@ -67,6 +67,20 @@ class GPUDomainManager(DomainManagerBase):
             # create new periodic ghosts
             if not self.minimum_image_periodic:
                 self._create_ghosts_periodic()
+
+    def _remove_ghosts(self):
+        versions = tuple(
+            pa_wrapper.pa.gpu.layout_version
+            for pa_wrapper in self.pa_wrappers
+        )
+        if self._ghost_layout_versions != versions:
+            DomainManagerBase._remove_ghosts(self)
+        else:
+            for pa_wrapper in self.pa_wrappers:
+                particle_array = pa_wrapper.pa
+                nreal = particle_array.get_number_of_particles(real=True)
+                particle_array.gpu.resize(nreal)
+        self._ghost_layout_versions = None
 
     def _compute_cell_size_for_binning(self):
         """Compute the cell size for the binning.
@@ -329,7 +343,6 @@ class GPUDomainManager(DomainManagerBase):
         """
         copy_props = self.copy_props
         pa_wrappers = self.pa_wrappers
-        narrays = self.narrays
 
         # cell size used to check for periodic ghosts. For summation density
         # like operations, we need to create two layers of ghost images, this
@@ -352,20 +365,7 @@ class GPUDomainManager(DomainManagerBase):
         scan_knl = self._get_ghosts_scan_kernel()
         translate_knl = self._get_translate_kernel()
 
-        if not self.ghosts:
-            self.ghosts = [paw.pa.empty_clone(props=copy_props[i])
-                           for i, paw in enumerate(pa_wrappers)]
-        else:
-            for ghost_pa in self.ghosts:
-                ghost_pa.resize(0)
-            for i in range(narrays):
-                self.ghosts[i].ensure_properties(
-                    pa_wrappers[i].pa, props=copy_props[i]
-                )
-
         for i, pa_wrapper in enumerate(self.pa_wrappers):
-            ghost_pa = self.ghosts[i]
-
             x = pa_wrapper.pa.gpu.x
             y = pa_wrapper.pa.gpu.y
             z = pa_wrapper.pa.gpu.z
@@ -385,12 +385,23 @@ class GPUDomainManager(DomainManagerBase):
                      ymin=ymin, zmin=zmin, xmax=xmax, ymax=ymax, zmax=zmax,
                      cell_size=cell_size, masks=masks, indices=indices)
 
+            nreal = pa_wrapper.pa.get_number_of_particles(real=True)
             pa_wrapper.pa.extract_particles(
-                indices, ghost_pa, align=False, props=copy_props[i]
+                indices, pa_wrapper.pa, align=False, props=copy_props[i]
+            )
+            gpu = pa_wrapper.pa.gpu
+            translate_knl(
+                gpu.x.get_view(nreal, num_extra_particles),
+                gpu.y.get_view(nreal, num_extra_particles),
+                gpu.z.get_view(nreal, num_extra_particles),
+                gpu.tag.get_view(nreal, num_extra_particles),
+                xtranslate,
+                ytranslate,
+                ztranslate,
+                masks,
             )
 
-            translate_knl(ghost_pa.gpu.x, ghost_pa.gpu.y, ghost_pa.gpu.z,
-                          ghost_pa.gpu.tag, xtranslate, ytranslate,
-                          ztranslate, masks)
-
-            pa_wrapper.pa.append_parray(ghost_pa, align=False)
+        self._ghost_layout_versions = tuple(
+            pa_wrapper.pa.gpu.layout_version
+            for pa_wrapper in pa_wrappers
+        )

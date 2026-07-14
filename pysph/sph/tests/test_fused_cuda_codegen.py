@@ -135,7 +135,10 @@ def test_hbucket_pair_outline_keeps_variable_h_bucket_traversal():
     for declaration in hbucket_context_argument_declarations():
         assert declaration in outline.source
     assert "for (int bucket = 0; bucket < bucket_count; ++bucket)" in outline.source
-    assert "int dst = sorted_ids[fused_dst_linear];" in outline.source
+    assert (
+        "int dst = n == source_count ? sorted_ids[fused_dst_linear] "
+        ": fused_dst_linear;" in outline.source
+    )
     assert "cell_bucket_h_max_bits[flat]" in outline.source
     assert "cell_bucket_starts[flat]" in outline.source
     assert "float fused_acc_d_au = 0.0f;" in outline.source

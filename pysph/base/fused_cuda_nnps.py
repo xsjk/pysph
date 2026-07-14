@@ -658,6 +658,7 @@ class FusedCudaHBucketNeighborContext:
     """Device h-bucket metadata shared by fused CUDA pair stages."""
 
     n: int
+    destination_count: int
     x: object
     y: object
     z: object
@@ -681,6 +682,7 @@ class FusedCudaHBucketNeighborContext:
     def __post_init__(self):
         """Validate the h-bucket metadata contract used by fused kernels."""
         assert self.n > 0
+        assert 0 < self.destination_count <= self.n
         assert self.lower.dtype == np.float32
         assert self.upper.dtype == np.float32
         assert self.periodic.dtype == np.bool_
@@ -783,6 +785,10 @@ class FusedCudaNeighborWorkspace:
         self.hbucket_cell_bucket_h_max_bits = _ensure_gpu_array(
             self.hbucket_cell_bucket_h_max_bits, flat_total, np.uint32
         )
+
+    def invalidate_h_bounds(self) -> None:
+        self.hbucket_h_min_ref = None
+        self.hbucket_h_max_ref = None
 
 
 def build_fused_cuda_neighbor_context_with_workspace(
@@ -1000,6 +1006,7 @@ def _build_fused_cuda_hbucket_context_from_hmin(
     hbucket_build_ms = _finish_event(start, stop, stream)
     return FusedCudaHBucketNeighborContext(
         n=n,
+        destination_count=n,
         x=x,
         y=y,
         z=z,

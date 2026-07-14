@@ -313,15 +313,24 @@ class Solver(object):
     def reorder_particles(self):
         """Re-order particles so as to coalesce memory access.
         """
-        # Refresh the legacy NNPS before and after the reorder.
         backend_handles_update = (
             self._stage_backend_handles_reorder_update_nnps()
         )
         if not backend_handles_update:
+            manager = self.nnps.domain.manager
+            rebuild_ghosts = (
+                manager.is_periodic
+                and not manager.in_parallel
+                and not manager.minimum_image_periodic
+            )
+            if rebuild_ghosts:
+                manager._remove_ghosts()
             self.nnps.update()
         for i in range(len(self.particles)):
             self.nnps.spatially_order_particles(i)
         if not backend_handles_update:
+            if rebuild_ghosts:
+                self.nnps.update_domain()
             self.nnps.update()
 
     def set_adaptive_timestep(self, value):

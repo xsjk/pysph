@@ -120,6 +120,7 @@ def test_brute_force_neighbor_indices_use_max_h_and_strict_cutoff():
 def test_hbucket_context_declares_bucketed_device_metadata():
     context = FusedCudaHBucketNeighborContext(
         n=4,
+        destination_count=4,
         x=FakeDeviceArray("float32"),
         y=FakeDeviceArray("float32"),
         z=FakeDeviceArray("float32"),
@@ -309,6 +310,7 @@ def test_hbucket_work_counter_launches_exact_traversal_kernel(monkeypatch):
     stream = object()
     context = FusedCudaHBucketNeighborContext(
         n=8,
+        destination_count=8,
         x=FakeSizedDeviceArray(8, np.float32),
         y=FakeSizedDeviceArray(8, np.float32),
         z=FakeSizedDeviceArray(8, np.float32),
