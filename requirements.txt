@@ -2,7 +2,6 @@ numpy
 setuptools>=42.0.0
 Cython>=0.20
 cyarray
-compyle>=0.8
+compyle @ git+https://github.com/xsjk/compyle.git
 mako
 pytools
-Beaker

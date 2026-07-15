@@ -683,9 +683,11 @@ def setup_package():
     exec(compile(open(module).read(), module, 'exec'), info)
 
     # The requirements.
+    compyle_url = ' @ git+https://github.com/xsjk/compyle.git'
     install_requires = [
-        'numpy', 'mako', 'cyarray', 'compyle>=0.8', 'Cython>=0.20',
-        'setuptools>=42.0.0', 'pytools', 'Beaker'
+        'numpy', 'mako', 'cyarray',
+        'compyle' + compyle_url, 'Cython>=0.20',
+        'pytools'
     ]
     tests_require = ['pytest>=3.0', 'h5py', 'vtk']
     if sys.version_info[:2] == (2, 6):
@@ -701,7 +703,7 @@ def setup_package():
 
     extras_require = dict(
         mpi=['mpi4py>=1.2', 'pyzoltan'],
-        opencl=['pyopencl'],
+        opencl=['compyle[opencl]' + compyle_url],
         ui=['mayavi>=4.0', 'pyside2', 'h5py'],
         tests=tests_require,
         docs=docs_require,
@@ -712,6 +714,10 @@ def setup_package():
     for dep in extras_require.values():
         everything.update(dep)
     extras_require['all'] = everything
+    extras_require.update(
+        cuda12x=['compyle[cuda12x]' + compyle_url],
+        cuda13x=['compyle[cuda13x]' + compyle_url],
+    )
 
     ext_modules = get_basic_extensions() + get_parallel_extensions()
     if MODE != 'info' and _is_cythonize_default():

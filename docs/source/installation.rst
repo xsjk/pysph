@@ -55,6 +55,16 @@ the development version using::
 
     $ pip install https://github.com/pypr/pysph/zipball/main
 
+GPU dependencies can be selected when installing this repository from Git::
+
+    $ pip install "pysph[cuda12x] @ git+https://github.com/xsjk/pysph.git"
+    $ pip install "pysph[cuda13x] @ git+https://github.com/xsjk/pysph.git"
+    $ pip install "pysph[opencl] @ git+https://github.com/xsjk/pysph.git"
+
+These extras use the latest version from the default branch of the
+``xsjk/compyle`` repository. The ``cuda12x`` and ``cuda13x`` extras are
+mutually exclusive and are not included in the ``all`` extra.
+
 If you wish to track the development of the package, clone the repository (as
 described in :ref:`downloading-pysph` and do the following::
 

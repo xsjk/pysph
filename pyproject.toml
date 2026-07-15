@@ -1,8 +1,7 @@
 [build-system]
 requires = [
-    "Beaker",
     "Cython>=0.20",
-    "compyle>=0.8",
+    "compyle @ git+https://github.com/xsjk/compyle.git",
     "cyarray",
     "mako",
     "numpy>=2.0,<3",
