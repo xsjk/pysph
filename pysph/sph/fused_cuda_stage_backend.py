@@ -14,6 +14,7 @@ from pysph.base.fused_cuda_nnps import (
 from pysph.sph.fused_cuda_codegen import (
     CudaPairPrecompute,
     cubic_spline_pair_precompute_for_symbols,
+    gaussian_pair_precompute_for_symbols,
     generate_hbucket_pair_stage_outline_from_equations,
     generate_snapshot_hbucket_pair_window_outline_from_equations,
     PairLaunchConfig,
@@ -24,6 +25,13 @@ from pysph.sph.fused_cuda_codegen import (
     precompute_argument_names,
     quintic_spline_pair_precompute_for_symbols,
     snapshot_hbucket_pair_window_stage,
+    super_gaussian_pair_precompute_for_symbols,
+    wendland_quintic_c2_1d_pair_precompute_for_symbols,
+    wendland_quintic_c4_1d_pair_precompute_for_symbols,
+    wendland_quintic_c4_pair_precompute_for_symbols,
+    wendland_quintic_c6_1d_pair_precompute_for_symbols,
+    wendland_quintic_c6_pair_precompute_for_symbols,
+    wendland_quintic_pair_precompute_for_symbols,
 )
 from pysph.sph.fused_cuda_stage_plan import (
     MethodKind,
@@ -901,9 +909,45 @@ def _precompute_for_stage(stage, kernel):
         }
     ):
         if kernel_name == "CubicSpline":
+            assert dim in (np.int32(1), np.int32(2), np.int32(3))
             return cubic_spline_pair_precompute_for_symbols(dim, frozenset(symbols))
         if kernel_name == "QuinticSpline":
+            assert dim in (np.int32(1), np.int32(2), np.int32(3))
             return quintic_spline_pair_precompute_for_symbols(dim, frozenset(symbols))
+        if kernel_name == "WendlandQuinticC2_1D":
+            assert dim == np.int32(1)
+            return wendland_quintic_c2_1d_pair_precompute_for_symbols(
+                dim, frozenset(symbols)
+            )
+        if kernel_name == "WendlandQuintic":
+            assert dim in (np.int32(2), np.int32(3))
+            return wendland_quintic_pair_precompute_for_symbols(dim, frozenset(symbols))
+        if kernel_name == "WendlandQuinticC4_1D":
+            assert dim == np.int32(1)
+            return wendland_quintic_c4_1d_pair_precompute_for_symbols(
+                dim, frozenset(symbols)
+            )
+        if kernel_name == "WendlandQuinticC4":
+            assert dim in (np.int32(2), np.int32(3))
+            return wendland_quintic_c4_pair_precompute_for_symbols(
+                dim, frozenset(symbols)
+            )
+        if kernel_name == "WendlandQuinticC6_1D":
+            assert dim == np.int32(1)
+            return wendland_quintic_c6_1d_pair_precompute_for_symbols(
+                dim, frozenset(symbols)
+            )
+        if kernel_name == "WendlandQuinticC6":
+            assert dim in (np.int32(2), np.int32(3))
+            return wendland_quintic_c6_pair_precompute_for_symbols(
+                dim, frozenset(symbols)
+            )
+        if kernel_name == "Gaussian":
+            assert dim in (np.int32(1), np.int32(2), np.int32(3))
+            return gaussian_pair_precompute_for_symbols(dim, frozenset(symbols))
+        if kernel_name == "SuperGaussian":
+            assert dim in (np.int32(1), np.int32(2), np.int32(3))
+            return super_gaussian_pair_precompute_for_symbols(dim, frozenset(symbols))
         assert False
     assert False
 

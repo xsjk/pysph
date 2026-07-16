@@ -477,6 +477,148 @@ def quintic_spline_pair_precompute(dim: np.int32) -> CudaPairPrecompute:
     )
 
 
+def wendland_quintic_c2_1d_pair_precompute_for_symbols(
+    dim: np.int32, symbols: frozenset[str]
+) -> CudaPairPrecompute:
+    """Return FP32 WendlandQuinticC2_1D precompute code for requested symbols."""
+    assert isinstance(dim, np.int32)
+    assert dim == np.int32(1)
+    expanded_symbols = _expanded_cubic_spline_pair_symbols(symbols)
+    return CudaPairPrecompute(
+        symbols=expanded_symbols,
+        helper_source=_kernel_pair_helper_source(
+            expanded_symbols, _WENDLAND_QUINTIC_C2_1D_GRADIENT_HELPER
+        ),
+        lines=_kernel_pair_lines_from_cubic_template(
+            dim, expanded_symbols, "wendland_quintic_c2_1d"
+        ),
+    )
+
+
+def wendland_quintic_pair_precompute_for_symbols(
+    dim: np.int32, symbols: frozenset[str]
+) -> CudaPairPrecompute:
+    """Return FP32 WendlandQuintic precompute code for requested symbols."""
+    assert isinstance(dim, np.int32)
+    assert dim in (np.int32(2), np.int32(3))
+    expanded_symbols = _expanded_cubic_spline_pair_symbols(symbols)
+    return CudaPairPrecompute(
+        symbols=expanded_symbols,
+        helper_source=_kernel_pair_helper_source(
+            expanded_symbols, _WENDLAND_QUINTIC_GRADIENT_HELPER
+        ),
+        lines=_kernel_pair_lines_from_cubic_template(
+            dim, expanded_symbols, "wendland_quintic"
+        ),
+    )
+
+
+def wendland_quintic_c4_1d_pair_precompute_for_symbols(
+    dim: np.int32, symbols: frozenset[str]
+) -> CudaPairPrecompute:
+    """Return FP32 WendlandQuinticC4_1D precompute code for requested symbols."""
+    assert isinstance(dim, np.int32)
+    assert dim == np.int32(1)
+    expanded_symbols = _expanded_cubic_spline_pair_symbols(symbols)
+    return CudaPairPrecompute(
+        symbols=expanded_symbols,
+        helper_source=_kernel_pair_helper_source(
+            expanded_symbols, _WENDLAND_QUINTIC_C4_1D_GRADIENT_HELPER
+        ),
+        lines=_kernel_pair_lines_from_cubic_template(
+            dim, expanded_symbols, "wendland_quintic_c4_1d"
+        ),
+    )
+
+
+def wendland_quintic_c4_pair_precompute_for_symbols(
+    dim: np.int32, symbols: frozenset[str]
+) -> CudaPairPrecompute:
+    """Return FP32 WendlandQuinticC4 precompute code for requested symbols."""
+    assert isinstance(dim, np.int32)
+    assert dim in (np.int32(2), np.int32(3))
+    expanded_symbols = _expanded_cubic_spline_pair_symbols(symbols)
+    return CudaPairPrecompute(
+        symbols=expanded_symbols,
+        helper_source=_kernel_pair_helper_source(
+            expanded_symbols, _WENDLAND_QUINTIC_C4_GRADIENT_HELPER
+        ),
+        lines=_kernel_pair_lines_from_cubic_template(
+            dim, expanded_symbols, "wendland_quintic_c4"
+        ),
+    )
+
+
+def wendland_quintic_c6_1d_pair_precompute_for_symbols(
+    dim: np.int32, symbols: frozenset[str]
+) -> CudaPairPrecompute:
+    """Return FP32 WendlandQuinticC6_1D precompute code for requested symbols."""
+    assert isinstance(dim, np.int32)
+    assert dim == np.int32(1)
+    expanded_symbols = _expanded_cubic_spline_pair_symbols(symbols)
+    return CudaPairPrecompute(
+        symbols=expanded_symbols,
+        helper_source=_kernel_pair_helper_source(
+            expanded_symbols, _WENDLAND_QUINTIC_C6_1D_GRADIENT_HELPER
+        ),
+        lines=_kernel_pair_lines_from_cubic_template(
+            dim, expanded_symbols, "wendland_quintic_c6_1d"
+        ),
+    )
+
+
+def wendland_quintic_c6_pair_precompute_for_symbols(
+    dim: np.int32, symbols: frozenset[str]
+) -> CudaPairPrecompute:
+    """Return FP32 WendlandQuinticC6 precompute code for requested symbols."""
+    assert isinstance(dim, np.int32)
+    assert dim in (np.int32(2), np.int32(3))
+    expanded_symbols = _expanded_cubic_spline_pair_symbols(symbols)
+    return CudaPairPrecompute(
+        symbols=expanded_symbols,
+        helper_source=_kernel_pair_helper_source(
+            expanded_symbols, _WENDLAND_QUINTIC_C6_GRADIENT_HELPER
+        ),
+        lines=_kernel_pair_lines_from_cubic_template(
+            dim, expanded_symbols, "wendland_quintic_c6"
+        ),
+    )
+
+
+def gaussian_pair_precompute_for_symbols(
+    dim: np.int32, symbols: frozenset[str]
+) -> CudaPairPrecompute:
+    """Return FP32 Gaussian precompute code for requested symbols."""
+    assert isinstance(dim, np.int32)
+    assert dim in (np.int32(1), np.int32(2), np.int32(3))
+    expanded_symbols = _expanded_cubic_spline_pair_symbols(symbols)
+    return CudaPairPrecompute(
+        symbols=expanded_symbols,
+        helper_source=_kernel_pair_helper_source(
+            expanded_symbols, _GAUSSIAN_GRADIENT_HELPER
+        ),
+        lines=_kernel_pair_lines_from_cubic_template(dim, expanded_symbols, "gaussian"),
+    )
+
+
+def super_gaussian_pair_precompute_for_symbols(
+    dim: np.int32, symbols: frozenset[str]
+) -> CudaPairPrecompute:
+    """Return FP32 SuperGaussian precompute code for requested symbols."""
+    assert isinstance(dim, np.int32)
+    assert dim in (np.int32(1), np.int32(2), np.int32(3))
+    expanded_symbols = _expanded_cubic_spline_pair_symbols(symbols)
+    return CudaPairPrecompute(
+        symbols=expanded_symbols,
+        helper_source=_kernel_pair_helper_source(
+            expanded_symbols, _SUPER_GAUSSIAN_GRADIENT_HELPER
+        ),
+        lines=_kernel_pair_lines_from_cubic_template(
+            dim, expanded_symbols, "super_gaussian"
+        ),
+    )
+
+
 def _expanded_cubic_spline_pair_symbols(symbols: frozenset[str]) -> frozenset[str]:
     assert symbols.issubset(frozenset(_CUBIC_SPLINE_PAIR_SYMBOL_ORDER))
     expanded = set(symbols)
@@ -522,6 +664,23 @@ def _quintic_spline_pair_helper_source(symbols: frozenset[str]) -> str:
     ):
         return _QUINTIC_SPLINE_GRADIENT_HELPER
     return ""
+
+
+def _kernel_pair_helper_source(symbols: frozenset[str], helper_source: str) -> str:
+    if symbols.intersection(
+        frozenset(("WIJ", "WI", "WJ", "DWIJ", "DWI", "DWJ", "GHI", "GHJ", "GHIJ"))
+    ):
+        return helper_source
+    return ""
+
+
+def _kernel_pair_lines_from_cubic_template(
+    dim: np.int32, symbols: frozenset[str], kernel_name: str
+) -> tuple[str, ...]:
+    return tuple(
+        line.replace("fused_codegen_cubic_spline_", f"fused_codegen_{kernel_name}_")
+        for line in _cubic_spline_pair_lines(dim, symbols)
+    )
 
 
 def _cubic_spline_pair_lines(dim: np.int32, symbols: frozenset[str]) -> tuple[str, ...]:
@@ -2068,7 +2227,7 @@ __device__ float fused_codegen_quintic_spline_wij(float rij, float h, int dim)
         fac = 0.008333333333333333f * h1;
     }
     else if (dim == 2) {
-        fac = 0.004660928796724434f * h1 * h1;
+        fac = 0.00466144184787978f * h1 * h1;
     }
     else if (dim == 3) {
         fac = 0.0026525823848649226f * h1 * h1 * h1;
@@ -2109,7 +2268,7 @@ __device__ float fused_codegen_quintic_spline_dwdq(float rij, float h, int dim)
         fac = 0.008333333333333333f * h1;
     }
     else if (dim == 2) {
-        fac = 0.004660928796724434f * h1 * h1;
+        fac = 0.00466144184787978f * h1 * h1;
     }
     else if (dim == 3) {
         fac = 0.0026525823848649226f * h1 * h1 * h1;
@@ -2169,7 +2328,7 @@ __device__ float fused_codegen_quintic_spline_gradient_h(float rij, float h, int
         fac = 0.008333333333333333f * h1;
     }
     else if (dim == 2) {
-        fac = 0.004660928796724434f * h1 * h1;
+        fac = 0.00466144184787978f * h1 * h1;
     }
     else if (dim == 3) {
         fac = 0.0026525823848649226f * h1 * h1 * h1;
@@ -2202,6 +2361,732 @@ __device__ float fused_codegen_quintic_spline_gradient_h(float rij, float h, int
         dw -= 75.0f * tmp1 * tmp1 * tmp1 * tmp1;
     }
     return -fac * h1 * (dw * q + w * (float)dim);
+}
+"""
+)
+
+
+_WENDLAND_QUINTIC_C2_1D_WIJ_HELPER = r"""
+__device__ float fused_codegen_wendland_quintic_c2_1d_fac(float h1, int dim)
+{
+    float fac = 0.0f;
+    if (dim == 1) {
+        fac = 0.625f * h1;
+    }
+    return fac;
+}
+
+__device__ float fused_codegen_wendland_quintic_c2_1d_wij(
+    float rij,
+    float h,
+    int dim
+)
+{
+    float h1 = 1.0f / h;
+    float q = rij * h1;
+    float fac = fused_codegen_wendland_quintic_c2_1d_fac(h1, dim);
+    float tmp = 1.0f - 0.5f * q;
+    float val = 0.0f;
+    if (q < 2.0f) {
+        val = tmp * tmp * tmp * (1.5f * q + 1.0f);
+    }
+    return val * fac;
+}
+"""
+
+
+_WENDLAND_QUINTIC_C2_1D_GRADIENT_HELPER = (
+    _WENDLAND_QUINTIC_C2_1D_WIJ_HELPER
+    + r"""
+__device__ float fused_codegen_wendland_quintic_c2_1d_dwdq(
+    float rij,
+    float h,
+    int dim
+)
+{
+    float h1 = 1.0f / h;
+    float q = rij * h1;
+    float fac = fused_codegen_wendland_quintic_c2_1d_fac(h1, dim);
+    float tmp = 1.0f - 0.5f * q;
+    float val = 0.0f;
+    if (q < 2.0f && rij > 1.0e-12f) {
+        val = -3.0f * q * tmp * tmp;
+    }
+    return val * fac;
+}
+
+__device__ void fused_codegen_wendland_quintic_c2_1d_gradient(
+    float *grad,
+    const float *xij,
+    float rij,
+    float h,
+    int dim
+)
+{
+    float h1 = 1.0f / h;
+    float tmp = 0.0f;
+    if (rij > 1.0e-12f) {
+        float wdash = fused_codegen_wendland_quintic_c2_1d_dwdq(rij, h, dim);
+        tmp = wdash * h1 / rij;
+    }
+    grad[0] = tmp * xij[0];
+    grad[1] = tmp * xij[1];
+    grad[2] = tmp * xij[2];
+}
+
+__device__ float fused_codegen_wendland_quintic_c2_1d_gradient_h(
+    float rij,
+    float h,
+    int dim
+)
+{
+    float h1 = 1.0f / h;
+    float q = rij * h1;
+    float fac = fused_codegen_wendland_quintic_c2_1d_fac(h1, dim);
+    float tmp = 1.0f - 0.5f * q;
+    float w = 0.0f;
+    float dw = 0.0f;
+    if (q < 2.0f) {
+        w = tmp * tmp * tmp * (1.5f * q + 1.0f);
+        dw = -3.0f * q * tmp * tmp;
+    }
+    return -fac * h1 * (dw * q + w * (float)dim);
+}
+"""
+)
+
+
+_WENDLAND_QUINTIC_WIJ_HELPER = r"""
+__device__ float fused_codegen_wendland_quintic_fac(float h1, int dim)
+{
+    float fac = 0.0f;
+    if (dim == 2) {
+        fac = 0.5570423008216338f * h1 * h1;
+    }
+    else if (dim == 3) {
+        fac = 0.4177817256162253f * h1 * h1 * h1;
+    }
+    return fac;
+}
+
+__device__ float fused_codegen_wendland_quintic_wij(float rij, float h, int dim)
+{
+    float h1 = 1.0f / h;
+    float q = rij * h1;
+    float fac = fused_codegen_wendland_quintic_fac(h1, dim);
+    float tmp = 1.0f - 0.5f * q;
+    float val = 0.0f;
+    if (q < 2.0f) {
+        val = tmp * tmp * tmp * tmp * (2.0f * q + 1.0f);
+    }
+    return val * fac;
+}
+"""
+
+
+_WENDLAND_QUINTIC_GRADIENT_HELPER = (
+    _WENDLAND_QUINTIC_WIJ_HELPER
+    + r"""
+__device__ float fused_codegen_wendland_quintic_dwdq(
+    float rij,
+    float h,
+    int dim
+)
+{
+    float h1 = 1.0f / h;
+    float q = rij * h1;
+    float fac = fused_codegen_wendland_quintic_fac(h1, dim);
+    float tmp = 1.0f - 0.5f * q;
+    float val = 0.0f;
+    if (q < 2.0f && rij > 1.0e-12f) {
+        val = -5.0f * q * tmp * tmp * tmp;
+    }
+    return val * fac;
+}
+
+__device__ void fused_codegen_wendland_quintic_gradient(
+    float *grad,
+    const float *xij,
+    float rij,
+    float h,
+    int dim
+)
+{
+    float h1 = 1.0f / h;
+    float tmp = 0.0f;
+    if (rij > 1.0e-12f) {
+        float wdash = fused_codegen_wendland_quintic_dwdq(rij, h, dim);
+        tmp = wdash * h1 / rij;
+    }
+    grad[0] = tmp * xij[0];
+    grad[1] = tmp * xij[1];
+    grad[2] = tmp * xij[2];
+}
+
+__device__ float fused_codegen_wendland_quintic_gradient_h(
+    float rij,
+    float h,
+    int dim
+)
+{
+    float h1 = 1.0f / h;
+    float q = rij * h1;
+    float fac = fused_codegen_wendland_quintic_fac(h1, dim);
+    float tmp = 1.0f - 0.5f * q;
+    float w = 0.0f;
+    float dw = 0.0f;
+    if (q < 2.0f) {
+        w = tmp * tmp * tmp * tmp * (2.0f * q + 1.0f);
+        dw = -5.0f * q * tmp * tmp * tmp;
+    }
+    return -fac * h1 * (dw * q + w * (float)dim);
+}
+"""
+)
+
+
+_WENDLAND_QUINTIC_C4_1D_WIJ_HELPER = r"""
+__device__ float fused_codegen_wendland_quintic_c4_1d_fac(float h1, int dim)
+{
+    float fac = 0.0f;
+    if (dim == 1) {
+        fac = 0.75f * h1;
+    }
+    return fac;
+}
+
+__device__ float fused_codegen_wendland_quintic_c4_1d_wij(
+    float rij,
+    float h,
+    int dim
+)
+{
+    float h1 = 1.0f / h;
+    float q = rij * h1;
+    float fac = fused_codegen_wendland_quintic_c4_1d_fac(h1, dim);
+    float tmp = 1.0f - 0.5f * q;
+    float val = 0.0f;
+    if (q < 2.0f) {
+        val = tmp * tmp * tmp * tmp * tmp;
+        val *= 2.0f * q * q + 2.5f * q + 1.0f;
+    }
+    return val * fac;
+}
+"""
+
+
+_WENDLAND_QUINTIC_C4_1D_GRADIENT_HELPER = (
+    _WENDLAND_QUINTIC_C4_1D_WIJ_HELPER
+    + r"""
+__device__ float fused_codegen_wendland_quintic_c4_1d_dwdq(
+    float rij,
+    float h,
+    int dim
+)
+{
+    float h1 = 1.0f / h;
+    float q = rij * h1;
+    float fac = fused_codegen_wendland_quintic_c4_1d_fac(h1, dim);
+    float tmp = 1.0f - 0.5f * q;
+    float val = 0.0f;
+    if (q < 2.0f && rij > 1.0e-12f) {
+        val = -3.5f * q * (2.0f * q + 1.0f);
+        val *= tmp * tmp * tmp * tmp;
+    }
+    return val * fac;
+}
+
+__device__ void fused_codegen_wendland_quintic_c4_1d_gradient(
+    float *grad,
+    const float *xij,
+    float rij,
+    float h,
+    int dim
+)
+{
+    float h1 = 1.0f / h;
+    float tmp = 0.0f;
+    if (rij > 1.0e-12f) {
+        float wdash = fused_codegen_wendland_quintic_c4_1d_dwdq(rij, h, dim);
+        tmp = wdash * h1 / rij;
+    }
+    grad[0] = tmp * xij[0];
+    grad[1] = tmp * xij[1];
+    grad[2] = tmp * xij[2];
+}
+
+__device__ float fused_codegen_wendland_quintic_c4_1d_gradient_h(
+    float rij,
+    float h,
+    int dim
+)
+{
+    float h1 = 1.0f / h;
+    float q = rij * h1;
+    float fac = fused_codegen_wendland_quintic_c4_1d_fac(h1, dim);
+    float tmp = 1.0f - 0.5f * q;
+    float w = 0.0f;
+    float dw = 0.0f;
+    if (q < 2.0f) {
+        w = tmp * tmp * tmp * tmp * tmp;
+        w *= 2.0f * q * q + 2.5f * q + 1.0f;
+        dw = -3.5f * q * (2.0f * q + 1.0f);
+        dw *= tmp * tmp * tmp * tmp;
+    }
+    return -fac * h1 * (dw * q + w * (float)dim);
+}
+"""
+)
+
+
+_WENDLAND_QUINTIC_C4_WIJ_HELPER = r"""
+__device__ float fused_codegen_wendland_quintic_c4_fac(float h1, int dim)
+{
+    float fac = 0.0f;
+    if (dim == 2) {
+        fac = 0.716197243913529f * h1 * h1;
+    }
+    else if (dim == 3) {
+        fac = 0.6154820064881891f * h1 * h1 * h1;
+    }
+    return fac;
+}
+
+__device__ float fused_codegen_wendland_quintic_c4_wij(float rij, float h, int dim)
+{
+    float h1 = 1.0f / h;
+    float q = rij * h1;
+    float fac = fused_codegen_wendland_quintic_c4_fac(h1, dim);
+    float tmp = 1.0f - 0.5f * q;
+    float val = 0.0f;
+    if (q < 2.0f) {
+        val = tmp * tmp * tmp * tmp * tmp * tmp;
+        val *= (35.0f / 12.0f) * q * q + 3.0f * q + 1.0f;
+    }
+    return val * fac;
+}
+"""
+
+
+_WENDLAND_QUINTIC_C4_GRADIENT_HELPER = (
+    _WENDLAND_QUINTIC_C4_WIJ_HELPER
+    + r"""
+__device__ float fused_codegen_wendland_quintic_c4_dwdq(
+    float rij,
+    float h,
+    int dim
+)
+{
+    float h1 = 1.0f / h;
+    float q = rij * h1;
+    float fac = fused_codegen_wendland_quintic_c4_fac(h1, dim);
+    float tmp = 1.0f - 0.5f * q;
+    float val = 0.0f;
+    if (q < 2.0f && rij > 1.0e-12f) {
+        val = (-14.0f / 3.0f) * q * (1.0f + 2.5f * q);
+        val *= tmp * tmp * tmp * tmp * tmp;
+    }
+    return val * fac;
+}
+
+__device__ void fused_codegen_wendland_quintic_c4_gradient(
+    float *grad,
+    const float *xij,
+    float rij,
+    float h,
+    int dim
+)
+{
+    float h1 = 1.0f / h;
+    float tmp = 0.0f;
+    if (rij > 1.0e-12f) {
+        float wdash = fused_codegen_wendland_quintic_c4_dwdq(rij, h, dim);
+        tmp = wdash * h1 / rij;
+    }
+    grad[0] = tmp * xij[0];
+    grad[1] = tmp * xij[1];
+    grad[2] = tmp * xij[2];
+}
+
+__device__ float fused_codegen_wendland_quintic_c4_gradient_h(
+    float rij,
+    float h,
+    int dim
+)
+{
+    float h1 = 1.0f / h;
+    float q = rij * h1;
+    float fac = fused_codegen_wendland_quintic_c4_fac(h1, dim);
+    float tmp = 1.0f - 0.5f * q;
+    float w = 0.0f;
+    float dw = 0.0f;
+    if (q < 2.0f) {
+        w = tmp * tmp * tmp * tmp * tmp * tmp;
+        w *= (35.0f / 12.0f) * q * q + 3.0f * q + 1.0f;
+        dw = (-14.0f / 3.0f) * q * (1.0f + 2.5f * q);
+        dw *= tmp * tmp * tmp * tmp * tmp;
+    }
+    return -fac * h1 * (dw * q + w * (float)dim);
+}
+"""
+)
+
+
+_WENDLAND_QUINTIC_C6_1D_WIJ_HELPER = r"""
+__device__ float fused_codegen_wendland_quintic_c6_1d_fac(float h1, int dim)
+{
+    float fac = 0.0f;
+    if (dim == 1) {
+        fac = 0.859375f * h1;
+    }
+    return fac;
+}
+
+__device__ float fused_codegen_wendland_quintic_c6_1d_wij(
+    float rij,
+    float h,
+    int dim
+)
+{
+    float h1 = 1.0f / h;
+    float q = rij * h1;
+    float fac = fused_codegen_wendland_quintic_c6_1d_fac(h1, dim);
+    float tmp = 1.0f - 0.5f * q;
+    float val = 0.0f;
+    if (q < 2.0f) {
+        val = tmp * tmp * tmp * tmp * tmp * tmp * tmp;
+        val *= 2.625f * q * q * q + 4.75f * q * q + 3.5f * q + 1.0f;
+    }
+    return val * fac;
+}
+"""
+
+
+_WENDLAND_QUINTIC_C6_1D_GRADIENT_HELPER = (
+    _WENDLAND_QUINTIC_C6_1D_WIJ_HELPER
+    + r"""
+__device__ float fused_codegen_wendland_quintic_c6_1d_dwdq(
+    float rij,
+    float h,
+    int dim
+)
+{
+    float h1 = 1.0f / h;
+    float q = rij * h1;
+    float fac = fused_codegen_wendland_quintic_c6_1d_fac(h1, dim);
+    float tmp = 1.0f - 0.5f * q;
+    float val = 0.0f;
+    if (q < 2.0f && rij > 1.0e-12f) {
+        val = -0.5f * q * (26.25f * q * q + 27.0f * q + 9.0f);
+        val *= tmp * tmp * tmp * tmp * tmp * tmp;
+    }
+    return val * fac;
+}
+
+__device__ void fused_codegen_wendland_quintic_c6_1d_gradient(
+    float *grad,
+    const float *xij,
+    float rij,
+    float h,
+    int dim
+)
+{
+    float h1 = 1.0f / h;
+    float tmp = 0.0f;
+    if (rij > 1.0e-12f) {
+        float wdash = fused_codegen_wendland_quintic_c6_1d_dwdq(rij, h, dim);
+        tmp = wdash * h1 / rij;
+    }
+    grad[0] = tmp * xij[0];
+    grad[1] = tmp * xij[1];
+    grad[2] = tmp * xij[2];
+}
+
+__device__ float fused_codegen_wendland_quintic_c6_1d_gradient_h(
+    float rij,
+    float h,
+    int dim
+)
+{
+    float h1 = 1.0f / h;
+    float q = rij * h1;
+    float fac = fused_codegen_wendland_quintic_c6_1d_fac(h1, dim);
+    float tmp = 1.0f - 0.5f * q;
+    float w = 0.0f;
+    float dw = 0.0f;
+    if (q < 2.0f) {
+        w = tmp * tmp * tmp * tmp * tmp * tmp * tmp;
+        w *= 2.625f * q * q * q + 4.75f * q * q + 3.5f * q + 1.0f;
+        dw = -0.5f * q * (26.25f * q * q + 27.0f * q + 9.0f);
+        dw *= tmp * tmp * tmp * tmp * tmp * tmp;
+    }
+    return -fac * h1 * (dw * q + w * (float)dim);
+}
+"""
+)
+
+
+_WENDLAND_QUINTIC_C6_WIJ_HELPER = r"""
+__device__ float fused_codegen_wendland_quintic_c6_fac(float h1, int dim)
+{
+    float fac = 0.0f;
+    if (dim == 2) {
+        fac = 0.886720397226274f * h1 * h1;
+    }
+    else if (dim == 3) {
+        fac = 0.8486191301579575f * h1 * h1 * h1;
+    }
+    return fac;
+}
+
+__device__ float fused_codegen_wendland_quintic_c6_wij(float rij, float h, int dim)
+{
+    float h1 = 1.0f / h;
+    float q = rij * h1;
+    float fac = fused_codegen_wendland_quintic_c6_fac(h1, dim);
+    float tmp = 1.0f - 0.5f * q;
+    float val = 0.0f;
+    if (q < 2.0f) {
+        val = tmp * tmp * tmp * tmp * tmp * tmp * tmp * tmp;
+        val *= 4.0f * q * q * q + 6.25f * q * q + 4.0f * q + 1.0f;
+    }
+    return val * fac;
+}
+"""
+
+
+_WENDLAND_QUINTIC_C6_GRADIENT_HELPER = (
+    _WENDLAND_QUINTIC_C6_WIJ_HELPER
+    + r"""
+__device__ float fused_codegen_wendland_quintic_c6_dwdq(
+    float rij,
+    float h,
+    int dim
+)
+{
+    float h1 = 1.0f / h;
+    float q = rij * h1;
+    float fac = fused_codegen_wendland_quintic_c6_fac(h1, dim);
+    float tmp = 1.0f - 0.5f * q;
+    float val = 0.0f;
+    if (q < 2.0f && rij > 1.0e-12f) {
+        val = -5.5f * q * (1.0f + 3.5f * q + 4.0f * q * q);
+        val *= tmp * tmp * tmp * tmp * tmp * tmp * tmp;
+    }
+    return val * fac;
+}
+
+__device__ void fused_codegen_wendland_quintic_c6_gradient(
+    float *grad,
+    const float *xij,
+    float rij,
+    float h,
+    int dim
+)
+{
+    float h1 = 1.0f / h;
+    float tmp = 0.0f;
+    if (rij > 1.0e-12f) {
+        float wdash = fused_codegen_wendland_quintic_c6_dwdq(rij, h, dim);
+        tmp = wdash * h1 / rij;
+    }
+    grad[0] = tmp * xij[0];
+    grad[1] = tmp * xij[1];
+    grad[2] = tmp * xij[2];
+}
+
+__device__ float fused_codegen_wendland_quintic_c6_gradient_h(
+    float rij,
+    float h,
+    int dim
+)
+{
+    float h1 = 1.0f / h;
+    float q = rij * h1;
+    float fac = fused_codegen_wendland_quintic_c6_fac(h1, dim);
+    float tmp = 1.0f - 0.5f * q;
+    float w = 0.0f;
+    float dw = 0.0f;
+    if (q < 2.0f) {
+        w = tmp * tmp * tmp * tmp * tmp * tmp * tmp * tmp;
+        w *= 4.0f * q * q * q + 6.25f * q * q + 4.0f * q + 1.0f;
+        dw = -5.5f * q * (1.0f + 3.5f * q + 4.0f * q * q);
+        dw *= tmp * tmp * tmp * tmp * tmp * tmp * tmp;
+    }
+    return -fac * h1 * (dw * q + w * (float)dim);
+}
+"""
+)
+
+
+_GAUSSIAN_WIJ_HELPER = r"""
+__device__ float fused_codegen_gaussian_fac(float h1, int dim)
+{
+    float fac = 0.0f;
+    if (dim == 1) {
+        fac = 0.5641895835477563f * h1;
+    }
+    else if (dim == 2) {
+        fac = 0.3183098861837907f * h1 * h1;
+    }
+    else if (dim == 3) {
+        fac = 0.17958712212516656f * h1 * h1 * h1;
+    }
+    return fac;
+}
+
+__device__ float fused_codegen_gaussian_wij(float rij, float h, int dim)
+{
+    float h1 = 1.0f / h;
+    float q = rij * h1;
+    float fac = fused_codegen_gaussian_fac(h1, dim);
+    float val = 0.0f;
+    if (q < 3.0f) {
+        val = expf(-q * q);
+    }
+    return val * fac;
+}
+"""
+
+
+_GAUSSIAN_GRADIENT_HELPER = (
+    _GAUSSIAN_WIJ_HELPER
+    + r"""
+__device__ float fused_codegen_gaussian_dwdq(float rij, float h, int dim)
+{
+    float h1 = 1.0f / h;
+    float q = rij * h1;
+    float fac = fused_codegen_gaussian_fac(h1, dim);
+    float val = 0.0f;
+    if (q < 3.0f && rij > 1.0e-12f) {
+        val = -2.0f * q * expf(-q * q);
+    }
+    return val * fac;
+}
+
+__device__ void fused_codegen_gaussian_gradient(
+    float *grad,
+    const float *xij,
+    float rij,
+    float h,
+    int dim
+)
+{
+    float h1 = 1.0f / h;
+    float tmp = 0.0f;
+    if (rij > 1.0e-12f) {
+        float wdash = fused_codegen_gaussian_dwdq(rij, h, dim);
+        tmp = wdash * h1 / rij;
+    }
+    grad[0] = tmp * xij[0];
+    grad[1] = tmp * xij[1];
+    grad[2] = tmp * xij[2];
+}
+
+__device__ float fused_codegen_gaussian_gradient_h(float rij, float h, int dim)
+{
+    float h1 = 1.0f / h;
+    float q = rij * h1;
+    float fac = fused_codegen_gaussian_fac(h1, dim);
+    float w = 0.0f;
+    float dw = 0.0f;
+    if (q < 3.0f) {
+        w = expf(-q * q);
+        dw = -2.0f * q * w;
+    }
+    return -fac * h1 * (dw * q + w * (float)dim);
+}
+"""
+)
+
+
+_SUPER_GAUSSIAN_WIJ_HELPER = r"""
+__device__ float fused_codegen_super_gaussian_fac(float h1, int dim)
+{
+    float fac = 0.0f;
+    if (dim == 1) {
+        fac = 0.5641895835477563f * h1;
+    }
+    else if (dim == 2) {
+        fac = 0.3183098861837907f * h1 * h1;
+    }
+    else if (dim == 3) {
+        fac = 0.17958712212516656f * h1 * h1 * h1;
+    }
+    return fac;
+}
+
+__device__ float fused_codegen_super_gaussian_wij(float rij, float h, int dim)
+{
+    float h1 = 1.0f / h;
+    float q = rij * h1;
+    float q2 = q * q;
+    float fac = fused_codegen_super_gaussian_fac(h1, dim);
+    float val = 0.0f;
+    if (q < 3.0f) {
+        val = expf(-q2) * (1.0f + 0.5f * (float)dim - q2);
+    }
+    return val * fac;
+}
+"""
+
+
+_SUPER_GAUSSIAN_GRADIENT_HELPER = (
+    _SUPER_GAUSSIAN_WIJ_HELPER
+    + r"""
+__device__ float fused_codegen_super_gaussian_dwdq(
+    float rij,
+    float h,
+    int dim
+)
+{
+    float h1 = 1.0f / h;
+    float q = rij * h1;
+    float q2 = q * q;
+    float fac = fused_codegen_super_gaussian_fac(h1, dim);
+    float val = 0.0f;
+    if (q < 3.0f && rij > 1.0e-12f) {
+        val = q * (2.0f * q2 - (float)dim - 4.0f) * expf(-q2);
+    }
+    return val * fac;
+}
+
+__device__ void fused_codegen_super_gaussian_gradient(
+    float *grad,
+    const float *xij,
+    float rij,
+    float h,
+    int dim
+)
+{
+    float h1 = 1.0f / h;
+    float tmp = 0.0f;
+    if (rij > 1.0e-12f) {
+        float wdash = fused_codegen_super_gaussian_dwdq(rij, h, dim);
+        tmp = wdash * h1 / rij;
+    }
+    grad[0] = tmp * xij[0];
+    grad[1] = tmp * xij[1];
+    grad[2] = tmp * xij[2];
+}
+
+__device__ float fused_codegen_super_gaussian_gradient_h(
+    float rij,
+    float h,
+    int dim
+)
+{
+    float h1 = 1.0f / h;
+    float q = rij * h1;
+    float q2 = q * q;
+    float d = (float)dim;
+    float fac = fused_codegen_super_gaussian_fac(h1, dim);
+    float val = 0.0f;
+    if (q < 3.0f) {
+        val = (-0.5f * d * d + 2.0f * d * q2 - d - 2.0f * q2 * q2
+               + 4.0f * q2) * expf(-q2);
+    }
+    return -fac * h1 * val;
 }
 """
 )
