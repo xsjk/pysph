@@ -955,6 +955,9 @@ def _hbucket_pair_neighbor_traversal_lines(
         "    float dst_y = y[dst];",
         "    float dst_z = z[dst];",
         "    float dst_h = h[dst];",
+        "    float fused_length_x = xmax - xmin;",
+        "    float fused_length_y = ymax - ymin;",
+        "    float fused_length_z = zmax - zmin;",
         "    int base_cx = fused_codegen_clamp_cell(dst_x, xmin, xmax, nx);",
         "    int base_cy = fused_codegen_clamp_cell(dst_y, ymin, ymax, ny);",
         "    int base_cz = fused_codegen_clamp_cell(dst_z, zmin, zmax, nz);",
@@ -964,6 +967,9 @@ def _hbucket_pair_neighbor_traversal_lines(
         "            continue;",
         "        }",
         "        float bucket_support = radius_scale * fmaxf(dst_h, bucket_h);",
+        "        int fused_ix_count = periodic_x ? (int)floorf(bucket_support / fused_length_x + 0.5f) : 0;",
+        "        int fused_iy_count = periodic_y ? (int)floorf(bucket_support / fused_length_y + 0.5f) : 0;",
+        "        int fused_iz_count = periodic_z ? (int)floorf(bucket_support / fused_length_z + 0.5f) : 0;",
         "        int max_x = (int)ceilf(bucket_support / cell_width_x);",
         "        int max_y = (int)ceilf(bucket_support / cell_width_y);",
         "        int max_z = (int)ceilf(bucket_support / cell_width_z);",
@@ -1017,22 +1023,12 @@ def _hbucket_pair_neighbor_traversal_lines(
         "                    int end = begin + cell_bucket_counts[flat];",
         "                    for (int pos = begin; pos < end; ++pos) {",
         "                        int src = sorted_ids[pos];",
-        *_hbucket_pair_support_lines(precompute, "                        "),
-        *tuple(
-            line.replace(
-                "                                        ",
-                "                            ",
-            )
-            for line in precompute_lines
+        *_hbucket_pair_lines(
+            precompute_lines,
+            loop_method_lines,
+            precompute,
+            "                        ",
         ),
-        *tuple(
-            line.replace(
-                "                                        ",
-                "                            ",
-            )
-            for line in loop_method_lines
-        ),
-        "                        }",
         "                    }",
         "                }",
         "            }",
@@ -1279,14 +1275,79 @@ def _hbucket_pair_support_lines(
             f"{indent})) {{",
         )
     return (
-        f"{indent}float XIJ[3];",
-        f"{indent}XIJ[0] = fused_codegen_minimum_image(dst_x - x[src], xmax - xmin, periodic_x);",
-        f"{indent}XIJ[1] = fused_codegen_minimum_image(dst_y - y[src], ymax - ymin, periodic_y);",
-        f"{indent}XIJ[2] = fused_codegen_minimum_image(dst_z - z[src], zmax - zmin, periodic_z);",
-        f"{indent}float R2IJ = XIJ[0] * XIJ[0] + XIJ[1] * XIJ[1] + XIJ[2] * XIJ[2];",
         f"{indent}float src_h = h[src];",
         f"{indent}float fused_support = radius_scale * fmaxf(dst_h, src_h);",
-        f"{indent}if (R2IJ < fused_support * fused_support) {{",
+        f"{indent}float fused_support2 = fused_support * fused_support;",
+        f"{indent}float fused_xij_x = fused_codegen_minimum_image(dst_x - x[src], fused_length_x, periodic_x);",
+        f"{indent}float fused_xij_y = fused_codegen_minimum_image(dst_y - y[src], fused_length_y, periodic_y);",
+        f"{indent}float fused_xij_z = fused_codegen_minimum_image(dst_z - z[src], fused_length_z, periodic_z);",
+        f"{indent}if (fused_ix_count == 0 && fused_iy_count == 0 && fused_iz_count == 0) {{",
+        f"{indent}    float XIJ[3];",
+        f"{indent}    XIJ[0] = fused_xij_x;",
+        f"{indent}    XIJ[1] = fused_xij_y;",
+        f"{indent}    XIJ[2] = fused_xij_z;",
+        f"{indent}    float R2IJ = XIJ[0] * XIJ[0] + XIJ[1] * XIJ[1] + XIJ[2] * XIJ[2];",
+        f"{indent}    if (R2IJ <= fused_support2) {{",
+    )
+
+
+def _hbucket_pair_image_support_lines(indent: str) -> tuple[str, ...]:
+    return (
+        f"{indent}    }}",
+        f"{indent}}} else {{",
+        f"{indent}for (int fused_ix = -fused_ix_count; fused_ix <= fused_ix_count; ++fused_ix) {{",
+        f"{indent}    for (int fused_iy = -fused_iy_count; fused_iy <= fused_iy_count; ++fused_iy) {{",
+        f"{indent}        for (int fused_iz = -fused_iz_count; fused_iz <= fused_iz_count; ++fused_iz) {{",
+        f"{indent}            float XIJ[3];",
+        f"{indent}            XIJ[0] = fused_xij_x + fused_ix * fused_length_x;",
+        f"{indent}            XIJ[1] = fused_xij_y + fused_iy * fused_length_y;",
+        f"{indent}            XIJ[2] = fused_xij_z + fused_iz * fused_length_z;",
+        f"{indent}            float R2IJ = XIJ[0] * XIJ[0] + XIJ[1] * XIJ[1] + XIJ[2] * XIJ[2];",
+        f"{indent}            if (R2IJ <= fused_support2) {{",
+    )
+
+
+def _hbucket_pair_lines(
+    precompute_lines: tuple[str, ...],
+    loop_method_lines: tuple[str, ...],
+    precompute: CudaPairPrecompute,
+    indent: str,
+) -> tuple[str, ...]:
+    body_lines = (
+        *_hbucket_pair_body_lines(precompute_lines, precompute),
+        *_hbucket_pair_body_lines(loop_method_lines, precompute),
+    )
+    lines = (*_hbucket_pair_support_lines(precompute, indent), *body_lines)
+    if _hbucket_pair_reuses_support_distance(precompute):
+        lines = (*lines, *_hbucket_pair_image_support_lines(indent), *body_lines)
+    return (*lines, *_hbucket_pair_support_end_lines(precompute, indent))
+
+
+def _hbucket_pair_body_lines(
+    lines: tuple[str, ...], precompute: CudaPairPrecompute
+) -> tuple[str, ...]:
+    if _hbucket_pair_reuses_support_distance(precompute):
+        return lines
+    return tuple(
+        line.replace(
+            "                                        ",
+            "                            ",
+        )
+        for line in lines
+    )
+
+
+def _hbucket_pair_support_end_lines(
+    precompute: CudaPairPrecompute, indent: str
+) -> tuple[str, ...]:
+    if not _hbucket_pair_reuses_support_distance(precompute):
+        return (f"{indent}}}",)
+    return (
+        f"{indent}            }}",
+        f"{indent}        }}",
+        f"{indent}    }}",
+        f"{indent}}}",
+        f"{indent}}}",
     )
 
 
