@@ -11,644 +11,626 @@ _SCAN_KERNEL = None
 CUDA_SOURCE = r"""
 extern "C" {
 
-	__global__ void fused_reset_hbucket_metadata(
-	    int *cell_bucket_counts,
-	    unsigned int *bucket_h_max_bits,
-	    unsigned int *cell_bucket_h_max_bits,
-	    int flat_total,
-	    int bucket_count
-	)
-	{
-	    int i = blockIdx.x * blockDim.x + threadIdx.x;
-	    if (i < flat_total) {
-	        cell_bucket_counts[i] = 0;
-	        cell_bucket_h_max_bits[i] = 0u;
-	    }
-	    if (i < bucket_count) {
-	        bucket_h_max_bits[i] = 0u;
-	    }
-	}
-
-	__global__ void fused_reduce_max_float(const float *values, int n, float *out)
-	{
-    __shared__ float scratch[256];
-    int tid = threadIdx.x;
-    int i = blockIdx.x * blockDim.x + tid;
-    float value = -3.402823466e+38F;
-    if (i < n) {
-        value = values[i];
-    }
-    scratch[tid] = value;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+    __global__ void fused_reset_hbucket_metadata(
+        int *cell_bucket_counts,
+        unsigned int *bucket_h_max_bits,
+        unsigned int *cell_bucket_h_max_bits,
+        int flat_total,
+        int bucket_count)
+    {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i < flat_total) {
+            cell_bucket_counts[i] = 0;
+            cell_bucket_h_max_bits[i] = 0u;
         }
+        if (i < bucket_count) {
+            bucket_h_max_bits[i] = 0u;
+        }
+    }
+
+    __global__ void fused_reduce_max_float(const float *values, int n, float *out)
+    {
+        __shared__ float scratch[256];
+        int tid = threadIdx.x;
+        int i = blockIdx.x * blockDim.x + tid;
+        float value = -3.402823466e+38F;
+        if (i < n) {
+            value = values[i];
+        }
+        scratch[tid] = value;
         __syncthreads();
-    }
-    if (tid == 0) {
-        out[blockIdx.x] = scratch[0];
-	    }
-	}
-
-	__global__ void fused_reduce_min_float(const float *values, int n, float *out)
-	{
-	    __shared__ float scratch[256];
-	    int tid = threadIdx.x;
-	    int i = blockIdx.x * blockDim.x + tid;
-	    float value = 3.402823466e+38F;
-	    if (i < n) {
-	        value = values[i];
-	    }
-	    scratch[tid] = value;
-	    __syncthreads();
-	    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-	        if (tid < stride) {
-	            scratch[tid] = fminf(scratch[tid], scratch[tid + stride]);
-	        }
-	        __syncthreads();
-	    }
-	    if (tid == 0) {
-	        out[blockIdx.x] = scratch[0];
-	    }
-	}
-
-__global__ void fused_wrap_periodic_xyz(
-    float *x,
-    float *y,
-    float *z,
-    int n,
-    float xmin,
-    float xmax,
-    float ymin,
-    float ymax,
-    float zmin,
-    float zmax,
-    int periodic_x,
-    int periodic_y,
-    int periodic_z
-)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) {
-        return;
-    }
-    if (periodic_x) {
-        float length = xmax - xmin;
-        if (x[i] < xmin) {
-            x[i] += length;
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+            }
+            __syncthreads();
         }
-        if (x[i] > xmax) {
-            x[i] -= length;
+        if (tid == 0) {
+            out[blockIdx.x] = scratch[0];
         }
     }
-    if (periodic_y) {
-        float length = ymax - ymin;
-        if (y[i] < ymin) {
-            y[i] += length;
-        }
-        if (y[i] > ymax) {
-            y[i] -= length;
-        }
-    }
-    if (periodic_z) {
-        float length = zmax - zmin;
-        if (z[i] < zmin) {
-            z[i] += length;
-        }
-        if (z[i] > zmax) {
-            z[i] -= length;
-        }
-    }
-}
 
-__device__ int fused_clamp_cell(float value, float lower, float upper, int count)
-{
-    float span = upper - lower;
-    float rel = (value - lower) / span;
-    int cell = (int)floorf(rel * (float)count);
-    if (cell < 0) {
-        cell = 0;
+    __global__ void fused_reduce_min_float(const float *values, int n, float *out)
+    {
+        __shared__ float scratch[256];
+        int tid = threadIdx.x;
+        int i = blockIdx.x * blockDim.x + tid;
+        float value = 3.402823466e+38F;
+        if (i < n) {
+            value = values[i];
+        }
+        scratch[tid] = value;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                scratch[tid] = fminf(scratch[tid], scratch[tid + stride]);
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            out[blockIdx.x] = scratch[0];
+        }
     }
-    if (cell >= count) {
-        cell = count - 1;
-    }
-    return cell;
-}
 
-__device__ int fused_linear_cell(int cx, int cy, int cz, int nx, int ny)
-{
-    return ((cz * ny) + cy) * nx + cx;
-}
-
-__device__ int fused_wrapped_cell(int cell, int count)
-{
-    if (cell < 0) {
-        return cell + count;
+    __global__ void fused_wrap_periodic_xyz(
+        float *x,
+        float *y,
+        float *z,
+        int n,
+        float xmin,
+        float xmax,
+        float ymin,
+        float ymax,
+        float zmin,
+        float zmax,
+        int periodic_x,
+        int periodic_y,
+        int periodic_z)
+    {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i >= n) {
+            return;
+        }
+        if (periodic_x) {
+            float length = xmax - xmin;
+            if (x[i] < xmin) {
+                x[i] += length;
+            }
+            if (x[i] > xmax) {
+                x[i] -= length;
+            }
+        }
+        if (periodic_y) {
+            float length = ymax - ymin;
+            if (y[i] < ymin) {
+                y[i] += length;
+            }
+            if (y[i] > ymax) {
+                y[i] -= length;
+            }
+        }
+        if (periodic_z) {
+            float length = zmax - zmin;
+            if (z[i] < zmin) {
+                z[i] += length;
+            }
+            if (z[i] > zmax) {
+                z[i] -= length;
+            }
+        }
     }
-    if (cell >= count) {
-        return cell - count;
-    }
-    return cell;
-}
 
-__device__ bool fused_neighbor_cell(
-    int base,
-    int offset,
-    int count,
-    int periodic,
-    int *out
-)
-{
-    int cell = base + offset;
-    if (periodic) {
-        *out = fused_wrapped_cell(cell, count);
+    __device__ int fused_clamp_cell(float value, float lower, float upper, int count)
+    {
+        float span = upper - lower;
+        float rel = (value - lower) / span;
+        int cell = (int)floorf(rel * (float)count);
+        if (cell < 0) {
+            cell = 0;
+        }
+        if (cell >= count) {
+            cell = count - 1;
+        }
+        return cell;
+    }
+
+    __device__ int fused_linear_cell(int cx, int cy, int cz, int nx, int ny)
+    {
+        return ((cz * ny) + cy) * nx + cx;
+    }
+
+    __device__ int fused_wrapped_cell(int cell, int count)
+    {
+        if (cell < 0) {
+            return cell + count;
+        }
+        if (cell >= count) {
+            return cell - count;
+        }
+        return cell;
+    }
+
+    __device__ bool fused_neighbor_cell(
+        int base,
+        int offset,
+        int count,
+        int periodic,
+        int *out)
+    {
+        int cell = base + offset;
+        if (periodic) {
+            *out = fused_wrapped_cell(cell, count);
+            return true;
+        }
+        if (cell < 0 || cell >= count) {
+            return false;
+        }
+        *out = cell;
         return true;
     }
-    if (cell < 0 || cell >= count) {
-        return false;
-    }
-    *out = cell;
-    return true;
-}
 
-__device__ float fused_minimum_image(float delta, float length, int periodic)
-{
-    if (periodic) {
-        float half = 0.5f * length;
-        if (delta > half) {
-            delta -= length;
+    __device__ float fused_minimum_image(float delta, float length, int periodic)
+    {
+        if (periodic) {
+            float half = 0.5f * length;
+            if (delta > half) {
+                delta -= length;
+            }
+            if (delta < -half) {
+                delta += length;
+            }
         }
-        if (delta < -half) {
-            delta += length;
+        return delta;
+    }
+
+    __device__ bool fused_in_support_xyz(
+        int dst,
+        int src,
+        const float *x,
+        const float *y,
+        const float *z,
+        const float *h,
+        float xmin,
+        float xmax,
+        float ymin,
+        float ymax,
+        float zmin,
+        float zmax,
+        int periodic_x,
+        int periodic_y,
+        int periodic_z,
+        float radius_scale)
+    {
+        float dx = x[src] - x[dst];
+        float dy = y[src] - y[dst];
+        float dz = z[src] - z[dst];
+        dx = fused_minimum_image(dx, xmax - xmin, periodic_x);
+        dy = fused_minimum_image(dy, ymax - ymin, periodic_y);
+        dz = fused_minimum_image(dz, zmax - zmin, periodic_z);
+        float dist2 = dx * dx + dy * dy + dz * dz;
+        float support = radius_scale * fmaxf(h[dst], h[src]);
+        return dist2 < support * support;
+    }
+
+    __device__ float fused_axis_cell_distance(
+        float point,
+        int cell,
+        float lower,
+        float upper,
+        float width,
+        int periodic)
+    {
+        float center = lower + ((float)cell + 0.5f) * width;
+        float delta = fused_minimum_image(center - point, upper - lower, periodic);
+        float distance = fabsf(delta) - 0.5f * width;
+        if (distance < 0.0f) {
+            distance = 0.0f;
+        }
+        return distance;
+    }
+
+    __device__ float fused_cell_distance2_to_particle(
+        int cell,
+        int nx,
+        int ny,
+        float px,
+        float py,
+        float pz,
+        float xmin,
+        float xmax,
+        float ymin,
+        float ymax,
+        float zmin,
+        float zmax,
+        int periodic_x,
+        int periodic_y,
+        int periodic_z,
+        float cell_width_x,
+        float cell_width_y,
+        float cell_width_z)
+    {
+        int cx = cell % nx;
+        int tmp = cell / nx;
+        int cy = tmp % ny;
+        int cz = tmp / ny;
+        float dx = fused_axis_cell_distance(
+            px, cx, xmin, xmax, cell_width_x, periodic_x);
+        float dy = fused_axis_cell_distance(
+            py, cy, ymin, ymax, cell_width_y, periodic_y);
+        float dz = fused_axis_cell_distance(
+            pz, cz, zmin, zmax, cell_width_z, periodic_z);
+        return dx * dx + dy * dy + dz * dz;
+    }
+
+    __device__ int fused_hbucket_index(float hi, float h_min, int bucket_count)
+    {
+        float ratio = fmaxf(hi / h_min, 1.0f);
+        if (bucket_count == 1) {
+            return 0;
+        }
+        if (bucket_count == 2) {
+            return ratio < 2.0f ? 0 : 1;
+        }
+        if (bucket_count == 4) {
+            if (ratio < 2.0f) {
+                return 0;
+            }
+            if (ratio < 4.0f) {
+                return 1;
+            }
+            if (ratio < 8.0f) {
+                return 2;
+            }
+            return 3;
+        }
+        int bucket = (int)floorf(log2f(ratio));
+        if (bucket < 0) {
+            bucket = 0;
+        }
+        if (bucket >= bucket_count) {
+            bucket = bucket_count - 1;
+        }
+        return bucket;
+    }
+
+    __global__ void fused_compute_hbucket_ids_counts_xyz(
+        const float *x,
+        const float *y,
+        const float *z,
+        const float *h,
+        int n,
+        const float *lower,
+        const float *upper,
+        float h_min,
+        int bucket_count,
+        int nx,
+        int ny,
+        int nz,
+        int total_cells,
+        int *cell_bucket_counts,
+        int *particle_cell,
+        int *particle_bucket,
+        int *particle_local_index,
+        unsigned int *bucket_h_max_bits,
+        unsigned int *cell_bucket_h_max_bits)
+    {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i < n) {
+            int cx = fused_clamp_cell(x[i], lower[0], upper[0], nx);
+            int cy = fused_clamp_cell(y[i], lower[1], upper[1], ny);
+            int cz = fused_clamp_cell(z[i], lower[2], upper[2], nz);
+            int cell = fused_linear_cell(cx, cy, cz, nx, ny);
+            int bucket = fused_hbucket_index(h[i], h_min, bucket_count);
+            int flat = bucket * total_cells + cell;
+            particle_cell[i] = cell;
+            particle_bucket[i] = bucket;
+            particle_local_index[i] = atomicAdd(&cell_bucket_counts[flat], 1);
+            atomicMax(&bucket_h_max_bits[bucket], __float_as_uint(h[i]));
+            atomicMax(&cell_bucket_h_max_bits[flat], __float_as_uint(h[i]));
         }
     }
-    return delta;
-}
 
-	__device__ bool fused_in_support_xyz(
-    int dst,
-    int src,
-    const float *x,
-    const float *y,
-    const float *z,
-    const float *h,
-    float xmin,
-    float xmax,
-    float ymin,
-    float ymax,
-    float zmin,
-    float zmax,
-    int periodic_x,
-    int periodic_y,
-    int periodic_z,
-    float radius_scale
-)
-{
-    float dx = x[src] - x[dst];
-    float dy = y[src] - y[dst];
-    float dz = z[src] - z[dst];
-    dx = fused_minimum_image(dx, xmax - xmin, periodic_x);
-    dy = fused_minimum_image(dy, ymax - ymin, periodic_y);
-    dz = fused_minimum_image(dz, zmax - zmin, periodic_z);
-    float dist2 = dx * dx + dy * dy + dz * dz;
-	    float support = radius_scale * fmaxf(h[dst], h[src]);
-	    return dist2 < support * support;
-	}
+    __global__ void fused_scatter_hbucket_sorted_particles(
+        int n,
+        int total_cells,
+        const int *particle_cell,
+        const int *particle_bucket,
+        const int *particle_local_index,
+        const int *cell_bucket_starts,
+        int *sorted_ids)
+    {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i < n) {
+            int flat = particle_bucket[i] * total_cells + particle_cell[i];
+            int out = cell_bucket_starts[flat] + particle_local_index[i];
+            sorted_ids[out] = i;
+        }
+    }
 
-	__device__ float fused_axis_cell_distance(
-	    float point,
-	    int cell,
-	    float lower,
-	    float upper,
-	    float width,
-	    int periodic
-	)
-	{
-	    float center = lower + ((float)cell + 0.5f) * width;
-	    float delta = fused_minimum_image(center - point, upper - lower, periodic);
-	    float distance = fabsf(delta) - 0.5f * width;
-	    if (distance < 0.0f) {
-	        distance = 0.0f;
-	    }
-	    return distance;
-	}
+    __global__ void fused_count_neighbors_from_hbucket_context(
+        const float *x,
+        const float *y,
+        const float *z,
+        const float *h,
+        int n,
+        float xmin,
+        float xmax,
+        float ymin,
+        float ymax,
+        float zmin,
+        float zmax,
+        int periodic_x,
+        int periodic_y,
+        int periodic_z,
+        float radius_scale,
+        int nx,
+        int ny,
+        int nz,
+        int total_cells,
+        int bucket_count,
+        float cell_width_x,
+        float cell_width_y,
+        float cell_width_z,
+        const unsigned int *bucket_h_max_bits,
+        const int *cell_bucket_counts,
+        const int *cell_bucket_starts,
+        const int *sorted_ids,
+        int *neighbor_counts)
+    {
+        int dst = blockIdx.x * blockDim.x + threadIdx.x;
+        if (dst >= n) {
+            return;
+        }
+        int base_cx = fused_clamp_cell(x[dst], xmin, xmax, nx);
+        int base_cy = fused_clamp_cell(y[dst], ymin, ymax, ny);
+        int base_cz = fused_clamp_cell(z[dst], zmin, zmax, nz);
+        float dst_h = h[dst];
+        int count = 0;
+        for (int bucket = 0; bucket < bucket_count; ++bucket) {
+            float bucket_h = __uint_as_float(bucket_h_max_bits[bucket]);
+            if (bucket_h <= 0.0f) {
+                continue;
+            }
+            float support = radius_scale * fmaxf(dst_h, bucket_h);
+            float support2 = support * support;
+            int max_x = (int)ceilf(support / cell_width_x);
+            int max_y = (int)ceilf(support / cell_width_y);
+            int max_z = (int)ceilf(support / cell_width_z);
+            int full_x = periodic_x && nx <= 2 * max_x + 1;
+            int full_y = periodic_y && ny <= 2 * max_y + 1;
+            int full_z = periodic_z && nz <= 2 * max_z + 1;
+            int loops_x = full_x ? nx : 2 * max_x + 1;
+            int loops_y = full_y ? ny : 2 * max_y + 1;
+            int loops_z = full_z ? nz : 2 * max_z + 1;
+            for (int iz = 0; iz < loops_z; ++iz) {
+                int cz = iz;
+                if (!full_z) {
+                    int offset = iz - max_z;
+                    if (!fused_neighbor_cell(base_cz, offset, nz, periodic_z, &cz)) {
+                        continue;
+                    }
+                }
+                for (int iy = 0; iy < loops_y; ++iy) {
+                    int cy = iy;
+                    if (!full_y) {
+                        int offset = iy - max_y;
+                        if (!fused_neighbor_cell(base_cy, offset, ny, periodic_y, &cy)) {
+                            continue;
+                        }
+                    }
+                    for (int ix = 0; ix < loops_x; ++ix) {
+                        int cx = ix;
+                        if (!full_x) {
+                            int offset = ix - max_x;
+                            if (!fused_neighbor_cell(base_cx, offset, nx, periodic_x, &cx)) {
+                                continue;
+                            }
+                        }
+                        int cell = fused_linear_cell(cx, cy, cz, nx, ny);
+                        float cell_distance2 = fused_cell_distance2_to_particle(
+                            cell,
+                            nx,
+                            ny,
+                            x[dst],
+                            y[dst],
+                            z[dst],
+                            xmin,
+                            xmax,
+                            ymin,
+                            ymax,
+                            zmin,
+                            zmax,
+                            periodic_x,
+                            periodic_y,
+                            periodic_z,
+                            cell_width_x,
+                            cell_width_y,
+                            cell_width_z);
+                        if (cell_distance2 > support2) {
+                            continue;
+                        }
+                        int flat = bucket * total_cells + cell;
+                        int begin = cell_bucket_starts[flat];
+                        int end = begin + cell_bucket_counts[flat];
+                        for (int pos = begin; pos < end; ++pos) {
+                            int src = sorted_ids[pos];
+                            if (fused_in_support_xyz(
+                                    dst,
+                                    src,
+                                    x,
+                                    y,
+                                    z,
+                                    h,
+                                    xmin,
+                                    xmax,
+                                    ymin,
+                                    ymax,
+                                    zmin,
+                                    zmax,
+                                    periodic_x,
+                                    periodic_y,
+                                    periodic_z,
+                                    radius_scale)) {
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        neighbor_counts[dst] = count;
+    }
 
-	__device__ float fused_cell_distance2_to_particle(
-	    int cell,
-	    int nx,
-	    int ny,
-	    float px,
-	    float py,
-	    float pz,
-	    float xmin,
-	    float xmax,
-	    float ymin,
-	    float ymax,
-	    float zmin,
-	    float zmax,
-	    int periodic_x,
-	    int periodic_y,
-	    int periodic_z,
-	    float cell_width_x,
-	    float cell_width_y,
-	    float cell_width_z
-	)
-	{
-	    int cx = cell % nx;
-	    int tmp = cell / nx;
-	    int cy = tmp % ny;
-	    int cz = tmp / ny;
-	    float dx = fused_axis_cell_distance(
-	        px, cx, xmin, xmax, cell_width_x, periodic_x
-	    );
-	    float dy = fused_axis_cell_distance(
-	        py, cy, ymin, ymax, cell_width_y, periodic_y
-	    );
-	    float dz = fused_axis_cell_distance(
-	        pz, cz, zmin, zmax, cell_width_z, periodic_z
-	    );
-	    return dx * dx + dy * dy + dz * dz;
-	}
-
-	__device__ int fused_hbucket_index(float hi, float h_min, int bucket_count)
-	{
-	    float ratio = fmaxf(hi / h_min, 1.0f);
-	    if (bucket_count == 1) {
-	        return 0;
-	    }
-	    if (bucket_count == 2) {
-	        return ratio < 2.0f ? 0 : 1;
-	    }
-	    if (bucket_count == 4) {
-	        if (ratio < 2.0f) {
-	            return 0;
-	        }
-	        if (ratio < 4.0f) {
-	            return 1;
-	        }
-	        if (ratio < 8.0f) {
-	            return 2;
-	        }
-	        return 3;
-	    }
-	    int bucket = (int)floorf(log2f(ratio));
-	    if (bucket < 0) {
-	        bucket = 0;
-	    }
-	    if (bucket >= bucket_count) {
-	        bucket = bucket_count - 1;
-	    }
-	    return bucket;
-	}
-
-	__global__ void fused_compute_hbucket_ids_counts_xyz(
-	    const float *x,
-	    const float *y,
-	    const float *z,
-	    const float *h,
-	    int n,
-	    const float *lower,
-	    const float *upper,
-	    float h_min,
-	    int bucket_count,
-	    int nx,
-	    int ny,
-	    int nz,
-	    int total_cells,
-	    int *cell_bucket_counts,
-	    int *particle_cell,
-	    int *particle_bucket,
-	    int *particle_local_index,
-	    unsigned int *bucket_h_max_bits,
-	    unsigned int *cell_bucket_h_max_bits
-	)
-	{
-	    int i = blockIdx.x * blockDim.x + threadIdx.x;
-	    if (i < n) {
-	        int cx = fused_clamp_cell(x[i], lower[0], upper[0], nx);
-	        int cy = fused_clamp_cell(y[i], lower[1], upper[1], ny);
-	        int cz = fused_clamp_cell(z[i], lower[2], upper[2], nz);
-	        int cell = fused_linear_cell(cx, cy, cz, nx, ny);
-	        int bucket = fused_hbucket_index(h[i], h_min, bucket_count);
-	        int flat = bucket * total_cells + cell;
-	        particle_cell[i] = cell;
-	        particle_bucket[i] = bucket;
-	        particle_local_index[i] = atomicAdd(&cell_bucket_counts[flat], 1);
-	        atomicMax(&bucket_h_max_bits[bucket], __float_as_uint(h[i]));
-	        atomicMax(&cell_bucket_h_max_bits[flat], __float_as_uint(h[i]));
-	    }
-	}
-
-	__global__ void fused_scatter_hbucket_sorted_particles(
-	    int n,
-	    int total_cells,
-	    const int *particle_cell,
-	    const int *particle_bucket,
-	    const int *particle_local_index,
-	    const int *cell_bucket_starts,
-	    int *sorted_ids
-	)
-	{
-	    int i = blockIdx.x * blockDim.x + threadIdx.x;
-	    if (i < n) {
-	        int flat = particle_bucket[i] * total_cells + particle_cell[i];
-	        int out = cell_bucket_starts[flat] + particle_local_index[i];
-	        sorted_ids[out] = i;
-	    }
-	}
-
-	__global__ void fused_count_neighbors_from_hbucket_context(
-	    const float *x,
-	    const float *y,
-	    const float *z,
-	    const float *h,
-	    int n,
-	    float xmin,
-	    float xmax,
-	    float ymin,
-	    float ymax,
-	    float zmin,
-	    float zmax,
-	    int periodic_x,
-	    int periodic_y,
-	    int periodic_z,
-	    float radius_scale,
-	    int nx,
-	    int ny,
-	    int nz,
-	    int total_cells,
-	    int bucket_count,
-	    float cell_width_x,
-	    float cell_width_y,
-	    float cell_width_z,
-	    const unsigned int *bucket_h_max_bits,
-	    const int *cell_bucket_counts,
-	    const int *cell_bucket_starts,
-	    const int *sorted_ids,
-	    int *neighbor_counts
-	)
-	{
-	    int dst = blockIdx.x * blockDim.x + threadIdx.x;
-	    if (dst >= n) {
-	        return;
-	    }
-	    int base_cx = fused_clamp_cell(x[dst], xmin, xmax, nx);
-	    int base_cy = fused_clamp_cell(y[dst], ymin, ymax, ny);
-	    int base_cz = fused_clamp_cell(z[dst], zmin, zmax, nz);
-	    float dst_h = h[dst];
-	    int count = 0;
-	    for (int bucket = 0; bucket < bucket_count; ++bucket) {
-	        float bucket_h = __uint_as_float(bucket_h_max_bits[bucket]);
-	        if (bucket_h <= 0.0f) {
-	            continue;
-	        }
-	        float support = radius_scale * fmaxf(dst_h, bucket_h);
-	        float support2 = support * support;
-	        int max_x = (int)ceilf(support / cell_width_x);
-	        int max_y = (int)ceilf(support / cell_width_y);
-	        int max_z = (int)ceilf(support / cell_width_z);
-	        int full_x = periodic_x && nx <= 2 * max_x + 1;
-	        int full_y = periodic_y && ny <= 2 * max_y + 1;
-	        int full_z = periodic_z && nz <= 2 * max_z + 1;
-	        int loops_x = full_x ? nx : 2 * max_x + 1;
-	        int loops_y = full_y ? ny : 2 * max_y + 1;
-	        int loops_z = full_z ? nz : 2 * max_z + 1;
-	        for (int iz = 0; iz < loops_z; ++iz) {
-	            int cz = iz;
-	            if (!full_z) {
-	                int offset = iz - max_z;
-	                if (!fused_neighbor_cell(base_cz, offset, nz, periodic_z, &cz)) {
-	                    continue;
-	                }
-	            }
-	            for (int iy = 0; iy < loops_y; ++iy) {
-	                int cy = iy;
-	                if (!full_y) {
-	                    int offset = iy - max_y;
-	                    if (!fused_neighbor_cell(base_cy, offset, ny, periodic_y, &cy)) {
-	                        continue;
-	                    }
-	                }
-	                for (int ix = 0; ix < loops_x; ++ix) {
-	                    int cx = ix;
-	                    if (!full_x) {
-	                        int offset = ix - max_x;
-	                        if (!fused_neighbor_cell(base_cx, offset, nx, periodic_x, &cx)) {
-	                            continue;
-	                        }
-	                    }
-	                    int cell = fused_linear_cell(cx, cy, cz, nx, ny);
-	                    float cell_distance2 = fused_cell_distance2_to_particle(
-	                        cell,
-	                        nx,
-	                        ny,
-	                        x[dst],
-	                        y[dst],
-	                        z[dst],
-	                        xmin,
-	                        xmax,
-	                        ymin,
-	                        ymax,
-	                        zmin,
-	                        zmax,
-	                        periodic_x,
-	                        periodic_y,
-	                        periodic_z,
-	                        cell_width_x,
-	                        cell_width_y,
-	                        cell_width_z
-	                    );
-	                    if (cell_distance2 > support2) {
-	                        continue;
-	                    }
-	                    int flat = bucket * total_cells + cell;
-	                    int begin = cell_bucket_starts[flat];
-	                    int end = begin + cell_bucket_counts[flat];
-	                    for (int pos = begin; pos < end; ++pos) {
-	                        int src = sorted_ids[pos];
-	                        if (fused_in_support_xyz(
-	                            dst,
-	                            src,
-	                            x,
-	                            y,
-	                            z,
-	                            h,
-	                            xmin,
-	                            xmax,
-	                            ymin,
-	                            ymax,
-	                            zmin,
-	                            zmax,
-	                            periodic_x,
-	                            periodic_y,
-	                            periodic_z,
-	                            radius_scale
-	                        )) {
-	                            count += 1;
-	                        }
-	                    }
-	                }
-	            }
-	        }
-	    }
-	    neighbor_counts[dst] = count;
-	}
-
-	__global__ void fused_count_hbucket_traversal_work(
-	    const float *x,
-	    const float *y,
-	    const float *z,
-	    const float *h,
-	    int n,
-	    float xmin,
-	    float xmax,
-	    float ymin,
-	    float ymax,
-	    float zmin,
-	    float zmax,
-	    int periodic_x,
-	    int periodic_y,
-	    int periodic_z,
-	    float radius_scale,
-	    int nx,
-	    int ny,
-	    int nz,
-	    int total_cells,
-	    int bucket_count,
-	    float cell_width_x,
-	    float cell_width_y,
-	    float cell_width_z,
-	    const unsigned int *bucket_h_max_bits,
-	    const unsigned int *cell_bucket_h_max_bits,
-	    const int *cell_bucket_counts,
-	    const int *cell_bucket_starts,
-	    const int *sorted_ids,
-	    int *visited_cell_counts,
-	    int *candidate_counts,
-	    int *neighbor_counts
-	)
-	{
-	    int dst = blockIdx.x * blockDim.x + threadIdx.x;
-	    if (dst >= n) {
-	        return;
-	    }
-	    float dst_x = x[dst];
-	    float dst_y = y[dst];
-	    float dst_z = z[dst];
-	    float dst_h = h[dst];
-	    int base_cx = fused_clamp_cell(dst_x, xmin, xmax, nx);
-	    int base_cy = fused_clamp_cell(dst_y, ymin, ymax, ny);
-	    int base_cz = fused_clamp_cell(dst_z, zmin, zmax, nz);
-	    int visited_cells = 0;
-	    int candidates = 0;
-	    int neighbors = 0;
-	    for (int bucket = 0; bucket < bucket_count; ++bucket) {
-	        float bucket_h = __uint_as_float(bucket_h_max_bits[bucket]);
-	        if (bucket_h <= 0.0f) {
-	            continue;
-	        }
-	        float bucket_support = radius_scale * fmaxf(dst_h, bucket_h);
-	        int max_x = (int)ceilf(bucket_support / cell_width_x);
-	        int max_y = (int)ceilf(bucket_support / cell_width_y);
-	        int max_z = (int)ceilf(bucket_support / cell_width_z);
-	        int full_x = periodic_x && nx <= 2 * max_x + 1;
-	        int full_y = periodic_y && ny <= 2 * max_y + 1;
-	        int full_z = periodic_z && nz <= 2 * max_z + 1;
-	        int loops_x = full_x ? nx : 2 * max_x + 1;
-	        int loops_y = full_y ? ny : 2 * max_y + 1;
-	        int loops_z = full_z ? nz : 2 * max_z + 1;
-	        for (int iz = 0; iz < loops_z; ++iz) {
-	            int cz = iz;
-	            if (!full_z) {
-	                int offset = iz - max_z;
-	                if (!fused_neighbor_cell(base_cz, offset, nz, periodic_z, &cz)) {
-	                    continue;
-	                }
-	            }
-	            for (int iy = 0; iy < loops_y; ++iy) {
-	                int cy = iy;
-	                if (!full_y) {
-	                    int offset = iy - max_y;
-	                    if (!fused_neighbor_cell(base_cy, offset, ny, periodic_y, &cy)) {
-	                        continue;
-	                    }
-	                }
-	                for (int ix = 0; ix < loops_x; ++ix) {
-	                    int cx = ix;
-	                    if (!full_x) {
-	                        int offset = ix - max_x;
-	                        if (!fused_neighbor_cell(base_cx, offset, nx, periodic_x, &cx)) {
-	                            continue;
-	                        }
-	                    }
-	                    int cell = fused_linear_cell(cx, cy, cz, nx, ny);
-	                    int flat = bucket * total_cells + cell;
-	                    float cell_bucket_h = __uint_as_float(cell_bucket_h_max_bits[flat]);
-	                    if (cell_bucket_h <= 0.0f) {
-	                        continue;
-	                    }
-	                    float cell_support = radius_scale * fmaxf(dst_h, cell_bucket_h);
-	                    float cell_support2 = cell_support * cell_support;
-	                    float cell_distance2 = fused_cell_distance2_to_particle(
-	                        cell,
-	                        nx,
-	                        ny,
-	                        dst_x,
-	                        dst_y,
-	                        dst_z,
-	                        xmin,
-	                        xmax,
-	                        ymin,
-	                        ymax,
-	                        zmin,
-	                        zmax,
-	                        periodic_x,
-	                        periodic_y,
-	                        periodic_z,
-	                        cell_width_x,
-	                        cell_width_y,
-	                        cell_width_z
-	                    );
-	                    if (cell_distance2 > cell_support2) {
-	                        continue;
-	                    }
-	                    int begin = cell_bucket_starts[flat];
-	                    int end = begin + cell_bucket_counts[flat];
-	                    visited_cells += 1;
-	                    candidates += end - begin;
-	                    for (int pos = begin; pos < end; ++pos) {
-	                        int src = sorted_ids[pos];
-	                        if (fused_in_support_xyz(
-	                            dst,
-	                            src,
-	                            x,
-	                            y,
-	                            z,
-	                            h,
-	                            xmin,
-	                            xmax,
-	                            ymin,
-	                            ymax,
-	                            zmin,
-	                            zmax,
-	                            periodic_x,
-	                            periodic_y,
-	                            periodic_z,
-	                            radius_scale
-	                        )) {
-	                            neighbors += 1;
-	                        }
-	                    }
-	                }
-	            }
-	        }
-	    }
-	    visited_cell_counts[dst] = visited_cells;
-	    candidate_counts[dst] = candidates;
-	    neighbor_counts[dst] = neighbors;
-	}
-
+    __global__ void fused_count_hbucket_traversal_work(
+        const float *x,
+        const float *y,
+        const float *z,
+        const float *h,
+        int n,
+        float xmin,
+        float xmax,
+        float ymin,
+        float ymax,
+        float zmin,
+        float zmax,
+        int periodic_x,
+        int periodic_y,
+        int periodic_z,
+        float radius_scale,
+        int nx,
+        int ny,
+        int nz,
+        int total_cells,
+        int bucket_count,
+        float cell_width_x,
+        float cell_width_y,
+        float cell_width_z,
+        const unsigned int *bucket_h_max_bits,
+        const unsigned int *cell_bucket_h_max_bits,
+        const int *cell_bucket_counts,
+        const int *cell_bucket_starts,
+        const int *sorted_ids,
+        int *visited_cell_counts,
+        int *candidate_counts,
+        int *neighbor_counts)
+    {
+        int dst = blockIdx.x * blockDim.x + threadIdx.x;
+        if (dst >= n) {
+            return;
+        }
+        float dst_x = x[dst];
+        float dst_y = y[dst];
+        float dst_z = z[dst];
+        float dst_h = h[dst];
+        int base_cx = fused_clamp_cell(dst_x, xmin, xmax, nx);
+        int base_cy = fused_clamp_cell(dst_y, ymin, ymax, ny);
+        int base_cz = fused_clamp_cell(dst_z, zmin, zmax, nz);
+        int visited_cells = 0;
+        int candidates = 0;
+        int neighbors = 0;
+        for (int bucket = 0; bucket < bucket_count; ++bucket) {
+            float bucket_h = __uint_as_float(bucket_h_max_bits[bucket]);
+            if (bucket_h <= 0.0f) {
+                continue;
+            }
+            float bucket_support = radius_scale * fmaxf(dst_h, bucket_h);
+            int max_x = (int)ceilf(bucket_support / cell_width_x);
+            int max_y = (int)ceilf(bucket_support / cell_width_y);
+            int max_z = (int)ceilf(bucket_support / cell_width_z);
+            int full_x = periodic_x && nx <= 2 * max_x + 1;
+            int full_y = periodic_y && ny <= 2 * max_y + 1;
+            int full_z = periodic_z && nz <= 2 * max_z + 1;
+            int loops_x = full_x ? nx : 2 * max_x + 1;
+            int loops_y = full_y ? ny : 2 * max_y + 1;
+            int loops_z = full_z ? nz : 2 * max_z + 1;
+            for (int iz = 0; iz < loops_z; ++iz) {
+                int cz = iz;
+                if (!full_z) {
+                    int offset = iz - max_z;
+                    if (!fused_neighbor_cell(base_cz, offset, nz, periodic_z, &cz)) {
+                        continue;
+                    }
+                }
+                for (int iy = 0; iy < loops_y; ++iy) {
+                    int cy = iy;
+                    if (!full_y) {
+                        int offset = iy - max_y;
+                        if (!fused_neighbor_cell(base_cy, offset, ny, periodic_y, &cy)) {
+                            continue;
+                        }
+                    }
+                    for (int ix = 0; ix < loops_x; ++ix) {
+                        int cx = ix;
+                        if (!full_x) {
+                            int offset = ix - max_x;
+                            if (!fused_neighbor_cell(base_cx, offset, nx, periodic_x, &cx)) {
+                                continue;
+                            }
+                        }
+                        int cell = fused_linear_cell(cx, cy, cz, nx, ny);
+                        int flat = bucket * total_cells + cell;
+                        float cell_bucket_h = __uint_as_float(cell_bucket_h_max_bits[flat]);
+                        if (cell_bucket_h <= 0.0f) {
+                            continue;
+                        }
+                        float cell_support = radius_scale * fmaxf(dst_h, cell_bucket_h);
+                        float cell_support2 = cell_support * cell_support;
+                        float cell_distance2 = fused_cell_distance2_to_particle(
+                            cell,
+                            nx,
+                            ny,
+                            dst_x,
+                            dst_y,
+                            dst_z,
+                            xmin,
+                            xmax,
+                            ymin,
+                            ymax,
+                            zmin,
+                            zmax,
+                            periodic_x,
+                            periodic_y,
+                            periodic_z,
+                            cell_width_x,
+                            cell_width_y,
+                            cell_width_z);
+                        if (cell_distance2 > cell_support2) {
+                            continue;
+                        }
+                        int begin = cell_bucket_starts[flat];
+                        int end = begin + cell_bucket_counts[flat];
+                        visited_cells += 1;
+                        candidates += end - begin;
+                        for (int pos = begin; pos < end; ++pos) {
+                            int src = sorted_ids[pos];
+                            if (fused_in_support_xyz(
+                                    dst,
+                                    src,
+                                    x,
+                                    y,
+                                    z,
+                                    h,
+                                    xmin,
+                                    xmax,
+                                    ymin,
+                                    ymax,
+                                    zmin,
+                                    zmax,
+                                    periodic_x,
+                                    periodic_y,
+                                    periodic_z,
+                                    radius_scale)) {
+                                neighbors += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        visited_cell_counts[dst] = visited_cells;
+        candidate_counts[dst] = candidates;
+        neighbor_counts[dst] = neighbors;
+    }
 }
 """
 
