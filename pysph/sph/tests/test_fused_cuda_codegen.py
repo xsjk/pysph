@@ -130,6 +130,7 @@ def test_hbucket_pair_outline_keeps_variable_h_bucket_traversal():
         stage,
         (equation,),
         CudaPairPrecompute(symbols=frozenset(), helper_source="", lines=()),
+        {},
     )
 
     for declaration in hbucket_context_argument_declarations():
@@ -144,6 +145,22 @@ def test_hbucket_pair_outline_keeps_variable_h_bucket_traversal():
     assert "float fused_acc_d_au = 0.0f;" in outline.source
     assert "AddMass_loop(add_mass0, dst, src, fused_local_d_au, s_m);" in outline.source
     assert "d_au[dst] += fused_acc_d_au;" in outline.source
+
+
+def test_hbucket_pair_outline_uses_known_integer_array_type():
+    deps = _sum_reduction_deps("AddMass", "au")
+    stage = _stage(StageKind.PAIR_RATE, (deps,))
+    equation = AddMass(dest="fluid", sources=["fluid"])
+
+    outline = generate_hbucket_pair_stage_outline_from_equations(
+        "plan0",
+        stage,
+        (equation,),
+        CudaPairPrecompute(symbols=frozenset(), helper_source="", lines=()),
+        {"s_m": KnownType("GLOBAL_MEM long*")},
+    )
+
+    assert "GLOBAL_MEM long* s_m" in outline.source
 
 
 def test_snapshot_pair_window_snapshots_left_read_before_right_write():
@@ -185,6 +202,7 @@ def test_snapshot_pair_window_outline_reads_snapshotted_left_arguments():
         ((left_equation,), (right_equation,)),
         CudaPairPrecompute(symbols=frozenset(), helper_source="", lines=()),
         ("au",),
+        {},
     )
 
     assert outline.name == "fused_plan0_fluid_snapshot_hbucket_pair_window"

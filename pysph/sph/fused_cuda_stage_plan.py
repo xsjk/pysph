@@ -555,37 +555,46 @@ def _plan_group(group, supported_convergence, stage_start_index):
             )
         return stages
 
-    methods = []
+    destinations = tuple(dict.fromkeys(equation.dest for equation in group.equations))
+    methods_by_dest = {dest: [] for dest in destinations}
     unsupported = []
     for equation in group.equations:
         if _has_overloaded_method(equation, "py_initialize"):
             unsupported.append("py_initialize")
         deps = method_deps_for_equation(equation)
-        methods.extend(deps)
+        methods_by_dest[equation.dest].extend(deps)
         for item in deps:
             unsupported.extend(item.unsupported_reasons)
             if item.method_kind is MethodKind.REDUCE:
                 unsupported.append("host reduce")
+    methods = tuple(method for dest in destinations for method in methods_by_dest[dest])
     if unsupported:
         stages.append(
             _host_boundary_with_methods(
-                group, tuple(methods), ", ".join(sorted(set(unsupported)))
+                group, methods, ", ".join(sorted(set(unsupported)))
             )
         )
         return stages
 
-    stage_kind = _stage_kind_for_methods(tuple(methods))
-    child_stage_index = stage_start_index + len(stages)
-    stages.append(
-        StageNode(
-            kind=stage_kind,
-            dest=_group_dest(group),
-            sources=_group_sources(group),
-            methods=tuple(methods),
-            reason="group methods",
-            convergence_policy=None,
+    child_stage_indices = []
+    for dest in destinations:
+        dest_methods = tuple(methods_by_dest[dest])
+        child_stage_indices.append(stage_start_index + len(stages))
+        sources = tuple(
+            dict.fromkeys(
+                source for method in dest_methods for source in method.sources
+            )
         )
-    )
+        stages.append(
+            StageNode(
+                kind=_stage_kind_for_methods(dest_methods),
+                dest=dest,
+                sources=sources,
+                methods=dest_methods,
+                reason="group methods",
+                convergence_policy=None,
+            )
+        )
     if group.iterate:
         if _group_has_supported_convergence(group, supported_convergence):
             stages.append(
@@ -596,7 +605,7 @@ def _plan_group(group, supported_convergence, stage_start_index):
                     methods=tuple(methods),
                     reason="supported device convergence",
                     convergence_policy=_device_convergence_policy(
-                        group, supported_convergence, child_stage_index
+                        group, supported_convergence, tuple(child_stage_indices)
                     ),
                 )
             )
@@ -641,7 +650,7 @@ def _group_has_supported_convergence(group, supported_convergence):
     return bool(names.intersection(set(supported_convergence)))
 
 
-def _device_convergence_policy(group, supported_convergence, child_stage_index):
+def _device_convergence_policy(group, supported_convergence, child_stage_indices):
     supported = set(supported_convergence)
     equation_names = tuple(
         equation.__class__.__name__
@@ -653,7 +662,7 @@ def _device_convergence_policy(group, supported_convergence, child_stage_index):
         min_iterations=int(group.min_iterations),
         max_iterations=int(group.max_iterations),
         update_nnps=bool(group.update_nnps),
-        child_stage_indices=(child_stage_index,),
+        child_stage_indices=child_stage_indices,
         equation_names=equation_names,
         flag_fields=("equation_has_converged",),
     )

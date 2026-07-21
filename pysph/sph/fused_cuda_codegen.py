@@ -107,10 +107,13 @@ def generate_hbucket_pair_stage_outline_from_equations(
     stage: StageNode,
     equations: tuple[object, ...],
     precompute: CudaPairPrecompute,
+    array_known_types: dict[str, KnownType],
 ) -> FusedKernelOutline:
     """Return an h-bucket pair outline generated from PySPH equations."""
     assert _stage_uses_neighbors(stage)
-    known_types = _cuda_known_types_for_stage(stage, equations, precompute.symbols)
+    known_types = _cuda_known_types_for_stage(
+        stage, equations, precompute.symbols, array_known_types
+    )
     group = CUDAGroup(list(equations))
     wrapper_source = group.get_equation_wrappers(known_types)
     calls = _cuda_equation_calls_for_stage(
@@ -127,13 +130,16 @@ def generate_snapshot_hbucket_pair_window_outline_from_equations(
     equations_by_stage: tuple[tuple[object, ...], ...],
     precompute: CudaPairPrecompute,
     snapshot_fields: tuple[str, ...],
+    array_known_types: dict[str, KnownType],
 ) -> FusedKernelOutline:
     """Return one h-bucket traversal for two dependency-compatible pair stages."""
     assert len(stages) == 2
     assert len(equations_by_stage) == 2
     stage = snapshot_hbucket_pair_window_stage(stages)
     equations = _unique_equations(equations_by_stage)
-    known_types = _cuda_known_types_for_stage(stage, equations, precompute.symbols)
+    known_types = _cuda_known_types_for_stage(
+        stage, equations, precompute.symbols, array_known_types
+    )
     group = CUDAGroup(list(equations))
     wrapper_source = group.get_equation_wrappers(known_types)
     calls = _cuda_equation_calls_for_snapshot_window(
@@ -153,10 +159,13 @@ def generate_pointwise_stage_outline_from_equations(
     plan_id: str,
     stage: StageNode,
     equations: tuple[object, ...],
+    array_known_types: dict[str, KnownType],
 ) -> FusedKernelOutline:
     """Return a pointwise outline generated from PySPH equations."""
     assert _stage_can_use_pointwise_kernel(stage)
-    known_types = _cuda_known_types_for_stage(stage, equations, frozenset())
+    known_types = _cuda_known_types_for_stage(
+        stage, equations, frozenset(), array_known_types
+    )
     group = CUDAGroup(list(equations))
     wrapper_source = group.get_equation_wrappers(known_types)
     calls = _cuda_equation_calls_for_stage(stage, equations, known_types, frozenset())
@@ -1690,6 +1699,7 @@ def _cuda_known_types_for_stage(
     stage: StageNode,
     equations: tuple[object, ...],
     precomputed_symbols: frozenset[str],
+    array_known_types: dict[str, KnownType],
 ) -> dict[str, KnownType]:
     known_types = {}
     for method in stage.methods:
@@ -1702,7 +1712,16 @@ def _cuda_known_types_for_stage(
                 continue
             if arg in known_types:
                 continue
-            known_types[arg] = _known_type_for_cuda_arg(arg, precomputed_symbols)
+            if arg in array_known_types and isinstance(
+                array_known_types[arg], KnownType
+            ):
+                array_type = array_known_types[arg]
+                known_types[arg] = KnownType(
+                    array_type.type.replace("double", "float"),
+                    array_type.base_type.replace("double", "float"),
+                )
+            else:
+                known_types[arg] = _known_type_for_cuda_arg(arg, precomputed_symbols)
     return known_types
 
 

@@ -307,6 +307,23 @@ def test_stage_planner_reports_host_reduce_as_host_boundary():
     assert "host reduce" in plan.stages[0].reason
 
 
+def test_stage_planner_splits_multiple_destinations():
+    group = Group(
+        [
+            DensityEquation(dest="fluid", sources=["fluid", "solid"]),
+            DensityEquation(dest="solid", sources=["fluid", "solid"]),
+        ]
+    )
+
+    plan = plan_equation_groups([group], False, ())
+
+    assert [stage.kind for stage in plan.stages] == [
+        StageKind.PAIR_DENSITY,
+        StageKind.PAIR_DENSITY,
+    ]
+    assert [stage.dest for stage in plan.stages] == ["fluid", "solid"]
+
+
 def test_supported_density_iteration_lowers_to_device_convergence():
     group = Group(
         [SyntheticDensityIteration(dest="fluid", sources=["fluid"])],

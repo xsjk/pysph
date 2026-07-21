@@ -89,22 +89,23 @@ class FusedCudaStageBackend:
         stage_group = info["stage_group"]
         if stage_group in self.device_convergence_skip_groups:
             return True
-        if stage_group in self.snapshot_window_covered_groups:
+        stage_key = _stage_group_key(info)
+        if stage_key in self.snapshot_window_covered_groups:
             return True
-        if stage_group in self.covered_stage_groups:
+        if stage_key in self.covered_stage_groups:
             return True
-        if stage_group not in self.stage_by_group:
+        if stage_key not in self.stage_by_group:
             return False
-        if stage_group in self.launched_groups:
+        if stage_key in self.launched_groups:
             return True
-        if stage_group in self.snapshot_window_by_group:
+        if stage_key in self.snapshot_window_by_group:
             self._launch_snapshot_window(
-                evaluator, self.snapshot_window_by_group[stage_group], extra_args
+                evaluator, self.snapshot_window_by_group[stage_key], extra_args
             )
         else:
-            stage = self.stage_by_group[stage_group]
+            stage = self.stage_by_group[stage_key]
             self._launch_stage(evaluator, stage, info, extra_args)
-        self.launched_groups.add(stage_group)
+        self.launched_groups.add(stage_key)
         return True
 
     def end_compute(self, evaluator, t, dt):
@@ -165,7 +166,7 @@ class FusedCudaStageBackend:
         for iteration in range(max_iterations):
             self._begin_device_convergence_iteration(info)
             for kernel_info in kernel_infos:
-                stage = self.stage_by_group[kernel_info["stage_group"]]
+                stage = self.stage_by_group[_stage_group_key(kernel_info)]
                 self._launch_stage(evaluator, stage, kernel_info, extra_args)
             iter_count = iteration + 1
             has_min_iterations = iter_count >= min_iterations
@@ -216,10 +217,10 @@ class FusedCudaStageBackend:
             if call["type"] == "stop_iteration":
                 return tuple(kernel_infos)
             if call["type"] == "kernel":
-                stage_group = call["stage_group"]
-                assert stage_group in self.stage_by_group
-                if stage_group not in groups:
-                    groups.append(stage_group)
+                stage_key = _stage_group_key(call)
+                assert stage_key in self.stage_by_group
+                if stage_key not in groups:
+                    groups.append(stage_key)
                     kernel_infos.append(call)
         assert False
 
@@ -231,9 +232,9 @@ class FusedCudaStageBackend:
 
     def _kernel_info_for_plan_stage_index(self, stage_index):
         assert stage_index in self.stage_group_by_plan_index
-        stage_group = self.stage_group_by_plan_index[stage_index]
+        stage_key = self.stage_group_by_plan_index[stage_index]
         for call in self.helper.calls:
-            if call["type"] == "kernel" and call["stage_group"] == stage_group:
+            if call["type"] == "kernel" and _stage_group_key(call) == stage_key:
                 return call
         assert False
 
@@ -323,7 +324,12 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
         if outline_key in self.outlines:
             return self.outlines[outline_key]
         outline = generate_snapshot_hbucket_pair_window_outline_from_equations(
-            "cuda_eval", stages, equations_by_stage, precompute, snapshot_fields
+            "cuda_eval",
+            stages,
+            equations_by_stage,
+            precompute,
+            snapshot_fields,
+            self.helper.known_types,
         )
         self.outlines[outline_key] = outline
         return outline
@@ -507,11 +513,11 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
             return self.outlines[outline_key]
         if stage.kind in (StageKind.PAIR_DENSITY, StageKind.PAIR_RATE):
             outline = generate_hbucket_pair_stage_outline_from_equations(
-                "cuda_eval", stage, equations, precompute
+                "cuda_eval", stage, equations, precompute, self.helper.known_types
             )
         elif _stage_can_use_pointwise_kernel(stage):
             outline = generate_pointwise_stage_outline_from_equations(
-                "cuda_eval", stage, equations
+                "cuda_eval", stage, equations, self.helper.known_types
             )
         else:
             assert False
@@ -541,8 +547,8 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
 def _stage_group_mapping(helper):
     stage_groups = []
     for call in helper.calls:
-        if call["type"] == "kernel" and call["stage_group"] not in stage_groups:
-            stage_groups.append(call["stage_group"])
+        if call["type"] == "kernel" and _stage_group_key(call) not in stage_groups:
+            stage_groups.append(_stage_group_key(call))
     stages = tuple(
         (index, stage)
         for index, stage in enumerate(helper.cuda_stage_plan.stages)
@@ -561,6 +567,10 @@ def _stage_group_mapping(helper):
         group_index += stage.legacy_group_count
     assert group_index == len(stage_groups)
     return stage_by_group, covered_stage_groups, stage_group_by_plan_index
+
+
+def _stage_group_key(call):
+    return call["stage_group"], call["dest"].name
 
 
 def _snapshot_window_mapping(helper, stage_group_by_plan_index):
@@ -840,13 +850,21 @@ def _stage_timing_key(stage, traversal):
 
 
 def _equations_for_stage(helper, stage, stage_group):
-    equations = list(_equations_for_stage_group(helper, stage_group))
+    equations = [
+        equation
+        for equation in _equations_for_stage_group(helper, stage_group)
+        if equation.dest == stage.dest
+    ]
     names = [equation.__class__.__name__ for equation in equations]
     for method in stage.methods:
         if method.equation_name not in names:
             equation = _equation_for_method(
                 method.equation_name,
-                _all_equations(helper),
+                tuple(
+                    equation
+                    for equation in _all_equations(helper)
+                    if equation.dest == stage.dest
+                ),
             )
             equations.append(equation)
             names.append(method.equation_name)
