@@ -2,6 +2,7 @@
 
 import inspect
 import re
+from copy import copy
 from dataclasses import dataclass
 
 import numpy as np
@@ -114,10 +115,11 @@ def generate_hbucket_pair_stage_outline_from_equations(
     known_types = _cuda_known_types_for_stage(
         stage, equations, precompute.symbols, array_known_types
     )
-    group = CUDAGroup(list(equations))
+    wrapped_equations = _equations_with_python_scalars(equations)
+    group = CUDAGroup(list(wrapped_equations))
     wrapper_source = group.get_equation_wrappers(known_types)
     calls = _cuda_equation_calls_for_stage(
-        stage, equations, known_types, precompute.symbols
+        stage, wrapped_equations, known_types, precompute.symbols
     )
     return _generate_hbucket_pair_loop_outline_with_equation_calls(
         plan_id, stage, wrapper_source, precompute, calls
@@ -140,12 +142,13 @@ def generate_snapshot_hbucket_pair_window_outline_from_equations(
     known_types = _cuda_known_types_for_stage(
         stage, equations, precompute.symbols, array_known_types
     )
-    group = CUDAGroup(list(equations))
+    wrapped_equations = _equations_with_python_scalars(equations)
+    group = CUDAGroup(list(wrapped_equations))
     wrapper_source = group.get_equation_wrappers(known_types)
     calls = _cuda_equation_calls_for_snapshot_window(
         stage,
         stages[0],
-        equations,
+        wrapped_equations,
         known_types,
         precompute.symbols,
         snapshot_fields,
@@ -166,9 +169,10 @@ def generate_pointwise_stage_outline_from_equations(
     known_types = _cuda_known_types_for_stage(
         stage, equations, frozenset(), array_known_types
     )
-    group = CUDAGroup(list(equations))
+    wrapped_equations = _equations_with_python_scalars(equations)
+    group = CUDAGroup(list(wrapped_equations))
     wrapper_source = group.get_equation_wrappers(known_types)
-    calls = _cuda_equation_calls_for_stage(stage, equations, known_types, frozenset())
+    calls = _cuda_equation_calls_for_stage(stage, wrapped_equations, known_types, frozenset())
     return generate_pointwise_kernel_outline_with_equation_calls(
         plan_id, stage, wrapper_source, calls
     )
@@ -920,14 +924,10 @@ def _launch_hbucket_pair_kernel_with_context(
         np.int32(context.periodic[1]),
         np.int32(context.periodic[2]),
         context.radius_scale,
-        np.int32(context.cell_counts[0]),
-        np.int32(context.cell_counts[1]),
-        np.int32(context.cell_counts[2]),
-        np.int32(context.total_cells),
         np.int32(context.bucket_count),
-        np.float32(context.cell_width[0]),
-        np.float32(context.cell_width[1]),
-        np.float32(context.cell_width[2]),
+        _kernel_arg(context.device_level_cell_counts),
+        _kernel_arg(context.device_level_cell_offsets),
+        _kernel_arg(context.device_level_cell_widths),
         _kernel_arg(context.bucket_h_max_bits),
         _kernel_arg(context.cell_bucket_h_max_bits),
         _kernel_arg(context.cell_bucket_counts),
@@ -1126,32 +1126,39 @@ def _hbucket_pair_neighbor_traversal_lines(
         "    float fused_length_x = xmax - xmin;",
         "    float fused_length_y = ymax - ymin;",
         "    float fused_length_z = zmax - zmin;",
-        "    int base_cx = fused_codegen_clamp_cell(dst_x, xmin, xmax, nx);",
-        "    int base_cy = fused_codegen_clamp_cell(dst_y, ymin, ymax, ny);",
-        "    int base_cz = fused_codegen_clamp_cell(dst_z, zmin, zmax, nz);",
         "    for (int bucket = 0; bucket < bucket_count; ++bucket) {",
+        "        int descriptor = 3 * bucket;",
+        "        int level_nx = level_cell_counts[descriptor];",
+        "        int level_ny = level_cell_counts[descriptor + 1];",
+        "        int level_nz = level_cell_counts[descriptor + 2];",
+        "        float level_cell_width_x = level_cell_widths[descriptor];",
+        "        float level_cell_width_y = level_cell_widths[descriptor + 1];",
+        "        float level_cell_width_z = level_cell_widths[descriptor + 2];",
         "        float bucket_h = __uint_as_float(bucket_h_max_bits[bucket]);",
         "        if (bucket_h <= 0.0f) {",
         "            continue;",
         "        }",
+        "        int base_cx = fused_codegen_clamp_cell(dst_x, xmin, xmax, level_nx);",
+        "        int base_cy = fused_codegen_clamp_cell(dst_y, ymin, ymax, level_ny);",
+        "        int base_cz = fused_codegen_clamp_cell(dst_z, zmin, zmax, level_nz);",
         "        float bucket_support = radius_scale * fmaxf(dst_h, bucket_h);",
         "        int fused_ix_count = periodic_x ? (int)floorf(bucket_support / fused_length_x + 0.5f) : 0;",
         "        int fused_iy_count = periodic_y ? (int)floorf(bucket_support / fused_length_y + 0.5f) : 0;",
         "        int fused_iz_count = periodic_z ? (int)floorf(bucket_support / fused_length_z + 0.5f) : 0;",
-        "        int max_x = (int)ceilf(bucket_support / cell_width_x);",
-        "        int max_y = (int)ceilf(bucket_support / cell_width_y);",
-        "        int max_z = (int)ceilf(bucket_support / cell_width_z);",
-        "        int full_x = periodic_x && nx <= 2 * max_x + 1;",
-        "        int full_y = periodic_y && ny <= 2 * max_y + 1;",
-        "        int full_z = periodic_z && nz <= 2 * max_z + 1;",
-        "        int loops_x = full_x ? nx : 2 * max_x + 1;",
-        "        int loops_y = full_y ? ny : 2 * max_y + 1;",
-        "        int loops_z = full_z ? nz : 2 * max_z + 1;",
+        "        int max_x = (int)ceilf(bucket_support / level_cell_width_x);",
+        "        int max_y = (int)ceilf(bucket_support / level_cell_width_y);",
+        "        int max_z = (int)ceilf(bucket_support / level_cell_width_z);",
+        "        int full_x = periodic_x && level_nx <= 2 * max_x + 1;",
+        "        int full_y = periodic_y && level_ny <= 2 * max_y + 1;",
+        "        int full_z = periodic_z && level_nz <= 2 * max_z + 1;",
+        "        int loops_x = full_x ? level_nx : 2 * max_x + 1;",
+        "        int loops_y = full_y ? level_ny : 2 * max_y + 1;",
+        "        int loops_z = full_z ? level_nz : 2 * max_z + 1;",
         "        for (int iz = 0; iz < loops_z; ++iz) {",
         "            int cz = iz;",
         "            if (!full_z) {",
         "                int offset = iz - max_z;",
-        "                if (!fused_codegen_neighbor_cell(base_cz, offset, nz, periodic_z, &cz)) {",
+        "                if (!fused_codegen_neighbor_cell(base_cz, offset, level_nz, periodic_z, &cz)) {",
         "                    continue;",
         "                }",
         "            }",
@@ -1159,7 +1166,7 @@ def _hbucket_pair_neighbor_traversal_lines(
         "                int cy = iy;",
         "                if (!full_y) {",
         "                    int offset = iy - max_y;",
-        "                    if (!fused_codegen_neighbor_cell(base_cy, offset, ny, periodic_y, &cy)) {",
+        "                    if (!fused_codegen_neighbor_cell(base_cy, offset, level_ny, periodic_y, &cy)) {",
         "                        continue;",
         "                    }",
         "                }",
@@ -1167,12 +1174,12 @@ def _hbucket_pair_neighbor_traversal_lines(
         "                    int cx = ix;",
         "                    if (!full_x) {",
         "                        int offset = ix - max_x;",
-        "                        if (!fused_codegen_neighbor_cell(base_cx, offset, nx, periodic_x, &cx)) {",
+        "                        if (!fused_codegen_neighbor_cell(base_cx, offset, level_nx, periodic_x, &cx)) {",
         "                            continue;",
         "                        }",
         "                    }",
-        "                    int cell = fused_codegen_linear_cell(cx, cy, cz, nx, ny);",
-        "                    int flat = bucket * total_cells + cell;",
+        "                    int cell = fused_codegen_linear_cell(cx, cy, cz, level_nx, level_ny);",
+        "                    int flat = level_cell_offsets[bucket] + cell;",
         "                    float cell_bucket_h = __uint_as_float(cell_bucket_h_max_bits[flat]);",
         "                    if (cell_bucket_h <= 0.0f) {",
         "                        continue;",
@@ -1180,9 +1187,10 @@ def _hbucket_pair_neighbor_traversal_lines(
         "                    float cell_support = radius_scale * fmaxf(dst_h, cell_bucket_h);",
         "                    float cell_support2 = cell_support * cell_support;",
         "                    float cell_distance2 = fused_codegen_cell_distance2_to_particle(",
-        "                        cell, nx, ny, dst_x, dst_y, dst_z, xmin, xmax,",
+        "                        cell, level_nx, level_ny, dst_x, dst_y, dst_z, xmin, xmax,",
         "                        ymin, ymax, zmin, zmax, periodic_x, periodic_y,",
-        "                        periodic_z, cell_width_x, cell_width_y, cell_width_z",
+        "                        periodic_z, level_cell_width_x, level_cell_width_y,",
+        "                        level_cell_width_z",
         "                    );",
         "                    if (cell_distance2 > cell_support2) {",
         "                        continue;",
@@ -1739,6 +1747,19 @@ def _unique_equations(
     return tuple(equations)
 
 
+def _equations_with_python_scalars(
+    equations: tuple[object, ...],
+) -> tuple[object, ...]:
+    copies = []
+    for equation in equations:
+        item = copy(equation)
+        for name, value in vars(equation).items():
+            if isinstance(value, np.generic):
+                setattr(item, name, value.item())
+        copies.append(item)
+    return tuple(copies)
+
+
 def _equation_for_method(equation_name: str, equations: tuple[object, ...]) -> object:
     matches = [
         equation
@@ -1880,14 +1901,10 @@ def hbucket_context_argument_declarations() -> tuple[str, ...]:
         "int periodic_y",
         "int periodic_z",
         "float radius_scale",
-        "int nx",
-        "int ny",
-        "int nz",
-        "int total_cells",
         "int bucket_count",
-        "float cell_width_x",
-        "float cell_width_y",
-        "float cell_width_z",
+        "const int *level_cell_counts",
+        "const int *level_cell_offsets",
+        "const float *level_cell_widths",
         "const unsigned int *bucket_h_max_bits",
         "const unsigned int *cell_bucket_h_max_bits",
         "const int *cell_bucket_counts",

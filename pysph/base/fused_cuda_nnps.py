@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import numpy as np
 
 _SCAN_KERNEL = None
+_MAX_HBUCKET_LEVELS = 8
 
 CUDA_SOURCE = r"""
 extern "C" {
@@ -265,25 +266,8 @@ extern "C" {
     __device__ int fused_hbucket_index(float hi, float h_min, int bucket_count)
     {
         float ratio = fmaxf(hi / h_min, 1.0f);
-        if (bucket_count == 1) {
-            return 0;
-        }
-        if (bucket_count == 2) {
-            return ratio < 2.0f ? 0 : 1;
-        }
-        if (bucket_count == 4) {
-            if (ratio < 2.0f) {
-                return 0;
-            }
-            if (ratio < 4.0f) {
-                return 1;
-            }
-            if (ratio < 8.0f) {
-                return 2;
-            }
-            return 3;
-        }
-        int bucket = (int)floorf(log2f(ratio));
+        // Positive finite FP32 exponent bits equal floor(log2(ratio)).
+        int bucket = (int)((__float_as_uint(ratio) >> 23) & 0xffu) - 127;
         if (bucket < 0) {
             bucket = 0;
         }
@@ -343,6 +327,58 @@ extern "C" {
         if (i < n) {
             int flat = particle_bucket[i] * total_cells + particle_cell[i];
             int out = cell_bucket_starts[flat] + particle_local_index[i];
+            sorted_ids[out] = i;
+        }
+    }
+
+    __global__ void fused_compute_hbucket_level_ids_counts_xyz(
+        const float *x,
+        const float *y,
+        const float *z,
+        const float *h,
+        int n,
+        const float *lower,
+        const float *upper,
+        float h_min,
+        int level_count,
+        const int *level_cell_counts,
+        const int *level_cell_offsets,
+        int *cell_counts,
+        int *particle_flat_cell,
+        int *particle_local_index,
+        unsigned int *level_h_max_bits,
+        unsigned int *cell_h_max_bits)
+    {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i < n) {
+            int level = fused_hbucket_index(h[i], h_min, level_count);
+            int descriptor = 3 * level;
+            int nx = level_cell_counts[descriptor];
+            int ny = level_cell_counts[descriptor + 1];
+            int nz = level_cell_counts[descriptor + 2];
+            int cx = fused_clamp_cell(x[i], lower[0], upper[0], nx);
+            int cy = fused_clamp_cell(y[i], lower[1], upper[1], ny);
+            int cz = fused_clamp_cell(z[i], lower[2], upper[2], nz);
+            int flat = level_cell_offsets[level]
+                + fused_linear_cell(cx, cy, cz, nx, ny);
+            particle_flat_cell[i] = flat;
+            particle_local_index[i] = atomicAdd(&cell_counts[flat], 1);
+            atomicMax(&level_h_max_bits[level], __float_as_uint(h[i]));
+            atomicMax(&cell_h_max_bits[flat], __float_as_uint(h[i]));
+        }
+    }
+
+    __global__ void fused_scatter_hbucket_level_sorted_particles(
+        int n,
+        const int *particle_flat_cell,
+        const int *particle_local_index,
+        const int *cell_starts,
+        int *sorted_ids)
+    {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;
+        if (i < n) {
+            int flat = particle_flat_cell[i];
+            int out = cell_starts[flat] + particle_local_index[i];
             sorted_ids[out] = i;
         }
     }
@@ -723,6 +759,15 @@ class FusedCudaHBucketNeighborContext:
         return sum(value for _name, value in self.timings_ms)
 
 
+@dataclass(frozen=True)
+class FusedCudaHierarchicalHBucketNeighborContext(FusedCudaHBucketNeighborContext):
+    """Independent-grid h-bucket level metadata."""
+
+    device_level_cell_counts: object
+    device_level_cell_offsets: object
+    device_level_cell_widths: object
+
+
 class FusedCudaNeighborWorkspace:
     """Reusable device buffers for fused h-bucket metadata builds."""
 
@@ -737,6 +782,9 @@ class FusedCudaNeighborWorkspace:
         self.hbucket_particle_local_index = None
         self.hbucket_bucket_h_max_bits = None
         self.hbucket_cell_bucket_h_max_bits = None
+        self.hbucket_level_cell_counts = None
+        self.hbucket_level_cell_offsets = None
+        self.hbucket_level_cell_widths = None
         self.hbucket_h_min_ref = None
         self.hbucket_h_max_ref = None
 
@@ -808,6 +856,170 @@ def build_fused_cuda_neighbor_context_with_workspace(
     )
 
 
+def build_fused_cuda_hierarchical_hbucket_context_with_workspace(
+    x: object,
+    y: object,
+    z: object,
+    h: object,
+    n: int,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    periodic: np.ndarray,
+    radius_scale: np.float32,
+    stream: object,
+    workspace: FusedCudaNeighborWorkspace,
+    h_reduce_scratch: list[object],
+) -> FusedCudaHierarchicalHBucketNeighborContext:
+    """Build an independent-grid h hierarchy."""
+    _ensure_cuda_context()
+    assert x.dtype == np.float32
+    assert y.dtype == np.float32
+    assert z.dtype == np.float32
+    assert h.dtype == np.float32
+    assert n > 0
+    assert lower.dtype == np.float32
+    assert upper.dtype == np.float32
+    assert periodic.dtype == np.bool_
+    assert isinstance(radius_scale, np.float32)
+
+    h_min, h_max = _cached_h_bounds(h, n, stream, workspace, h_reduce_scratch)
+    h_ratio = np.float32(h_max / h_min)
+    level_count = min(
+        int(np.floor(np.log2(h_ratio))) + 1, _MAX_HBUCKET_LEVELS
+    )
+
+    import pycuda.driver as cuda
+
+    level_cell_counts, level_cell_offsets, level_cell_widths = (
+        _hbucket_level_layout(
+            lower, upper, h_min, radius_scale, level_count, n
+        )
+    )
+    level_totals = np.prod(level_cell_counts, axis=1, dtype=np.int64)
+    flat_total = int(np.sum(level_totals, dtype=np.int64))
+    workspace.ensure_hbucket(n, flat_total, level_count)
+    workspace.hbucket_level_cell_counts = _ensure_gpu_array(
+        workspace.hbucket_level_cell_counts, 3 * level_count, np.int32
+    )
+    workspace.hbucket_level_cell_offsets = _ensure_gpu_array(
+        workspace.hbucket_level_cell_offsets, level_count, np.int32
+    )
+    workspace.hbucket_level_cell_widths = _ensure_gpu_array(
+        workspace.hbucket_level_cell_widths, 3 * level_count, np.float32
+    )
+    d_lower = workspace.lower
+    d_upper = workspace.upper
+    d_cell_counts = workspace.hbucket_cell_bucket_counts
+    d_cell_starts = workspace.hbucket_cell_bucket_starts
+    d_sorted_ids = workspace.hbucket_sorted_ids
+    d_particle_flat_cell = workspace.hbucket_particle_cell
+    d_particle_local_index = workspace.hbucket_particle_local_index
+    d_level_h_max_bits = workspace.hbucket_bucket_h_max_bits
+    d_cell_h_max_bits = workspace.hbucket_cell_bucket_h_max_bits
+    d_level_cell_counts = workspace.hbucket_level_cell_counts
+    d_level_cell_offsets = workspace.hbucket_level_cell_offsets
+    d_level_cell_widths = workspace.hbucket_level_cell_widths
+    cuda.memcpy_htod_async(_device_ptr(d_lower), np.ascontiguousarray(lower), stream)
+    cuda.memcpy_htod_async(_device_ptr(d_upper), np.ascontiguousarray(upper), stream)
+    cuda.memcpy_htod_async(
+        _device_ptr(d_level_cell_counts),
+        np.ascontiguousarray(level_cell_counts.reshape(-1)),
+        stream,
+    )
+    cuda.memcpy_htod_async(
+        _device_ptr(d_level_cell_offsets),
+        np.ascontiguousarray(level_cell_offsets),
+        stream,
+    )
+    cuda.memcpy_htod_async(
+        _device_ptr(d_level_cell_widths),
+        np.ascontiguousarray(level_cell_widths.reshape(-1)),
+        stream,
+    )
+
+    kernels = _module()
+    reset_metadata = kernels.get_function("fused_reset_hbucket_metadata")
+    compute_ids_counts = kernels.get_function(
+        "fused_compute_hbucket_level_ids_counts_xyz"
+    )
+    scatter_sorted = kernels.get_function(
+        "fused_scatter_hbucket_level_sorted_particles"
+    )
+
+    start, stop = _event_pair(stream)
+    reset_metadata(
+        _device_ptr(d_cell_counts),
+        _device_ptr(d_level_h_max_bits),
+        _device_ptr(d_cell_h_max_bits),
+        np.int32(flat_total),
+        np.int32(level_count),
+        block=(256, 1, 1),
+        grid=_grid_size(flat_total),
+        stream=stream,
+    )
+    compute_ids_counts(
+        _device_ptr(x),
+        _device_ptr(y),
+        _device_ptr(z),
+        _device_ptr(h),
+        np.int32(n),
+        _device_ptr(d_lower),
+        _device_ptr(d_upper),
+        h_min,
+        np.int32(level_count),
+        _device_ptr(d_level_cell_counts),
+        _device_ptr(d_level_cell_offsets),
+        _device_ptr(d_cell_counts),
+        _device_ptr(d_particle_flat_cell),
+        _device_ptr(d_particle_local_index),
+        _device_ptr(d_level_h_max_bits),
+        _device_ptr(d_cell_h_max_bits),
+        block=(256, 1, 1),
+        grid=_grid_size(n),
+        stream=stream,
+    )
+    _scan_int32(
+        d_cell_counts[:flat_total], d_cell_starts[:flat_total], stream
+    )
+    scatter_sorted(
+        np.int32(n),
+        _device_ptr(d_particle_flat_cell),
+        _device_ptr(d_particle_local_index),
+        _device_ptr(d_cell_starts),
+        _device_ptr(d_sorted_ids),
+        block=(256, 1, 1),
+        grid=_grid_size(n),
+        stream=stream,
+    )
+    build_ms = _finish_event(start, stop, stream)
+    return FusedCudaHierarchicalHBucketNeighborContext(
+        n=n,
+        destination_count=n,
+        x=x,
+        y=y,
+        z=z,
+        h=h,
+        lower=lower,
+        upper=upper,
+        periodic=periodic,
+        radius_scale=radius_scale,
+        cell_counts=level_cell_counts[0].copy(),
+        total_cells=int(level_totals[0]),
+        bucket_count=level_count,
+        cell_width=level_cell_widths[0].copy(),
+        stream=stream,
+        bucket_h_max_bits=d_level_h_max_bits,
+        cell_bucket_h_max_bits=d_cell_h_max_bits,
+        sorted_ids=d_sorted_ids,
+        cell_bucket_starts=d_cell_starts,
+        cell_bucket_counts=d_cell_counts,
+        timings_ms=(("hbucket_build_ms", build_ms),),
+        device_level_cell_counts=d_level_cell_counts,
+        device_level_cell_offsets=d_level_cell_offsets,
+        device_level_cell_widths=d_level_cell_widths,
+    )
+
+
 def build_fused_cuda_hbucket_context_with_workspace(
     x: object,
     y: object,
@@ -869,8 +1081,6 @@ def _effective_hbucket_count(
     assert isinstance(h_max, np.float32)
     assert h_min > np.float32(0.0)
     assert h_max >= h_min
-    if requested_bucket_count == 1:
-        return 1
     ratio = np.float32(h_max / h_min)
     if ratio < np.float32(2.0):
         return 1
@@ -880,6 +1090,41 @@ def _effective_hbucket_count(
     if ratio >= np.float32(8.0):
         return requested_bucket_count
     return min(requested_bucket_count, 2)
+
+
+def _hbucket_level_layout(
+    lower: np.ndarray,
+    upper: np.ndarray,
+    h_min: np.float32,
+    radius_scale: np.float32,
+    level_count: int,
+    particle_count: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    levels = np.arange(level_count, dtype=np.int32)
+    level_lower_h = h_min * np.exp2(levels).astype(np.float32)
+    target_widths = radius_scale * level_lower_h[:, None]
+    raw_counts = np.ceil(
+        (upper - lower)[None, :] / target_widths
+    ).astype(np.int32)
+    raw_counts = np.maximum(
+        raw_counts, np.ones((level_count, 3), dtype=np.int32)
+    )
+    raw_total = np.sum(np.prod(raw_counts, axis=1, dtype=np.int64))
+    target_total = particle_count / 2
+    # Scaling all three axes by cbrt(raw/target) keeps metadata at O(N).
+    metadata_scale = np.maximum(
+        np.float32(1.0), np.cbrt(raw_total / target_total).astype(np.float32)
+    )
+    target_widths *= metadata_scale
+    cell_counts = np.ceil((upper - lower)[None, :] / target_widths).astype(np.int32)
+    cell_counts = np.maximum(cell_counts, np.ones((level_count, 3), dtype=np.int32))
+    cell_widths = ((upper - lower)[None, :] / cell_counts).astype(np.float32)
+    level_totals = np.prod(cell_counts, axis=1, dtype=np.int64)
+    flat_total = int(np.sum(level_totals, dtype=np.int64))
+    assert flat_total <= np.iinfo(np.int32).max
+    offsets = np.zeros((level_count,), dtype=np.int32)
+    offsets[1:] = np.cumsum(level_totals[:-1], dtype=np.int64).astype(np.int32)
+    return cell_counts, offsets, cell_widths
 
 
 def _build_fused_cuda_hbucket_context_from_hmin(

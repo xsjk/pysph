@@ -8,7 +8,7 @@ import numpy as np
 
 from pysph.base.fused_cuda_nnps import (
     FusedCudaNeighborWorkspace,
-    build_fused_cuda_neighbor_context_with_workspace,
+    build_fused_cuda_hierarchical_hbucket_context_with_workspace,
     wrap_periodic_xyz,
 )
 from pysph.sph.fused_cuda_codegen import (
@@ -112,7 +112,7 @@ class FusedCudaStageBackend:
         return False
 
     def handle_outer_update_nnps(self, integrator, index):
-        return True
+        return integrator.nnps.domain.manager.minimum_image_periodic
 
     def handle_reorder_update_nnps(self, solver):
         return True
@@ -838,10 +838,6 @@ def _source_module_options():
     return ("--use_fast_math",)
 
 
-def _hbucket_bucket_count():
-    return 1
-
-
 def _stage_timing_key(stage, traversal):
     method_names = "+".join(
         f"{method.equation_name}.{method.method_kind.value}" for method in stage.methods
@@ -1040,7 +1036,7 @@ def _neighbor_context_for_info(evaluator, info, stream, h_reduce_scratch, worksp
     radius_scale = np.float32(nnps.radius_scale)
     nreal = dest.get_number_of_particles(True)
     source_count = dest.get_number_of_particles()
-    context = build_fused_cuda_neighbor_context_with_workspace(
+    context = build_fused_cuda_hierarchical_hbucket_context_with_workspace(
         dest.gpu.x.dev,
         dest.gpu.y.dev,
         dest.gpu.z.dev,
@@ -1050,7 +1046,6 @@ def _neighbor_context_for_info(evaluator, info, stream, h_reduce_scratch, worksp
         upper,
         periodic,
         radius_scale,
-        _hbucket_bucket_count(),
         stream,
         workspace,
         h_reduce_scratch,
