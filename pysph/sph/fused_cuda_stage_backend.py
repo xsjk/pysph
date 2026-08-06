@@ -44,6 +44,7 @@ class FusedCudaStageBackend:
 
     def __init__(self, helper):
         self.helper = helper
+        self._check_plan_executable(helper)
         (
             self.stage_by_group,
             self.covered_stage_groups,
@@ -59,6 +60,40 @@ class FusedCudaStageBackend:
         self.device_convergence_active = False
         self.device_convergence_iteration_counts = []
         self.device_convergence_rebuild_count = 0
+
+    def _check_plan_executable(self, helper):
+        """Fail loudly instead of silently degrading to the legacy path."""
+        plan = helper.cuda_stage_plan
+        if any(stage.kind is StageKind.HOST_BOUNDARY for stage in plan.stages):
+            raise RuntimeError(
+                "The fused CUDA stage backend cannot execute this equation "
+                "set: the fused planner lowered one or more groups to a host "
+                "boundary (host-side reduce()/convergence iterations are not "
+                "supported in fused stages). Use '--cuda' or '--opencl' "
+                "instead of '--cuda --fused'."
+            )
+        for stage in plan.stages:
+            if stage.kind is StageKind.DEVICE_CONVERGENCE:
+                continue
+            if stage.dest not in stage.sources:
+                continue
+            reads = set()
+            writes = set()
+            for method in stage.methods:
+                reads.update(method.source_reads)
+                writes.update(method.dest_writes)
+            conflicting = reads & writes
+            if conflicting:
+                raise RuntimeError(
+                    "The fused CUDA stage backend cannot execute this equation "
+                    "set: stage for '%s' both reads fields (%s) from source "
+                    "particles and writes them on the same destination array; "
+                    "fused single-kernel execution does not order these "
+                    "concurrently, so results are not reproducible and "
+                    "iterations may not converge. Use '--cuda' or '--opencl' "
+                    "instead of '--cuda --fused'."
+                    % (stage.dest, ", ".join(sorted(conflicting)))
+                )
 
     def begin_compute(self, evaluator, t, dt):
         self.launched_groups = set()
