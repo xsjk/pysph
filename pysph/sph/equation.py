@@ -497,7 +497,13 @@ class Equation(object):
         """Optional host-side reduction hook."""
 
     def py_initialize(self, *args):
-        """Optional host-side initialization hook."""
+        """Run on the host before particle initialization for each destination.
+
+        Override as ``py_initialize(self, dst, t, dt)``. Iterative groups call
+        this once per iteration. CUDA copies equation scalar fields from the
+        device before this hook and writes them back afterwards; define these
+        fields in ``__init__`` so their device storage exists.
+        """
 
     def _pull(self, *args):
         """Pull attributes from the GPU if needed.

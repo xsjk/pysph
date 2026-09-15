@@ -299,12 +299,18 @@ class GPUAccelerationEval(object):
         ary = eq._gpu.get()
         for i, name in enumerate(ary.dtype.names):
             setattr(eq, name, ary[0][i])
+        return ary
 
     def _converged(self, equations):
         for eq in equations:
             if not (eq.converged() > 0):
                 return False
         return True
+
+    def _call_py_initialize(self, info, t, dt):
+        self._sync_before_host()
+        for call in info['calls']:
+            call(info['dest'], t, dt)
 
     def _sync_before_host(self):
         self._queue.finish()
@@ -336,10 +342,7 @@ class GPUAccelerationEval(object):
                 else:
                     method(*info.get('args'))
             elif type == 'py_initialize':
-                self._sync_before_host()
-                args = info['dest'], t, dt
-                for call in info['calls']:
-                    call(*args)
+                self._call_py_initialize(info, t, dt)
             elif type == 'pre_post':
                 self._sync_before_host()
                 func = info.get('callable')
@@ -427,6 +430,15 @@ class GPUAccelerationEval(object):
 
 
 class CUDAAccelerationEval(GPUAccelerationEval):
+    def _call_py_initialize(self, info, t, dt):
+        for call in info['calls']:
+            equation = call.__self__
+            state = self._sync_from_gpu(equation)
+            call(info['dest'], t, dt)
+            for name in state.dtype.names:
+                state[name][0] = getattr(equation, name)
+            equation._gpu.set(state)
+
     def _sync_before_host(self):
         pass
 
@@ -531,10 +543,8 @@ def _cuda_supported_convergence_names_for_group(group):
         for subgroup in group.equations:
             names.update(_cuda_supported_convergence_names_for_group(subgroup))
         return names
-    for equation in getattr(group, 'equations', ()):
-        if hasattr(equation, 'converged') and hasattr(
-                equation, 'equation_has_converged'
-        ):
+    for equation in group.equations:
+        if is_overloaded_method(equation.converged):
             names.add(equation.__class__.__name__)
     return names
 

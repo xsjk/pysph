@@ -103,9 +103,10 @@ class FusedCudaStageBackend:
     def handle_call(self, evaluator, info, extra_args, t, dt):
         if info["type"] == "start_iteration":
             if self.has_device_convergence:
-                kernel_infos = self._device_convergence_kernel_infos(info)
+                iteration_calls = self._device_convergence_calls(info)
                 self.device_convergence_skip_groups = set(
-                    kernel_info["stage_group"] for kernel_info in kernel_infos
+                    call["stage_group"] for call in iteration_calls
+                    if call["type"] == "kernel"
                 )
                 self.device_convergence_active = True
                 self._launch_device_convergence_super_stage(
@@ -119,6 +120,10 @@ class FusedCudaStageBackend:
                 self.device_convergence_active = False
                 return True
             return False
+        if info["type"] == "py_initialize":
+            if not self.device_convergence_active:
+                self._initialize_equations(evaluator, info, t, dt)
+            return True
         if info["type"] != "kernel":
             return False
         stage_group = info["stage_group"]
@@ -155,6 +160,9 @@ class FusedCudaStageBackend:
     def _launch_stage(self, evaluator, stage, info, extra_args):
         raise NotImplementedError("subclasses must launch the fused CUDA stage")
 
+    def _initialize_equations(self, evaluator, info, t, dt):
+        evaluator._call_py_initialize(info, t, dt)
+
     def _launch_snapshot_window(self, evaluator, stage_indices, extra_args):
         for stage_index in stage_indices:
             info = self._kernel_info_for_plan_stage_index(stage_index)
@@ -164,26 +172,26 @@ class FusedCudaStageBackend:
     def _launch_device_convergence_super_stage(
         self, evaluator, info, extra_args, t, dt
     ):
-        kernel_infos = self._device_convergence_kernel_infos(info)
-        policy = self._device_convergence_policy()
+        iteration_calls = self._device_convergence_calls(info)
+        kernel_infos = tuple(
+            call for call in iteration_calls if call["type"] == "kernel"
+        )
         group = info["group"]
         max_iterations = group.max_iterations
         min_iterations = group.min_iterations
         update_nnps = group.update_nnps
-        if policy is not None:
-            max_iterations = policy.max_iterations
-            min_iterations = policy.min_iterations
-            update_nnps = policy.update_nnps
         self._begin_device_convergence_super_stage(kernel_infos)
         try:
             self._run_device_convergence_iterations(
                 evaluator,
                 info,
                 extra_args,
-                kernel_infos,
+                iteration_calls,
                 max_iterations,
                 min_iterations,
                 update_nnps,
+                t,
+                dt,
             )
         finally:
             self._end_device_convergence_super_stage()
@@ -193,16 +201,20 @@ class FusedCudaStageBackend:
         evaluator,
         info,
         extra_args,
-        kernel_infos,
+        iteration_calls,
         max_iterations,
         min_iterations,
         update_nnps,
+        t,
+        dt,
     ):
         for iteration in range(max_iterations):
-            self._begin_device_convergence_iteration(info)
-            for kernel_info in kernel_infos:
-                stage = self.stage_by_group[_stage_group_key(kernel_info)]
-                self._launch_stage(evaluator, stage, kernel_info, extra_args)
+            for call in iteration_calls:
+                if call["type"] == "py_initialize":
+                    self._initialize_equations(evaluator, call, t, dt)
+                else:
+                    stage = self.stage_by_group[_stage_group_key(call)]
+                    self._launch_stage(evaluator, stage, call, extra_args)
             iter_count = iteration + 1
             has_min_iterations = iter_count >= min_iterations
             at_max_iterations = iter_count == max_iterations
@@ -221,9 +233,6 @@ class FusedCudaStageBackend:
     def _device_convergence_has_converged(self, evaluator, info):
         return False
 
-    def _begin_device_convergence_iteration(self, info):
-        pass
-
     def _begin_device_convergence_super_stage(self, kernel_infos):
         pass
 
@@ -233,13 +242,7 @@ class FusedCudaStageBackend:
     def _update_device_convergence_nnps(self, evaluator, info):
         evaluator.update_nnps()
 
-    def _device_convergence_kernel_infos(self, start_info):
-        policy = self._device_convergence_policy()
-        if policy is not None:
-            return tuple(
-                self._kernel_info_for_plan_stage_index(index)
-                for index in policy.child_stage_indices
-            )
+    def _device_convergence_calls(self, start_info):
         start_index = None
         for index, call in enumerate(self.helper.calls):
             if call is start_info:
@@ -247,23 +250,21 @@ class FusedCudaStageBackend:
                 break
         assert start_index is not None
         groups = []
-        kernel_infos = []
+        iteration_calls = []
         for call in self.helper.calls[start_index + 1 :]:
             if call["type"] == "stop_iteration":
-                return tuple(kernel_infos)
+                return tuple(iteration_calls)
+            if call["type"] == "py_initialize":
+                iteration_calls.append(call)
             if call["type"] == "kernel":
                 stage_key = _stage_group_key(call)
+                if stage_key in self.covered_stage_groups:
+                    continue
                 assert stage_key in self.stage_by_group
                 if stage_key not in groups:
                     groups.append(stage_key)
-                    kernel_infos.append(call)
+                    iteration_calls.append(call)
         assert False
-
-    def _device_convergence_policy(self):
-        for stage in self.helper.cuda_stage_plan.stages:
-            if stage.kind is StageKind.DEVICE_CONVERGENCE:
-                return stage.convergence_policy
-        return None
 
     def _kernel_info_for_plan_stage_index(self, stage_index):
         assert stage_index in self.stage_group_by_plan_index
@@ -499,13 +500,15 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
             self.neighbor_contexts = {}
             self._invalidate_neighbor_h_bounds()
 
+    def _initialize_equations(self, evaluator, info, t, dt):
+        self.stream.synchronize()
+        super()._initialize_equations(evaluator, info, t, dt)
+        self.neighbor_contexts = {}
+        self._invalidate_neighbor_h_bounds()
+
     def _device_convergence_has_converged(self, evaluator, info):
         self.stream.synchronize()
-        for equation in info["equations"]:
-            evaluator._sync_from_gpu(equation)
-            if equation.equation_has_converged <= 0:
-                return False
-        return True
+        return evaluator._converged(info["equations"])
 
     def _update_device_convergence_nnps(self, evaluator, info):
         self._refresh_ghost_domain(evaluator)

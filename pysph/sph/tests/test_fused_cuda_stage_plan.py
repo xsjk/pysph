@@ -164,6 +164,13 @@ class HostReduceEquation(Equation):
 
 
 class SyntheticDensityIteration(DensityEquation):
+    def __init__(self, dest, sources):
+        super().__init__(dest, sources)
+        self.ready = 1
+
+    def py_initialize(self, dst, t, dt):
+        self.ready = 1
+
     def converged(self):
         return 1
 
@@ -289,13 +296,15 @@ def test_stage_planner_strict_mode_rejects_host_boundary():
         plan_equation_groups([group], True, ())
 
 
-def test_stage_planner_reports_py_initialize_as_host_boundary():
+def test_stage_planner_orders_py_initialize_before_kernels():
     group = Group([HostInitEquation(dest="fluid", sources=None)])
 
-    plan = plan_equation_groups([group], False, ())
+    plan = plan_equation_groups([group], True, ())
 
-    assert [stage.kind for stage in plan.stages] == [StageKind.HOST_BOUNDARY]
-    assert "py_initialize" in plan.stages[0].reason
+    assert [stage.kind for stage in plan.stages] == [
+        StageKind.PY_INITIALIZE, StageKind.POINTWISE
+    ]
+    assert not plan.has_host_boundary
 
 
 def test_stage_planner_reports_host_reduce_as_host_boundary():
@@ -336,17 +345,17 @@ def test_supported_density_iteration_lowers_to_device_convergence():
     plan = plan_equation_groups([group], True, ("SyntheticDensityIteration",))
 
     assert [stage.kind for stage in plan.stages] == [
+        StageKind.PY_INITIALIZE,
         StageKind.PAIR_DENSITY,
         StageKind.DEVICE_CONVERGENCE,
     ]
     assert not plan.has_host_boundary
-    policy = plan.stages[1].convergence_policy
+    policy = plan.stages[2].convergence_policy
     assert policy.min_iterations == 2
     assert policy.max_iterations == 7
     assert policy.update_nnps
-    assert policy.child_stage_indices == (0,)
+    assert policy.child_stage_indices == (1,)
     assert policy.equation_names == ("SyntheticDensityIteration",)
-    assert policy.flag_fields == ("equation_has_converged",)
 
 
 def test_device_convergence_format_reports_policy():
@@ -361,7 +370,7 @@ def test_device_convergence_format_reports_policy():
     plan = plan_equation_groups([group], True, ("SyntheticDensityIteration",))
 
     assert (
-        "policy=min=2 max=7 update_nnps=True children=0 flags=equation_has_converged"
+        "policy=min=2 max=7 update_nnps=True children=1"
         in plan.format_text()
     )
 

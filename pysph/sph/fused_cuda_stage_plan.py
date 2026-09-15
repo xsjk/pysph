@@ -30,6 +30,7 @@ class StageKind(Enum):
 
     NEIGHBOR_BUILD = "neighbor_build"
     INITIALIZE = "initialize"
+    PY_INITIALIZE = "py_initialize"
     PAIR_DENSITY = "pair_density"
     POINTWISE = "pointwise"
     PAIR_RATE = "pair_rate"
@@ -71,7 +72,6 @@ class DeviceConvergencePolicy:
     update_nnps: bool
     child_stage_indices: tuple[int, ...]
     equation_names: tuple[str, ...]
-    flag_fields: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -89,7 +89,7 @@ class StageNode:
 
     @property
     def has_host_boundary(self):
-        """Return whether this stage requires host-side execution."""
+        """Return whether this stage requires unsupported host-side execution."""
         return self.kind is StageKind.HOST_BOUNDARY
 
 
@@ -106,7 +106,7 @@ class CudaStagePlan:
         return any(stage.has_host_boundary for stage in self.stages)
 
     def assert_strict_supported(self):
-        """Raise if strict mode cannot execute the plan fully on device."""
+        """Raise if strict mode cannot execute every planned stage."""
         if self.strict and self.has_host_boundary:
             raise StrictPlanError(self.format_text())
 
@@ -129,8 +129,7 @@ def _format_convergence_policy(policy):
     if policy is None:
         return ""
     children = ",".join(str(index) for index in policy.child_stage_indices)
-    flags = ",".join(policy.flag_fields)
-    return f" policy=min={policy.min_iterations} max={policy.max_iterations} update_nnps={policy.update_nnps} children={children} flags={flags}"
+    return f" policy=min={policy.min_iterations} max={policy.max_iterations} update_nnps={policy.update_nnps} children={children}"
 
 
 def analyze_equation_method(equation, method_name):
@@ -559,8 +558,6 @@ def _plan_group(group, supported_convergence, stage_start_index):
     methods_by_dest = {dest: [] for dest in destinations}
     unsupported = []
     for equation in group.equations:
-        if _has_overloaded_method(equation, "py_initialize"):
-            unsupported.append("py_initialize")
         deps = method_deps_for_equation(equation)
         methods_by_dest[equation.dest].extend(deps)
         for item in deps:
@@ -578,7 +575,23 @@ def _plan_group(group, supported_convergence, stage_start_index):
 
     child_stage_indices = []
     for dest in destinations:
+        if any(
+            equation.dest == dest and _has_overloaded_method(equation, "py_initialize")
+            for equation in group.equations
+        ):
+            stages.append(
+                StageNode(
+                    kind=StageKind.PY_INITIALIZE,
+                    dest=dest,
+                    sources=(),
+                    methods=(),
+                    reason="host initialization before destination kernels",
+                    convergence_policy=None,
+                )
+            )
         dest_methods = tuple(methods_by_dest[dest])
+        if not dest_methods:
+            continue
         child_stage_indices.append(stage_start_index + len(stages))
         sources = tuple(
             dict.fromkeys(
@@ -646,15 +659,21 @@ def _stage_kind_for_methods(methods):
 
 
 def _group_has_supported_convergence(group, supported_convergence):
-    names = {equation.__class__.__name__ for equation in group.equations}
-    return bool(names.intersection(set(supported_convergence)))
+    equations = [
+        equation for equation in _flatten_equations(group)
+        if _has_overloaded_method(equation, "converged")
+    ]
+    return bool(equations) and all(
+        equation.__class__.__name__ in supported_convergence
+        for equation in equations
+    )
 
 
 def _device_convergence_policy(group, supported_convergence, child_stage_indices):
     supported = set(supported_convergence)
     equation_names = tuple(
         equation.__class__.__name__
-        for equation in group.equations
+        for equation in _flatten_equations(group)
         if equation.__class__.__name__ in supported
     )
     assert equation_names
@@ -664,7 +683,6 @@ def _device_convergence_policy(group, supported_convergence, child_stage_indices
         update_nnps=bool(group.update_nnps),
         child_stage_indices=child_stage_indices,
         equation_names=equation_names,
-        flag_fields=("equation_has_converged",),
     )
 
 
@@ -766,6 +784,10 @@ class _AccessCollector(ast.NodeVisitor):
         self.visit(node.value)
 
     def visit_Call(self, node):
+        if isinstance(node.func, ast.Name) and node.func.id in (
+            "atomic_inc", "atomic_dec", "atomic_min"
+        ):
+            self._record_target(node.args[0], True)
         for arg in node.args:
             if isinstance(arg, ast.Name) and _is_array_name(arg.id):
                 self.unsupported_reasons.append(f"bare array argument {arg.id}")
