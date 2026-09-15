@@ -652,6 +652,15 @@ def _can_launch_snapshot_pair_window(left, right):
     hoisted_left_post, remaining_left_post = _snapshot_hoisted_left_post_methods(
         left_loop, left_post
     )
+    right_source_reads = set(_methods_precomputed_source_reads(right.methods))
+    for method in right.methods:
+        right_source_reads.update(method.source_reads)
+    # A snapshot holds old values. Reading newly written source state needs
+    # a kernel boundary, even when the writer can be hoisted before the loop.
+    if right_source_reads.intersection(
+        _methods_written_fields(left_pre + hoisted_left_post)
+    ):
+        return False
     snapshot_fields = _snapshot_pair_window_fields_from_parts(
         left_loop, right_pre, right_loop
     )
