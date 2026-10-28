@@ -948,8 +948,8 @@ class AccelerationEvalGPUHelper(object):
         py_args = []
         code = []
         for eq in eq_group.equations:
-            method = getattr(eq, kind, None)
-            if method is not None:
+            method = getattr(eq, kind)
+            if is_overloaded_method(method):
                 cls = eq.__class__.__name__
                 arg = 'GLOBAL_MEM {cls}* {name}'.format(
                     cls=cls, name=eq.var_name
