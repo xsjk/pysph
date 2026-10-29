@@ -409,16 +409,7 @@ class GPUAccelerationEval(object):
     def update_particle_arrays(self, arrays):
         raise NotImplementedError('GPU backend is incomplete')
 
-    def _stage_backend_handles_internal_update_nnps(self):
-        if self.stage_backend is None:
-            return False
-        if not hasattr(self.stage_backend, "handle_internal_update_nnps"):
-            return False
-        return self.stage_backend.handle_internal_update_nnps(self)
-
     def update_nnps(self):
-        if self._stage_backend_handles_internal_update_nnps():
-            return
         with profile_ctx('Integrator.update_domain'):
             self.nnps.update_domain()
         with profile_ctx('nnps.update'):
@@ -780,7 +771,9 @@ class AccelerationEvalGPUHelper(object):
                     GeneratedFusedCudaStageBackend,
                 )
 
-                acceleration_eval.stage_backend = GeneratedFusedCudaStageBackend(self)
+                acceleration_eval.stage_backend = GeneratedFusedCudaStageBackend(
+                    self, get_config().fused_block_size
+                )
 
         object.set_compiled_object(acceleration_eval)
 

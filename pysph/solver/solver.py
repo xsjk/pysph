@@ -277,23 +277,6 @@ class Solver(object):
         """
         self.pre_step_callbacks.append(callback)
 
-    def _stage_backend_for_acceleration_eval(self, index):
-        acceleration_eval = self.acceleration_evals[index]
-        if not hasattr(acceleration_eval, "c_acceleration_eval"):
-            return None
-        compiled_eval = acceleration_eval.c_acceleration_eval
-        if not hasattr(compiled_eval, "stage_backend"):
-            return None
-        return compiled_eval.stage_backend
-
-    def _stage_backend_handles_reorder_update_nnps(self):
-        backend = self._stage_backend_for_acceleration_eval(0)
-        if backend is None:
-            return False
-        if not hasattr(backend, "handle_reorder_update_nnps"):
-            return False
-        return backend.handle_reorder_update_nnps(self)
-
     def append_particle_arrrays(self, arrays):
         """ Append the particle arrays to the existing particle arrays
         """
@@ -313,25 +296,20 @@ class Solver(object):
     def reorder_particles(self):
         """Re-order particles so as to coalesce memory access.
         """
-        backend_handles_update = (
-            self._stage_backend_handles_reorder_update_nnps()
+        manager = self.nnps.domain.manager
+        rebuild_ghosts = (
+            manager.is_periodic
+            and not manager.in_parallel
+            and not manager.minimum_image_periodic
         )
-        if not backend_handles_update:
-            manager = self.nnps.domain.manager
-            rebuild_ghosts = (
-                manager.is_periodic
-                and not manager.in_parallel
-                and not manager.minimum_image_periodic
-            )
-            if rebuild_ghosts:
-                manager._remove_ghosts()
-            self.nnps.update()
+        if rebuild_ghosts:
+            manager._remove_ghosts()
+        self.nnps.update()
         for i in range(len(self.particles)):
             self.nnps.spatially_order_particles(i)
-        if not backend_handles_update:
-            if rebuild_ghosts:
-                self.nnps.update_domain()
-            self.nnps.update()
+        if rebuild_ghosts:
+            self.nnps.update_domain()
+        self.nnps.update()
 
     def set_adaptive_timestep(self, value):
         """Set it to True to use adaptive timestepping based on

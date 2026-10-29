@@ -68,6 +68,9 @@ class TestApplication(TestCase):
         self.output_dir = mkdtemp()
         self.app = MockApp(output_dir=self.output_dir)
         config = get_config()
+        block_config = mock.patch.object(config, 'fused_block_size', None, create=True)
+        block_config.start()
+        self.addCleanup(block_config.stop)
         self._old_use_cuda = config.use_cuda
         self._old_use_opencl = config.use_opencl
         self._old_use_fused_cuda = getattr(config, 'use_fused_cuda', False)
@@ -114,17 +117,17 @@ class TestApplication(TestCase):
         # No interfaces should be started by default.
         self.assertEqual(len(app._interfaces), 0)
 
-    def test_cuda_fused_defaults_to_hbucket_nnps(self):
+    def test_cuda_fused_defaults_to_native_nnps(self):
         app = self.app
-        app.set_args(['--cuda', '--fused'])
+        app.set_args(['--cuda', '--fused', '--fused-block-size', '256'])
 
         app._parse_command_line(force=True)
 
-        self.assertEqual(app.options.nnps, 'hbucket')
+        self.assertEqual(app.options.nnps, 'll')
 
     def test_cuda_fused_sets_global_config(self):
         app = self.app
-        app.set_args(['--cuda', '--fused'])
+        app.set_args(['--cuda', '--fused', '--fused-block-size', '128'])
         app._parse_command_line(force=True)
 
         app._configure_global_config()
@@ -132,15 +135,22 @@ class TestApplication(TestCase):
         config = get_config()
         self.assertTrue(config.use_cuda)
         self.assertTrue(config.use_fused_cuda)
+        self.assertEqual(config.fused_block_size, 128)
 
-    def test_fused_rejects_non_hbucket_nnps(self):
+    def test_fused_accepts_native_gpu_nnps(self):
         app = self.app
-        app.set_args(['--cuda', '--fused', '--nnps', 'gpu_octree'])
+        app.set_args(['--cuda', '--fused', '--fused-block-size', '256',
+                      '--nnps', 'gpu_octree'])
 
-        with self.assertRaises(SystemExit):
-            app._parse_command_line(force=True)
+        app._parse_command_line(force=True)
+        self.assertEqual(app.options.nnps, 'gpu_octree')
 
-    def test_hbucket_requires_fused_cuda(self):
+    def test_fused_requires_explicit_block_size(self):
+        self.app.set_args(['--cuda', '--fused'])
+        with self.assertRaisesRegex(AssertionError, '--fused-block-size'):
+            self.app._parse_command_line(force=True)
+
+    def test_removed_hbucket_option_is_rejected(self):
         app = self.app
         app.set_args(['--cuda', '--nnps', 'hbucket'])
 

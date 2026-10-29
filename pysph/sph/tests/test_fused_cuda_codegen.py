@@ -1,24 +1,23 @@
 """Tests for the retained fused CUDA codegen paths."""
 
 from dataclasses import replace
-from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from pysph.sph.fused_cuda_codegen import (
     CudaPairPrecompute,
     _force_cuda_source_fp32,
-    generate_hbucket_pair_stage_outline_from_equations,
+    generate_csr_pair_stage_outline_from_equations,
     generate_pointwise_kernel_outline_with_equation_calls,
-    generate_snapshot_hbucket_pair_window_outline_from_equations,
-    hbucket_context_argument_declarations,
-    PairLaunchConfig,
-    snapshot_hbucket_pair_window_stage,
+    generate_snapshot_csr_pair_window_outline_from_equations,
+    csr_context_argument_declarations,
+    CudaLaunchConfig,
+    launch_cuda_kernel,
+    snapshot_csr_pair_window_stage,
 )
 from pysph.sph.equation import CUDAGroup, KnownType
 from pysph.sph.fused_cuda_stage_backend import (
-    _neighbor_context_bounds_and_periodicity,
-    _pair_traversal_for_stage,
     _snapshot_pair_window_fields,
     _snapshot_pair_windows,
 )
@@ -120,44 +119,43 @@ def test_fp32_wrapper_uses_fast_dim_power_helpers():
     )
 
 
-def test_hbucket_pair_outline_keeps_variable_h_bucket_traversal():
+def test_csr_pair_outline_keeps_variable_h_bucket_traversal():
     deps = _sum_reduction_deps("AddMass", "au")
     stage = _stage(StageKind.PAIR_RATE, (deps,))
     equation = AddMass(dest="fluid", sources=["fluid"])
 
-    outline = generate_hbucket_pair_stage_outline_from_equations(
+    outline = generate_csr_pair_stage_outline_from_equations(
         "plan0",
         stage,
         (equation,),
         CudaPairPrecompute(symbols=frozenset(), helper_source="", lines=()),
         {},
+        False,
     )
 
-    for declaration in hbucket_context_argument_declarations():
+    for declaration in csr_context_argument_declarations():
         assert declaration in outline.source
-    assert "for (int bucket = 0; bucket < bucket_count; ++bucket)" in outline.source
-    assert (
-        "int dst = n == source_count ? sorted_ids[fused_dst_linear] "
-        ": fused_dst_linear;" in outline.source
-    )
-    assert "cell_bucket_h_max_bits[flat]" in outline.source
-    assert "cell_bucket_starts[flat]" in outline.source
+    assert "int dst = fused_dst_linear;" in outline.source
+    assert "unsigned int begin = start_idx[dst];" in outline.source
+    assert "int src = neighbors[pos];" in outline.source
+    assert "bucket_count" not in outline.source
     assert "float fused_acc_d_au = 0.0f;" in outline.source
     assert "AddMass_loop(add_mass0, dst, src, fused_local_d_au, s_m);" in outline.source
     assert "d_au[dst] += fused_acc_d_au;" in outline.source
 
 
-def test_hbucket_pair_outline_uses_known_integer_array_type():
+def test_csr_pair_outline_uses_known_integer_array_type():
     deps = _sum_reduction_deps("AddMass", "au")
     stage = _stage(StageKind.PAIR_RATE, (deps,))
     equation = AddMass(dest="fluid", sources=["fluid"])
 
-    outline = generate_hbucket_pair_stage_outline_from_equations(
+    outline = generate_csr_pair_stage_outline_from_equations(
         "plan0",
         stage,
         (equation,),
         CudaPairPrecompute(symbols=frozenset(), helper_source="", lines=()),
         {"s_m": KnownType("GLOBAL_MEM long*")},
+        False,
     )
 
     assert "GLOBAL_MEM long* s_m" in outline.source
@@ -176,7 +174,7 @@ def test_snapshot_pair_window_snapshots_left_read_before_right_write():
     assert _snapshot_pair_windows((left, right)) == ((0, 1),)
     assert _snapshot_pair_window_fields((left, right)) == ("au",)
 
-    combined = snapshot_hbucket_pair_window_stage((left, right))
+    combined = snapshot_csr_pair_window_stage((left, right))
 
     assert [
         (method.equation_name, method.method_kind) for method in combined.methods
@@ -196,16 +194,17 @@ def test_snapshot_pair_window_outline_reads_snapshotted_left_arguments():
     left = _stage(StageKind.PAIR_RATE, _method_deps(left_equation))
     right = _stage(StageKind.PAIR_RATE, _method_deps(right_equation))
 
-    outline = generate_snapshot_hbucket_pair_window_outline_from_equations(
+    outline = generate_snapshot_csr_pair_window_outline_from_equations(
         "plan0",
         (left, right),
         ((left_equation,), (right_equation,)),
         CudaPairPrecompute(symbols=frozenset(), helper_source="", lines=()),
         ("au",),
         {},
+        False,
     )
 
-    assert outline.name == "fused_plan0_fluid_snapshot_hbucket_pair_window"
+    assert outline.name == "fused_plan0_fluid_pair_rate"
     assert "GLOBAL_MEM float* fused_snapshot_au" in outline.source
     assert (
         "ReadDestAndSourceAcceleration_loop("
@@ -218,13 +217,6 @@ def test_snapshot_pair_window_outline_reads_snapshotted_left_arguments():
     )
 
 
-def test_pair_traversal_uses_hbucket_context():
-    assert (
-        _pair_traversal_for_stage(SimpleNamespace(cell_bucket_counts=object()))
-        == "hbucket"
-    )
-
-
 def test_backend_records_pair_launch_config_counts():
     from pysph.sph.fused_cuda_stage_backend import GeneratedFusedCudaStageBackend
 
@@ -232,43 +224,39 @@ def test_backend_records_pair_launch_config_counts():
     backend.pair_launch_config_counts = {}
 
     backend._record_pair_launch_config(
-        PairLaunchConfig(traversal="hbucket", n=1000, block_size=256, grid_x=4)
+        CudaLaunchConfig(traversal="csr", n=1000, block_size=256, grid_x=4)
     )
     backend._record_pair_launch_config(
-        PairLaunchConfig(traversal="hbucket", n=1000, block_size=256, grid_x=4)
+        CudaLaunchConfig(traversal="csr", n=1000, block_size=256, grid_x=4)
     )
 
     assert backend.pair_launch_config_counts == {
-        ("hbucket", 1000, 256, 4): 2,
+        ("csr", 1000, 256, 4): 2,
     }
 
 
-def test_neighbor_context_uses_domain_bounds_for_minimum_image_periodic():
-    manager = SimpleNamespace(
-        xmin=-1.0,
-        xmax=1.0,
-        ymin=-0.5,
-        ymax=0.5,
-        zmin=-0.125,
-        zmax=0.125,
-        minimum_image_periodic=True,
-        periodic_in_x=True,
-        periodic_in_y=True,
-        periodic_in_z=True,
-    )
-    nnps = SimpleNamespace(
-        xmin=np.array([-0.996, -0.496, -0.121], dtype=np.float64),
-        xmax=np.array([0.996, 0.496, 0.121], dtype=np.float64),
-        domain=SimpleNamespace(manager=manager),
-    )
+@pytest.mark.parametrize("size", [1, 255, 256, 257])
+@pytest.mark.parametrize("block_size", [128, 256])
+def test_launch_uses_configured_block_and_covers_tail(size, block_size):
+    calls = []
 
-    lower, upper, periodic = _neighbor_context_bounds_and_periodicity(nnps)
+    def kernel(*arguments, **options):
+        calls.append((arguments, options))
 
-    np.testing.assert_allclose(lower, np.array([-1.0, -0.5, -0.125], dtype=np.float32))
-    np.testing.assert_allclose(upper, np.array([1.0, 0.5, 0.125], dtype=np.float32))
-    np.testing.assert_array_equal(
-        periodic, np.array([True, True, True], dtype=np.bool_)
-    )
+    arguments = (np.int32(size), np.float32(2.0))
+    config = launch_cuda_kernel(kernel, size, None, arguments, "pointwise", block_size)
+    grid = (size + block_size - 1) // block_size
+    assert config == CudaLaunchConfig("pointwise", size, block_size, grid)
+    assert calls == [
+        (
+            arguments,
+            {
+                "block": (block_size, 1, 1),
+                "grid": (grid, 1, 1),
+                "stream": None,
+            },
+        )
+    ]
 
 
 def _call(equation, method_name, known_types, precomputed_symbols):
@@ -286,3 +274,47 @@ def _method_deps(equation):
         analyze_equation_method(equation, method_name)
         for method_name in ("initialize", "loop", "post_loop")
     )
+
+
+def test_pointwise_and_pair_outlines_emit_shared_table_helpers_once():
+    from pysph.sph.fused_cuda_codegen import (
+        generate_pointwise_stage_outline_from_equations,
+    )
+    from pysph.sph.tests.fused_cuda_codegen_equations import (
+        TableLookup,
+        SourceTableLookup,
+    )
+
+    pointwise = TableLookup(dest="fluid", sources=None)
+    deps = analyze_equation_method(pointwise, "loop")
+    stage = StageNode(
+        kind=StageKind.POINTWISE,
+        dest="fluid",
+        sources=(),
+        methods=(deps,),
+        reason="test",
+        convergence_policy=None,
+    )
+    known_types = {"d_index": KnownType("GLOBAL_MEM int*")}
+    outline = generate_pointwise_stage_outline_from_equations(
+        "table", stage, (pointwise,), known_types
+    )
+    assert outline.source.count("WITHIN_KERNEL float table_element(") == 1
+    assert outline.source.count("WITHIN_KERNEL float table_lookup(") == 1
+    assert (
+        outline.source.index("WITHIN_KERNEL float table_element(")
+        < outline.source.index("WITHIN_KERNEL float table_lookup(")
+        < outline.source.index("WITHIN_KERNEL void TableLookup_loop(")
+    )
+    pair = SourceTableLookup(dest="fluid", sources=["fluid"])
+    deps = analyze_equation_method(pair, "loop")
+    stage = _stage(StageKind.PAIR_RATE, (deps,))
+    outline = generate_csr_pair_stage_outline_from_equations(
+        "table",
+        stage,
+        (pair,),
+        CudaPairPrecompute(symbols=frozenset(), helper_source="", lines=()),
+        {"s_index": KnownType("GLOBAL_MEM int*")},
+        False,
+    )
+    assert outline.source.count("WITHIN_KERNEL float table_lookup(") == 1

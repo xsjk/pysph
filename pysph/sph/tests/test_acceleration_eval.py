@@ -1,5 +1,6 @@
 # Standard library imports.
 import unittest
+from unittest.mock import patch
 
 # Library imports.
 import pytest
@@ -220,33 +221,10 @@ class TestAccelerationEvalGPUHelperCodegen(unittest.TestCase):
             [("begin", evaluator, 1.0, 0.25), ("end", evaluator, 1.0, 0.25)],
         )
 
-    def test_stage_backend_can_handle_internal_update_nnps(self):
-        class HandlingStageBackend(object):
-            def __init__(self):
-                self.calls = []
-
-            def handle_internal_update_nnps(self, evaluator):
-                self.calls.append(evaluator)
-                return True
-
-        class NNPS(object):
-            def update_domain(self):
-                raise AssertionError("update_domain should be handled by backend")
-
-            def update(self):
-                raise AssertionError("update should be handled by backend")
-
-        evaluator = object.__new__(GPUAccelerationEval)
-        evaluator.stage_backend = HandlingStageBackend()
-        evaluator.nnps = NNPS()
-
-        evaluator.update_nnps()
-
-        self.assertEqual(evaluator.stage_backend.calls, [evaluator])
-
     def test_cuda_helper_can_install_generated_fused_stage_backend(self):
         class CompiledObject(object):
             particle_arrays = []
+            all_group = Group([])
 
             def set_compiled_object(self, compiled):
                 self.compiled = compiled
@@ -264,7 +242,8 @@ class TestAccelerationEvalGPUHelperCodegen(unittest.TestCase):
         old_use_fused_cuda = getattr(config, "use_fused_cuda", False)
         config.use_fused_cuda = True
         try:
-            helper.setup_compiled_module(None)
+            with patch.object(config, "fused_block_size", 256, create=True):
+                helper.setup_compiled_module(None)
         finally:
             config.use_fused_cuda = old_use_fused_cuda
 

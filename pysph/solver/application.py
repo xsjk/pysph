@@ -461,6 +461,10 @@ class Application(object):
             default=False,
             help="Use the generated fused CUDA stage backend."
         )
+        parser.add_argument(
+            "--fused-block-size", type=int,
+            help="Threads per fused CUDA block; required with --fused."
+        )
 
         # --use-local-memory
         parser.add_argument(
@@ -515,8 +519,7 @@ class Application(object):
             dest="nnps",
             choices=[
                 'box', 'll', 'sh', 'esh', 'ci', 'sfc', 'comp_tree',
-                'strat_hash', 'strat_sfc', 'tree', 'gpu_octree',
-                'hbucket'
+                'strat_hash', 'strat_sfc', 'tree', 'gpu_octree'
             ],
             default=None,
             help="Use one of box-sort ('box') or "
@@ -529,8 +532,7 @@ class Application(object):
             "the stratified sfc algorithm ('strat_sfc') or "
             "the octree algorithm ('tree') or "
             "the compressed octree algorithm ('comp_tree') or "
-            "the gpu octree algorithm ('gpu_octree') or "
-            "the fused CUDA hashed bucket algorithm ('hbucket')")
+            "the gpu octree algorithm ('gpu_octree')")
 
         nnps_options.add_argument(
             "--spatial-hash-sub-factor",
@@ -784,15 +786,14 @@ class Application(object):
 
     def _validate_command_line_options(self, options):
         if options.nnps is None:
-            options.nnps = 'hbucket' if options.with_fused_cuda else 'll'
+            options.nnps = 'll'
         if options.with_fused_cuda and not options.with_cuda:
             self.arg_parse.error("--fused requires --cuda")
         if options.with_fused_cuda and options.with_opencl:
             self.arg_parse.error("--fused cannot be used with --opencl")
-        if options.with_fused_cuda and options.nnps != 'hbucket':
-            self.arg_parse.error("--fused requires --nnps hbucket")
-        if options.nnps == 'hbucket' and not options.with_fused_cuda:
-            self.arg_parse.error("--nnps hbucket requires --cuda --fused")
+        if options.with_fused_cuda:
+            assert options.fused_block_size is not None, \
+                "--fused requires --fused-block-size"
 
     def _process_command_line(self):
         """Process the parsed command line arguments.
@@ -962,6 +963,7 @@ class Application(object):
             config.use_cuda = True
             logger.info('Using CUDA')
         config.use_fused_cuda = bool(options.with_fused_cuda)
+        config.fused_block_size = options.fused_block_size
 
         if options.with_local_memory:
             leaf_size = int(options.octree_leaf_size)
@@ -1007,7 +1009,8 @@ class Application(object):
                     #                      "be a multiple of 32")
 
                     from pysph.base.octree_gpu_nnps import OctreeGPUNNPS
-                    # Sorting enabled by default
+
+                    # The solver owns particle reordering.
                     print("Using elementwise: ", options.octree_elementwise)
                     nnps = OctreeGPUNNPS(
                         dim=solver.dim,
@@ -1016,7 +1019,7 @@ class Application(object):
                         domain=self.domain,
                         cache=True,
                         sort_gids=options.sort_gids,
-                        allow_sort=options.reorder_freq != 0,
+                        allow_sort=False,
                         leaf_size=leaf_size,
                         use_elementwise=options.octree_elementwise,
                     )

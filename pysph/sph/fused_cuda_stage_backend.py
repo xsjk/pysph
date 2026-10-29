@@ -2,29 +2,27 @@
 
 import inspect
 import os
-from dataclasses import replace
 
 import numpy as np
 
-from pysph.base.fused_cuda_nnps import (
-    FusedCudaNeighborWorkspace,
-    build_fused_cuda_hierarchical_hbucket_context_with_workspace,
-    wrap_periodic_xyz,
-)
 from pysph.sph.fused_cuda_codegen import (
     CudaPairPrecompute,
+    _methods_read_fields,
+    _methods_read_written_fields,
+    _methods_written_fields,
+    _pair_segment_methods,
+    _snapshot_hoisted_left_post_methods,
+    _stage_can_use_pointwise_kernel,
+    _unique_equations,
     cubic_spline_pair_precompute_for_symbols,
     gaussian_pair_precompute_for_symbols,
-    generate_hbucket_pair_stage_outline_from_equations,
-    generate_snapshot_hbucket_pair_window_outline_from_equations,
-    PairLaunchConfig,
+    generate_csr_pair_stage_outline_from_equations,
+    generate_snapshot_csr_pair_window_outline_from_equations,
     generate_pointwise_stage_outline_from_equations,
-    launch_hbucket_pair_kernel_with_context,
-    launch_pointwise_kernel,
-    launch_snapshot_hbucket_pair_window_kernel_with_context,
+    launch_cuda_kernel,
     precompute_argument_names,
     quintic_spline_pair_precompute_for_symbols,
-    snapshot_hbucket_pair_window_stage,
+    snapshot_csr_pair_window_stage,
     super_gaussian_pair_precompute_for_symbols,
     wendland_quintic_c2_1d_pair_precompute_for_symbols,
     wendland_quintic_c4_1d_pair_precompute_for_symbols,
@@ -38,6 +36,7 @@ from pysph.sph.fused_cuda_stage_plan import (
     StageKind,
     _equation_method_access,
     _has_overloaded_method,
+    _precomputed_source_reads,
 )
 
 
@@ -129,12 +128,13 @@ class FusedCudaStageBackend:
             if self.has_device_convergence:
                 iteration_calls = self._device_convergence_calls(info)
                 self.device_convergence_skip_groups = set(
-                    call["stage_group"] for call in iteration_calls
+                    call["stage_group"]
+                    for call in iteration_calls
                     if call["type"] == "kernel"
                 )
                 self.device_convergence_active = True
                 self._launch_device_convergence_super_stage(
-                    evaluator, info, extra_args, t, dt
+                    evaluator, info, extra_args, iteration_calls, t, dt
                 )
                 return True
             return False
@@ -175,12 +175,6 @@ class FusedCudaStageBackend:
     def end_compute(self, evaluator, t, dt):
         return False
 
-    def handle_outer_update_nnps(self, integrator, index):
-        return integrator.nnps.domain.manager.minimum_image_periodic
-
-    def handle_reorder_update_nnps(self, solver):
-        return True
-
     def _launch_stage(self, evaluator, stage, info, extra_args):
         raise NotImplementedError("subclasses must launch the fused CUDA stage")
 
@@ -194,77 +188,25 @@ class FusedCudaStageBackend:
             self._launch_stage(evaluator, stage, info, extra_args)
 
     def _launch_device_convergence_super_stage(
-        self, evaluator, info, extra_args, t, dt
+        self, evaluator, info, extra_args, iteration_calls, t, dt
     ):
-        iteration_calls = self._device_convergence_calls(info)
-        kernel_infos = tuple(
-            call for call in iteration_calls if call["type"] == "kernel"
-        )
         group = info["group"]
-        max_iterations = group.max_iterations
-        min_iterations = group.min_iterations
-        update_nnps = group.update_nnps
-        self._begin_device_convergence_super_stage(kernel_infos)
-        try:
-            self._run_device_convergence_iterations(
-                evaluator,
-                info,
-                extra_args,
-                iteration_calls,
-                max_iterations,
-                min_iterations,
-                update_nnps,
-                t,
-                dt,
-            )
-        finally:
-            self._end_device_convergence_super_stage()
-
-    def _run_device_convergence_iterations(
-        self,
-        evaluator,
-        info,
-        extra_args,
-        iteration_calls,
-        max_iterations,
-        min_iterations,
-        update_nnps,
-        t,
-        dt,
-    ):
-        for iteration in range(max_iterations):
+        for iteration in range(1, group.max_iterations + 1):
             for call in iteration_calls:
                 if call["type"] == "py_initialize":
                     self._initialize_equations(evaluator, call, t, dt)
                 else:
                     stage = self.stage_by_group[_stage_group_key(call)]
                     self._launch_stage(evaluator, stage, call, extra_args)
-            iter_count = iteration + 1
-            has_min_iterations = iter_count >= min_iterations
-            at_max_iterations = iter_count == max_iterations
-            has_converged = False
-            if has_min_iterations and not at_max_iterations:
-                has_converged = self._device_convergence_has_converged(
-                    evaluator, info
-                )
-            if has_min_iterations and (at_max_iterations or has_converged):
-                self.device_convergence_iteration_counts.append(iter_count)
+            if iteration >= group.min_iterations and (
+                iteration == group.max_iterations
+                or evaluator._converged(info["equations"])
+            ):
+                self.device_convergence_iteration_counts.append(iteration)
                 return
-            if update_nnps:
+            if group.update_nnps:
                 self.device_convergence_rebuild_count += 1
-                self._update_device_convergence_nnps(evaluator, info)
-
-    def _device_convergence_has_converged(self, evaluator, info):
-        return False
-
-    def _begin_device_convergence_super_stage(self, kernel_infos):
-        pass
-
-    def _end_device_convergence_super_stage(self):
-        pass
-
-    def _update_device_convergence_nnps(self, evaluator, info):
-        evaluator.update_nnps()
+                evaluator.update_nnps()
 
     def _device_convergence_calls(self, start_info):
         start_index = None
@@ -302,97 +244,81 @@ class FusedCudaStageBackend:
 class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
     """Executable fused CUDA stage backend for the supported strict subset."""
 
-    def __init__(self, helper):
+    def __init__(self, helper, block_size):
         super().__init__(helper)
-        import pycuda.driver as cuda
-
-        self.stream = cuda.Stream()
-        self.modules = {}
-        self.outlines = {}
-        self.neighbor_contexts = {}
-        self.neighbor_workspaces = {}
+        assert type(block_size) is int
+        assert 32 <= block_size <= 1024 and block_size % 32 == 0
+        self.block_size = block_size
+        # Share the native NNPS and integrator default stream.
+        self.stream = None
+        self.programs = {}
+        self.snapshot_programs = {}
         self.snapshot_arrays = {}
         self.launch_count = 0
-        self.h_reduce_scratch = []
         self.traversal_launch_counts = {}
         self.pair_launch_config_counts = {}
         self.stage_timing_ms = {}
         self.stage_timing_counts = {}
 
-    def begin_compute(self, evaluator, t, dt):
-        super().begin_compute(evaluator, t, dt)
-        self.neighbor_contexts = {}
-
-    def _launch_stage(self, evaluator, stage, info, extra_args):
-        self._launch_single_stage(evaluator, stage, info, extra_args)
-
     def _launch_snapshot_window(self, evaluator, stage_indices, extra_args):
-        stages = tuple(
-            self.helper.cuda_stage_plan.stages[index] for index in stage_indices
-        )
         infos = tuple(
             self._kernel_info_for_plan_stage_index(index) for index in stage_indices
         )
-        context = self._neighbor_context_for_stage(evaluator, infos[0])
-        equations_by_stage = tuple(
-            _equations_for_stage(self.helper, stage, info["stage_group"])
-            for stage, info in zip(stages, infos)
+        pair_args, periodic = self._pair_args(evaluator, infos[0])
+        combined_stage, snapshot_fields, program = self._program_for_snapshot_window(
+            stage_indices, infos, periodic
         )
-        combined_stage = snapshot_hbucket_pair_window_stage(stages)
-        precompute = _precompute_for_stage(combined_stage, self.helper.object.kernel)
-        snapshot_fields = _snapshot_pair_window_fields(stages)
-        outline = self._outline_for_snapshot_hbucket_pair_window(
-            stages, equations_by_stage, precompute, snapshot_fields
-        )
-        module = self._module_for_stage(outline, infos[0], combined_stage)
-        combined_equations = _unique_equations_for_window(equations_by_stage)
-        stage_args = _stage_extra_args(
-            self.helper,
-            combined_stage,
-            combined_equations,
-            infos[0],
-            extra_args,
-            precompute,
+        _module, kernel, names = program
+        stage_args = tuple(
+            _stage_extra_arg_value(self.helper, name, infos[0], extra_args)
+            for name in names
         )
         snapshot_args = tuple(
             self._snapshot_field_arg(infos[0], field) for field in snapshot_fields
         )
         timer = _stage_timer(self.stream)
-        launch_config = launch_snapshot_hbucket_pair_window_kernel_with_context(
-            module,
-            outline.name,
-            context,
-            snapshot_args,
-            stage_args,
+        launch_config = launch_cuda_kernel(
+            kernel,
+            infos[0]["dest"].get_number_of_particles(True),
+            self.stream,
+            pair_args + snapshot_args + stage_args,
+            "snapshot_csr",
+            self.block_size,
         )
-        traversal = "snapshot_hbucket"
-        self._record_pair_launch(traversal)
+        self._record_pair_launch("snapshot_csr")
         self._record_pair_launch_config(launch_config)
-        for stage in stages:
-            self._finish_launched_stage(stage)
-        self._record_stage_timing(
-            _snapshot_hbucket_pair_window_stage(stages), traversal, timer
-        )
+        self._record_stage_timing(combined_stage, "snapshot_csr", timer)
         self.launch_count += 1
 
-    def _outline_for_snapshot_hbucket_pair_window(
-        self, stages, equations_by_stage, precompute, snapshot_fields
-    ):
-        outline_key = _snapshot_hbucket_pair_window_key(
-            stages, precompute, snapshot_fields
+    def _program_for_snapshot_window(self, stage_indices, infos, periodic):
+        key = stage_indices, periodic
+        if key in self.snapshot_programs:
+            return self.snapshot_programs[key]
+        stages = tuple(
+            self.helper.cuda_stage_plan.stages[index] for index in stage_indices
         )
-        if outline_key in self.outlines:
-            return self.outlines[outline_key]
-        outline = generate_snapshot_hbucket_pair_window_outline_from_equations(
+        equations_by_stage = tuple(
+            _equations_for_stage(self.helper, stage, info["stage_group"])
+            for stage, info in zip(stages, infos)
+        )
+        stage = snapshot_csr_pair_window_stage(stages)
+        precompute = _precompute_for_stage(stage, self.helper.object.kernel)
+        snapshot_fields = _snapshot_pair_window_fields(stages)
+        outline = generate_snapshot_csr_pair_window_outline_from_equations(
             "cuda_eval",
             stages,
             equations_by_stage,
             precompute,
             snapshot_fields,
             self.helper.known_types,
+            periodic,
         )
-        self.outlines[outline_key] = outline
-        return outline
+        names = _stage_extra_arg_names(
+            stage, _unique_equations(equations_by_stage), precompute
+        )
+        program = self._compile_program(outline, names)
+        self.snapshot_programs[key] = stage, snapshot_fields, program
+        return self.snapshot_programs[key]
 
     def _snapshot_field_arg(self, info, field):
         import pycuda.driver as cuda
@@ -414,39 +340,27 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
         )
         return target
 
-    def _launch_single_stage(self, evaluator, stage, info, extra_args):
-        equations = _equations_for_stage(self.helper, stage, info["stage_group"])
-        precompute = _precompute_for_stage(stage, self.helper.object.kernel)
-        timer = _stage_timer(self.stream)
-        traversal = "pointwise"
-        if stage.kind in (StageKind.PAIR_DENSITY, StageKind.PAIR_RATE):
-            context = self._neighbor_context_for_stage(evaluator, info)
-            traversal = _pair_traversal_for_stage(context)
-            outline = self._outline_for_stage(
-                stage, equations, precompute, info, traversal
-            )
-            module = self._module_for_stage(outline, info, stage)
-            stage_args = _stage_extra_args(
-                self.helper, stage, equations, info, extra_args, precompute
-            )
-            self._record_pair_launch(traversal)
-            launch_config = launch_hbucket_pair_kernel_with_context(
-                module, outline.name, context, stage_args
-            )
-            self._record_pair_launch_config(launch_config)
-        elif _stage_can_use_pointwise_kernel(stage):
-            outline = self._outline_for_stage(
-                stage, equations, precompute, info, traversal
-            )
-            module = self._module_for_stage(outline, info, stage)
-            stage_args = _stage_extra_args(
-                self.helper, stage, equations, info, extra_args, precompute
-            )
-            n = info["dest"].get_number_of_particles(True)
-            launch_pointwise_kernel(module, outline.name, n, self.stream, stage_args)
+    def _launch_stage(self, evaluator, stage, info, extra_args):
+        pair = stage.kind in (StageKind.PAIR_DENSITY, StageKind.PAIR_RATE)
+        if pair:
+            pair_args, periodic = self._pair_args(evaluator, info)
         else:
-            assert False
-        self._finish_launched_stage(stage)
+            pair_args, periodic = (), False
+        _module, kernel, names = self._program_for_stage(stage, info, periodic)
+        stage_args = tuple(
+            _stage_extra_arg_value(self.helper, name, info, extra_args)
+            for name in names
+        )
+        n = info["dest"].get_number_of_particles(True)
+        traversal = "csr" if pair else "pointwise"
+        arguments = pair_args + stage_args if pair else (np.int32(n), *stage_args)
+        timer = _stage_timer(self.stream)
+        launch_config = launch_cuda_kernel(
+            kernel, n, self.stream, arguments, traversal, self.block_size
+        )
+        if pair:
+            self._record_pair_launch(traversal)
+            self._record_pair_launch_config(launch_config)
         self._record_stage_timing(stage, traversal, timer)
         self.launch_count += 1
 
@@ -456,9 +370,6 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
         self.traversal_launch_counts[traversal] += 1
 
     def _record_pair_launch_config(self, launch_config):
-        if launch_config is None:
-            return
-        assert isinstance(launch_config, PairLaunchConfig)
         key = (
             launch_config.traversal,
             launch_config.n,
@@ -480,130 +391,56 @@ class GeneratedFusedCudaStageBackend(FusedCudaStageBackend):
         self.stage_timing_ms[key] += elapsed_ms
         self.stage_timing_counts[key] += 1
 
-    def _neighbor_context_for_stage(self, evaluator, info):
-        key = _neighbor_context_key(info)
-        if key not in self.neighbor_contexts:
-            self.neighbor_contexts[key] = self._build_neighbor_context(evaluator, info)
-        return self.neighbor_contexts[key]
-
-    def _build_neighbor_context(self, evaluator, info):
-        key = _neighbor_context_key(info)
-        if key not in self.neighbor_workspaces:
-            self.neighbor_workspaces[key] = FusedCudaNeighborWorkspace()
-        return _neighbor_context_for_info(
-            evaluator,
-            info,
-            self.stream,
-            self.h_reduce_scratch,
-            self.neighbor_workspaces[key],
+    def _pair_args(self, evaluator, info):
+        dest = info["dest"]
+        assert dest is info["src"]
+        nnps = evaluator.nnps
+        nnps.set_context(info["src_idx"], info["dst_idx"])
+        cache = nnps.current_cache
+        cache.get_neighbors_gpu()
+        periodic_args = evaluator._periodic_args()
+        arguments = (
+            *(getattr(dest.gpu, name).dev for name in ("x", "y", "z", "h")),
+            np.int32(dest.get_number_of_particles(True)),
+            cache._nbr_lengths_gpu.dev,
+            cache._start_idx_gpu.dev,
+            cache._neighbors_gpu.dev,
+            *periodic_args,
+            np.float32(nnps.radius_scale),
         )
+        return arguments, any(periodic_args[:3])
 
-    def handle_update_domain(self, integrator):
-        manager = integrator.nnps.domain.manager
-        if not manager.minimum_image_periodic:
-            self.stream.synchronize()
-            return False
-        lower, upper, periodic = _domain_bounds_and_periodicity_from_manager(manager)
-        for particle_array in integrator.acceleration_evals[0].particle_arrays:
-            assert particle_array.gpu is not None
-            nreal = particle_array.get_number_of_particles(True)
-            wrap_periodic_xyz(
-                particle_array.gpu.x.dev,
-                particle_array.gpu.y.dev,
-                particle_array.gpu.z.dev,
-                nreal,
-                lower,
-                upper,
-                periodic,
-                self.stream,
-            )
-        return True
-
-    def _finish_launched_stage(self, stage):
-        if _stage_invalidates_neighbor_context(stage):
-            self.neighbor_contexts = {}
-            self._invalidate_neighbor_h_bounds()
-
-    def _initialize_equations(self, evaluator, info, t, dt):
-        self.stream.synchronize()
-        super()._initialize_equations(evaluator, info, t, dt)
-        self.neighbor_contexts = {}
-        self._invalidate_neighbor_h_bounds()
-
-    def _device_convergence_has_converged(self, evaluator, info):
-        self.stream.synchronize()
-        return evaluator._converged(info["equations"])
-
-    def _update_device_convergence_nnps(self, evaluator, info):
-        self._refresh_ghost_domain(evaluator)
-        self.neighbor_contexts = {}
-
-    def handle_internal_update_nnps(self, evaluator):
-        self._refresh_ghost_domain(evaluator)
-        self.neighbor_contexts = {}
-        return True
-
-    def handle_reorder_update_nnps(self, solver):
-        self.stream.synchronize()
-        self.neighbor_contexts = {}
-        self._invalidate_neighbor_h_bounds()
-        return False
-
-    def _refresh_ghost_domain(self, evaluator):
-        manager = evaluator.nnps.domain.manager
-        if not manager.minimum_image_periodic:
-            self.stream.synchronize()
-            evaluator.nnps.update_domain()
-        self._invalidate_neighbor_h_bounds()
-
-    def _invalidate_neighbor_h_bounds(self):
-        for workspace in self.neighbor_workspaces.values():
-            workspace.invalidate_h_bounds()
-
-    def _outline_for_stage(self, stage, equations, precompute, info, traversal):
-        stage_group = info["stage_group"]
-        outline_key = (
-            stage_group,
-            stage.kind.value,
-            traversal,
-            tuple(
-                (method.equation_name, method.method_kind.value)
-                for method in stage.methods
-            ),
-        )
-        if outline_key in self.outlines:
-            return self.outlines[outline_key]
+    def _program_for_stage(self, stage, info, periodic):
+        key = _stage_group_key(info), periodic
+        if key in self.programs:
+            return self.programs[key]
+        equations = _equations_for_stage(self.helper, stage, info["stage_group"])
+        precompute = _precompute_for_stage(stage, self.helper.object.kernel)
         if stage.kind in (StageKind.PAIR_DENSITY, StageKind.PAIR_RATE):
-            outline = generate_hbucket_pair_stage_outline_from_equations(
-                "cuda_eval", stage, equations, precompute, self.helper.known_types
+            outline = generate_csr_pair_stage_outline_from_equations(
+                "cuda_eval",
+                stage,
+                equations,
+                precompute,
+                self.helper.known_types,
+                periodic,
             )
-        elif _stage_can_use_pointwise_kernel(stage):
+        else:
+            assert _stage_can_use_pointwise_kernel(stage)
             outline = generate_pointwise_stage_outline_from_equations(
                 "cuda_eval", stage, equations, self.helper.known_types
             )
-        else:
-            assert False
-        self.outlines[outline_key] = outline
-        return outline
+        names = _stage_extra_arg_names(stage, equations, precompute)
+        self.programs[key] = self._compile_program(outline, names)
+        return self.programs[key]
 
-    def _module_for_stage(self, outline, info, stage):
-        module_key = (
-            info["stage_group"],
-            outline.name,
-            tuple(
-                (method.equation_name, method.method_kind.value)
-                for method in stage.methods
-            ),
-        )
-        if module_key in self.modules:
-            return self.modules[module_key]
+    def _compile_program(self, outline, names):
         from pycuda.compiler import SourceModule
 
         module = SourceModule(
-            outline.source, no_extern_c=True, options=list(_source_module_options())
+            outline.source, no_extern_c=True, options=["--use_fast_math"]
         )
-        self.modules[module_key] = module
-        return module
+        return module, module.get_function(outline.name), names
 
 
 def _stage_group_mapping(helper):
@@ -668,14 +505,12 @@ def _can_launch_snapshot_pair_window(left, right):
         and right.kind in (StageKind.PAIR_DENSITY, StageKind.PAIR_RATE)
         and left.dest == right.dest
         and left.sources == right.sources
-        and not _stage_invalidates_neighbor_context(left)
-        and not _stage_invalidates_neighbor_context(right)
+        and not _stage_changes_geometry(left)
+        and not _stage_changes_geometry(right)
     ):
         return False
-    left_pre, left_loop, left_post = _pair_segment_methods_for_backend(left.methods)
-    right_pre, right_loop, _right_post = _pair_segment_methods_for_backend(
-        right.methods
-    )
+    left_pre, left_loop, left_post = _pair_segment_methods(left.methods)
+    right_pre, right_loop, _right_post = _pair_segment_methods(right.methods)
     hoisted_left_post, remaining_left_post = _snapshot_hoisted_left_post_methods(
         left_loop, left_post
     )
@@ -713,11 +548,7 @@ def _has_device_convergence(helper):
     )
 
 
-def _neighbor_context_key(info):
-    return (id(info["dest"]), id(info["src"]))
-
-
-def _stage_invalidates_neighbor_context(stage):
+def _stage_changes_geometry(stage):
     invalidating_fields = frozenset(("x", "y", "z", "h"))
     for method in stage.methods:
         if method.dest_writes.intersection(invalidating_fields):
@@ -727,53 +558,9 @@ def _stage_invalidates_neighbor_context(stage):
     return False
 
 
-def _pair_segment_methods_for_backend(methods):
-    pair_loop_indices = tuple(
-        index for index, method in enumerate(methods) if _is_pair_loop_method(method)
-    )
-    assert pair_loop_indices
-    first_pair_loop_index = pair_loop_indices[0]
-    pre_methods = []
-    loop_methods = []
-    post_methods = []
-    for index, method in enumerate(methods):
-        if _is_pair_loop_method(method):
-            loop_methods.append(method)
-        elif _is_source_free_method(method):
-            if index < first_pair_loop_index:
-                pre_methods.append(method)
-            else:
-                post_methods.append(method)
-        elif _is_pair_pre_loop_method(method):
-            pre_methods.append(method)
-        elif _is_pair_post_loop_method(method):
-            post_methods.append(method)
-        else:
-            assert False
-    return tuple(pre_methods), tuple(loop_methods), tuple(post_methods)
-
-
-def _snapshot_hoisted_left_post_methods(left_loop, left_post):
-    left_loop_writes = _methods_written_fields(left_loop)
-    hoisted = []
-    remaining = []
-    for method in left_post:
-        if _is_source_free_method(method) and not _method_read_fields(
-            method
-        ).intersection(left_loop_writes):
-            hoisted.append(method)
-        else:
-            remaining.append(method)
-    return tuple(hoisted), tuple(remaining)
-
-
 def _snapshot_pair_window_fields(stages):
-    left_pre, left_loop, _left_post = _pair_segment_methods_for_backend(
-        stages[0].methods
-    )
-    right_pre, right_loop, _right_post = _pair_segment_methods_for_backend(
-        stages[1].methods
-    )
+    left_pre, left_loop, _left_post = _pair_segment_methods(stages[0].methods)
+    right_pre, right_loop, _right_post = _pair_segment_methods(stages[1].methods)
     assert left_pre or left_loop
     return _snapshot_pair_window_fields_from_parts(left_loop, right_pre, right_loop)
 
@@ -783,36 +570,6 @@ def _snapshot_pair_window_fields_from_parts(left_loop, right_pre, right_loop):
         _methods_written_fields(right_pre + right_loop)
     )
     return tuple(sorted(fields))
-
-
-def _methods_read_written_fields(readers, writers):
-    return bool(
-        _methods_read_fields(readers).intersection(_methods_written_fields(writers))
-    )
-
-
-def _methods_read_fields(methods):
-    fields = set()
-    for method in methods:
-        fields.update(_method_read_fields(method))
-    return frozenset(fields)
-
-
-def _method_read_fields(method):
-    fields = set(method.dest_reads.difference(method.dest_reduction_reads))
-    fields.update(method.source_reads)
-    fields.update(_precomputed_source_reads(method.precomputed_symbols))
-    return frozenset(fields)
-
-
-def _methods_written_fields(methods):
-    fields = set()
-    for method in methods:
-        fields.update(method.dest_writes)
-        fields.update(method.source_writes)
-        fields.update(method.dest_reduction_writes)
-        fields.update(method.dest_max_reduction_writes)
-    return frozenset(fields)
 
 
 def _methods_precomputed_source_reads(methods):
@@ -826,61 +583,10 @@ def _method_identities(methods):
     return frozenset((method.equation_name, method.method_kind) for method in methods)
 
 
-def _is_pair_pre_loop_method(method):
-    return bool(method.sources) and method.method_kind in (
-        MethodKind.INITIALIZE,
-        MethodKind.LOOP_ALL,
-    )
-
-
-def _is_pair_loop_method(method):
-    return bool(method.sources) and method.method_kind is MethodKind.LOOP
-
-
-def _is_pair_post_loop_method(method):
-    return (
-        bool(method.sources) and method.method_kind is MethodKind.POST_LOOP
-    ) or not bool(method.sources)
-
-
-def _is_source_free_method(method):
-    return not bool(method.sources)
-
-
-def _precomputed_source_reads(symbols):
-    reads = set()
-    if "VIJ" in symbols:
-        reads.update(("u", "v", "w"))
-    if "RHOIJ" in symbols or "RHOIJ1" in symbols:
-        reads.add("rho")
-    if symbols.intersection(frozenset(("XIJ", "R2IJ", "RIJ"))):
-        reads.update(("x", "y", "z"))
-    if symbols.intersection(
-        frozenset(
-            ("HIJ", "WIJ", "WI", "WJ", "DWIJ", "DWI", "DWJ", "GHI", "GHJ", "GHIJ")
-        )
-    ):
-        reads.add("h")
-    return frozenset(reads)
-
-
 def _stage_can_launch_from_kernel_call(stage):
     if stage.kind in (StageKind.PAIR_DENSITY, StageKind.PAIR_RATE):
         return True
     return _stage_can_use_pointwise_kernel(stage)
-
-
-def _stage_can_use_pointwise_kernel(stage):
-    if stage.kind is StageKind.POINTWISE:
-        return True
-    if stage.kind is StageKind.REDUCTION:
-        return all(method.method_kind.value != "reduce" for method in stage.methods)
-    return False
-
-
-def _pair_traversal_for_stage(context):
-    assert hasattr(context, "cell_bucket_counts")
-    return "hbucket"
 
 
 class _CudaStageTimer:
@@ -903,10 +609,6 @@ def _stage_timer(stream):
         return None
     assert os.environ["PYSPH_PROFILE_CUDA_EVENTS"] == "1"
     return _CudaStageTimer(stream)
-
-
-def _source_module_options():
-    return ("--use_fast_math",)
 
 
 def _stage_timing_key(stage, traversal):
@@ -1037,13 +739,6 @@ def _precompute_for_stage(stage, kernel):
     assert False
 
 
-def _stage_extra_args(helper, stage, equations, info, extra_args, precompute):
-    names = _stage_extra_arg_names(stage, equations, precompute)
-    return tuple(
-        _stage_extra_arg_value(helper, name, info, extra_args) for name in names
-    )
-
-
 def _stage_extra_arg_names(stage, equations, precompute):
     names = list(precompute_argument_names(precompute))
     for name in _stage_equation_extra_arg_names(stage, equations, precompute):
@@ -1096,97 +791,6 @@ def _equation_for_method(equation_name, equations):
     ]
     assert len(matches) == 1
     return matches[0]
-
-
-def _neighbor_context_for_info(evaluator, info, stream, h_reduce_scratch, workspace):
-    dest = info["dest"]
-    src = info["src"]
-    assert dest is src
-    nnps = evaluator.nnps
-    lower, upper, periodic = _neighbor_context_bounds_and_periodicity(nnps)
-    radius_scale = np.float32(nnps.radius_scale)
-    nreal = dest.get_number_of_particles(True)
-    source_count = dest.get_number_of_particles()
-    context = build_fused_cuda_hierarchical_hbucket_context_with_workspace(
-        dest.gpu.x.dev,
-        dest.gpu.y.dev,
-        dest.gpu.z.dev,
-        dest.gpu.h.dev,
-        source_count,
-        lower,
-        upper,
-        periodic,
-        radius_scale,
-        stream,
-        workspace,
-        h_reduce_scratch,
-    )
-    return replace(context, destination_count=nreal)
-
-
-def _neighbor_context_bounds_and_periodicity(nnps):
-    domain_manager = nnps.domain.manager
-    nnps_lower = np.asarray(nnps.xmin, dtype=np.float32)
-    nnps_upper = np.asarray(nnps.xmax, dtype=np.float32)
-    domain_lower, domain_upper, periodic = _domain_bounds_and_periodicity_from_manager(
-        domain_manager
-    )
-    lower = np.where(periodic, domain_lower, nnps_lower).astype(np.float32)
-    upper = np.where(periodic, domain_upper, nnps_upper).astype(np.float32)
-    return lower, upper, periodic
-
-
-def _domain_bounds_and_periodicity_from_manager(domain_manager):
-    use_minimum_image = bool(domain_manager.minimum_image_periodic)
-    periodic = np.array(
-        [
-            use_minimum_image and domain_manager.periodic_in_x,
-            use_minimum_image and domain_manager.periodic_in_y,
-            use_minimum_image and domain_manager.periodic_in_z,
-        ],
-        dtype=np.bool_,
-    )
-    lower = np.array(
-        [domain_manager.xmin, domain_manager.ymin, domain_manager.zmin],
-        dtype=np.float32,
-    )
-    upper = np.array(
-        [domain_manager.xmax, domain_manager.ymax, domain_manager.zmax],
-        dtype=np.float32,
-    )
-    return lower, upper, periodic
-
-
-def _snapshot_hbucket_pair_window_stage(stages):
-    reason = "; ".join(stage.reason for stage in stages)
-    stage = snapshot_hbucket_pair_window_stage(stages)
-    return replace(stage, reason=f"snapshot hbucket pair window: {reason}")
-
-
-def _snapshot_hbucket_pair_window_key(stages, precompute, snapshot_fields):
-    return (
-        tuple(
-            tuple(
-                (method.equation_name, method.method_kind.value)
-                for method in stage.methods
-            )
-            for stage in stages
-        ),
-        tuple(sorted(precompute.symbols)),
-        snapshot_fields,
-    )
-
-
-def _unique_equations_for_window(equations_by_stage):
-    equations = []
-    names = []
-    for stage_equations in equations_by_stage:
-        for equation in stage_equations:
-            name = equation.__class__.__name__
-            if name not in names:
-                names.append(name)
-                equations.append(equation)
-    return tuple(equations)
 
 
 def _device_pointer_int(array):

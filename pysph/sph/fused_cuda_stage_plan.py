@@ -306,8 +306,6 @@ def _can_merge_pair_rate_stages(left, right):
 def _coalesced_pair_method_segments(method_segments):
     if not method_segments:
         return ()
-    if not _coalesce_pair_segments():
-        return method_segments
     coalesced = []
     for segment in method_segments:
         if coalesced and _can_coalesce_pair_method_segments(coalesced[-1], segment):
@@ -429,8 +427,6 @@ def _methods_precomputed_write_conflicts(left_methods, right_methods):
 def _methods_write_conflicts(left_methods, right_methods):
     left_writes = _methods_writes(left_methods)
     right_writes = _methods_writes(right_methods)
-    if not _local_reduction_accumulators():
-        return left_writes.intersection(right_writes)
     left_non_reduction_writes = _methods_non_reduction_writes(left_methods)
     right_non_reduction_writes = _methods_non_reduction_writes(right_methods)
     left_additive_writes = _methods_additive_reduction_writes(left_methods)
@@ -512,14 +508,6 @@ def _stage_source_reads(stage):
         reads.update(method.source_reads)
         reads.update(_precomputed_source_reads(method.precomputed_symbols))
     return frozenset(reads)
-
-
-def _coalesce_pair_segments():
-    return True
-
-
-def _local_reduction_accumulators():
-    return True
 
 
 def _precomputed_source_reads(symbols):
@@ -671,12 +659,12 @@ def _stage_kind_for_methods(methods):
 
 def _group_has_supported_convergence(group, supported_convergence):
     equations = [
-        equation for equation in _flatten_equations(group)
+        equation
+        for equation in _flatten_equations(group)
         if _has_overloaded_method(equation, "converged")
     ]
     return bool(equations) and all(
-        equation.__class__.__name__ in supported_convergence
-        for equation in equations
+        equation.__class__.__name__ in supported_convergence for equation in equations
     )
 
 

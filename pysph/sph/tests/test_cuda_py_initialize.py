@@ -38,6 +38,7 @@ def test_cuda_py_initialize_resets_once_per_iteration(monkeypatch, fused):
     cuda.init()
     assert cuda.Device.count() > 0
     monkeypatch.setattr(get_config(), "use_fused_cuda", fused, raising=False)
+    monkeypatch.setattr(get_config(), "fused_block_size", 256, raising=False)
     monkeypatch.setattr(get_config(), "use_cuda", True)
     monkeypatch.setattr(get_config(), "use_double", False)
     x, y, z = np.indices((32, 32, 32), dtype=np.float64).reshape(3, -1)

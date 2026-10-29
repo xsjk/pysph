@@ -13,6 +13,8 @@ from pysph.sph.fused_cuda_stage_plan import (
     MethodKind,
     StageKind,
     StageNode,
+    _precomputed_source_reads,
+    _stage_method_segments,
 )
 
 
@@ -53,8 +55,8 @@ class LocalReductionField:
 
 
 @dataclass(frozen=True)
-class PairLaunchConfig:
-    """CUDA launch shape used for one generated pair traversal kernel."""
+class CudaLaunchConfig:
+    """CUDA launch shape used for one generated fused kernel."""
 
     traversal: str
     n: int
@@ -104,14 +106,15 @@ def generate_pointwise_kernel_outline_with_equation_calls(
     return FusedKernelOutline(name=name, source=source)
 
 
-def generate_hbucket_pair_stage_outline_from_equations(
+def generate_csr_pair_stage_outline_from_equations(
     plan_id: str,
     stage: StageNode,
     equations: tuple[object, ...],
     precompute: CudaPairPrecompute,
     array_known_types: dict[str, KnownType],
+    periodic: bool,
 ) -> FusedKernelOutline:
-    """Return an h-bucket pair outline generated from PySPH equations."""
+    """Return a CSR pair outline generated from PySPH equations."""
     assert _stage_uses_neighbors(stage)
     known_types = _cuda_known_types_for_stage(
         stage, equations, precompute.symbols, array_known_types
@@ -121,23 +124,24 @@ def generate_hbucket_pair_stage_outline_from_equations(
     calls = _cuda_equation_calls_for_stage(
         stage, wrapped_equations, known_types, precompute.symbols
     )
-    return _generate_hbucket_pair_loop_outline_with_equation_calls(
-        plan_id, stage, wrapper_source, precompute, calls
+    return _generate_pair_kernel_outline(
+        plan_id, stage, wrapper_source, precompute, calls, (), periodic
     )
 
 
-def generate_snapshot_hbucket_pair_window_outline_from_equations(
+def generate_snapshot_csr_pair_window_outline_from_equations(
     plan_id: str,
     stages: tuple[StageNode, ...],
     equations_by_stage: tuple[tuple[object, ...], ...],
     precompute: CudaPairPrecompute,
     snapshot_fields: tuple[str, ...],
     array_known_types: dict[str, KnownType],
+    periodic: bool,
 ) -> FusedKernelOutline:
-    """Return one h-bucket traversal for two dependency-compatible pair stages."""
+    """Return one CSR traversal for two dependency-compatible pair stages."""
     assert len(stages) == 2
     assert len(equations_by_stage) == 2
-    stage = snapshot_hbucket_pair_window_stage(stages)
+    stage = snapshot_csr_pair_window_stage(stages)
     equations = _unique_equations(equations_by_stage)
     known_types = _cuda_known_types_for_stage(
         stage, equations, precompute.symbols, array_known_types
@@ -152,8 +156,8 @@ def generate_snapshot_hbucket_pair_window_outline_from_equations(
         precompute.symbols,
         snapshot_fields,
     )
-    return _generate_snapshot_hbucket_pair_window_outline_with_equation_calls(
-        plan_id, stage, wrapper_source, precompute, calls, snapshot_fields
+    return _generate_pair_kernel_outline(
+        plan_id, stage, wrapper_source, precompute, calls, snapshot_fields, periodic
     )
 
 
@@ -170,7 +174,9 @@ def generate_pointwise_stage_outline_from_equations(
     )
     wrapped_equations = _equations_with_python_scalars(equations)
     wrapper_source = _equation_wrapper_source(wrapped_equations, known_types)
-    calls = _cuda_equation_calls_for_stage(stage, wrapped_equations, known_types, frozenset())
+    calls = _cuda_equation_calls_for_stage(
+        stage, wrapped_equations, known_types, frozenset()
+    )
     return generate_pointwise_kernel_outline_with_equation_calls(
         plan_id, stage, wrapper_source, calls
     )
@@ -200,71 +206,27 @@ def _stage_can_use_pointwise_kernel(stage: StageNode) -> bool:
     return False
 
 
-def _generate_hbucket_pair_loop_outline_with_equation_calls(
-    plan_id: str,
-    stage: StageNode,
-    wrapper_source: str,
-    precompute: CudaPairPrecompute,
-    calls: tuple[CudaEquationMethodCall, ...],
-) -> FusedKernelOutline:
-    assert _stage_uses_neighbors(stage)
-    name = fused_kernel_name(plan_id, stage)
-    segment_lines = _hbucket_pair_segment_lines(stage, calls, precompute)
-    arguments = (
-        hbucket_context_argument_declarations()
-        + _unique_argument_declarations(
-            _precompute_argument_declarations(precompute),
-            _equation_call_arguments(calls),
-        )
-    )
-    fp32_wrapper_source = _hbucket_pair_wrapper_source(wrapper_source, stage)
-    source = "\n".join(
-        (
-            'extern "C" {',
-            _FUSED_CUDA_COMPYLE_PREAMBLE,
-            _PAIR_TRAVERSAL_HELPERS,
-            precompute.helper_source,
-            fp32_wrapper_source,
-            f"__global__ void {name}(",
-            _argument_block(arguments),
-            ")",
-            "{",
-            "    int fused_dst_linear = blockIdx.x * blockDim.x + threadIdx.x;",
-            "    if (fused_dst_linear >= n) {",
-            "        return;",
-            "    }",
-            (
-                "    int dst = n == source_count ? sorted_ids[fused_dst_linear] "
-                ": fused_dst_linear;"
-            ),
-            *segment_lines,
-            "}",
-            "}",
-        )
-    )
-    return FusedKernelOutline(name=name, source=source)
-
-
-def _generate_snapshot_hbucket_pair_window_outline_with_equation_calls(
+def _generate_pair_kernel_outline(
     plan_id: str,
     stage: StageNode,
     wrapper_source: str,
     precompute: CudaPairPrecompute,
     calls: tuple[CudaEquationMethodCall, ...],
     snapshot_fields: tuple[str, ...],
+    periodic: bool,
 ) -> FusedKernelOutline:
     assert _stage_uses_neighbors(stage)
-    name = f"fused_{plan_id}_{stage.dest}_snapshot_hbucket_pair_window"
-    segment_lines = _hbucket_pair_segment_lines(stage, calls, precompute)
+    name = fused_kernel_name(plan_id, stage)
+    segment_lines = _csr_pair_segment_lines(stage, calls, precompute)
     arguments = (
-        hbucket_context_argument_declarations()
+        csr_context_argument_declarations()
         + _snapshot_argument_declarations(snapshot_fields)
         + _unique_argument_declarations(
             _precompute_argument_declarations(precompute),
             _equation_call_arguments(calls),
         )
     )
-    fp32_wrapper_source = _hbucket_pair_wrapper_source(wrapper_source, stage)
+    fp32_wrapper_source = _csr_pair_wrapper_source(wrapper_source, stage)
     source = "\n".join(
         (
             'extern "C" {',
@@ -280,10 +242,8 @@ def _generate_snapshot_hbucket_pair_window_outline_with_equation_calls(
             "    if (fused_dst_linear >= n) {",
             "        return;",
             "    }",
-            (
-                "    int dst = n == source_count ? sorted_ids[fused_dst_linear] "
-                ": fused_dst_linear;"
-            ),
+            "    int dst = fused_dst_linear;",
+            *(() if periodic else ("    periodic_x = periodic_y = periodic_z = 0;",)),
             *segment_lines,
             "}",
             "}",
@@ -345,9 +305,9 @@ def cubic_spline_wij_precompute(dim: np.int32) -> CudaPairPrecompute:
             "float RIJ;",
             "float WIJ;",
             "HIJ = 0.5f * (h[dst] + h[src]);",
-            "XIJ[0] = fused_codegen_minimum_image(x[dst] - x[src], xmax - xmin, periodic_x);",
-            "XIJ[1] = fused_codegen_minimum_image(y[dst] - y[src], ymax - ymin, periodic_y);",
-            "XIJ[2] = fused_codegen_minimum_image(z[dst] - z[src], zmax - zmin, periodic_z);",
+            "XIJ[0] = fused_codegen_minimum_image(x[dst] - x[src], xtranslate, periodic_x);",
+            "XIJ[1] = fused_codegen_minimum_image(y[dst] - y[src], ytranslate, periodic_y);",
+            "XIJ[2] = fused_codegen_minimum_image(z[dst] - z[src], ztranslate, periodic_z);",
             "R2IJ = XIJ[0] * XIJ[0] + XIJ[1] * XIJ[1] + XIJ[2] * XIJ[2];",
             "RIJ = sqrtf(R2IJ);",
             f"WIJ = fused_codegen_cubic_spline_wij(RIJ, HIJ, {int(dim)});",
@@ -371,9 +331,9 @@ def cubic_spline_gradient_precompute(dim: np.int32) -> CudaPairPrecompute:
             "float DWI[3];",
             "float DWJ[3];",
             "HIJ = 0.5f * (h[dst] + h[src]);",
-            "XIJ[0] = fused_codegen_minimum_image(x[dst] - x[src], xmax - xmin, periodic_x);",
-            "XIJ[1] = fused_codegen_minimum_image(y[dst] - y[src], ymax - ymin, periodic_y);",
-            "XIJ[2] = fused_codegen_minimum_image(z[dst] - z[src], zmax - zmin, periodic_z);",
+            "XIJ[0] = fused_codegen_minimum_image(x[dst] - x[src], xtranslate, periodic_x);",
+            "XIJ[1] = fused_codegen_minimum_image(y[dst] - y[src], ytranslate, periodic_y);",
+            "XIJ[2] = fused_codegen_minimum_image(z[dst] - z[src], ztranslate, periodic_z);",
             "R2IJ = XIJ[0] * XIJ[0] + XIJ[1] * XIJ[1] + XIJ[2] * XIJ[2];",
             "RIJ = sqrtf(R2IJ);",
             f"fused_codegen_cubic_spline_gradient(DWIJ, XIJ, RIJ, HIJ, {int(dim)});",
@@ -441,9 +401,9 @@ def quintic_spline_wij_precompute(dim: np.int32) -> CudaPairPrecompute:
             "float RIJ;",
             "float WIJ;",
             "HIJ = 0.5f * (h[dst] + h[src]);",
-            "XIJ[0] = fused_codegen_minimum_image(x[dst] - x[src], xmax - xmin, periodic_x);",
-            "XIJ[1] = fused_codegen_minimum_image(y[dst] - y[src], ymax - ymin, periodic_y);",
-            "XIJ[2] = fused_codegen_minimum_image(z[dst] - z[src], zmax - zmin, periodic_z);",
+            "XIJ[0] = fused_codegen_minimum_image(x[dst] - x[src], xtranslate, periodic_x);",
+            "XIJ[1] = fused_codegen_minimum_image(y[dst] - y[src], ytranslate, periodic_y);",
+            "XIJ[2] = fused_codegen_minimum_image(z[dst] - z[src], ztranslate, periodic_z);",
             "R2IJ = XIJ[0] * XIJ[0] + XIJ[1] * XIJ[1] + XIJ[2] * XIJ[2];",
             "RIJ = sqrtf(R2IJ);",
             f"WIJ = fused_codegen_quintic_spline_wij(RIJ, HIJ, {int(dim)});",
@@ -467,9 +427,9 @@ def quintic_spline_gradient_precompute(dim: np.int32) -> CudaPairPrecompute:
             "float DWI[3];",
             "float DWJ[3];",
             "HIJ = 0.5f * (h[dst] + h[src]);",
-            "XIJ[0] = fused_codegen_minimum_image(x[dst] - x[src], xmax - xmin, periodic_x);",
-            "XIJ[1] = fused_codegen_minimum_image(y[dst] - y[src], ymax - ymin, periodic_y);",
-            "XIJ[2] = fused_codegen_minimum_image(z[dst] - z[src], zmax - zmin, periodic_z);",
+            "XIJ[0] = fused_codegen_minimum_image(x[dst] - x[src], xtranslate, periodic_x);",
+            "XIJ[1] = fused_codegen_minimum_image(y[dst] - y[src], ytranslate, periodic_y);",
+            "XIJ[2] = fused_codegen_minimum_image(z[dst] - z[src], ztranslate, periodic_z);",
             "R2IJ = XIJ[0] * XIJ[0] + XIJ[1] * XIJ[1] + XIJ[2] * XIJ[2];",
             "RIJ = sqrtf(R2IJ);",
             f"fused_codegen_quintic_spline_gradient(DWIJ, XIJ, RIJ, HIJ, {int(dim)});",
@@ -737,9 +697,9 @@ def _cubic_spline_pair_lines(dim: np.int32, symbols: frozenset[str]) -> tuple[st
     if "XIJ" in symbols:
         lines.extend(
             (
-                "XIJ[0] = fused_codegen_minimum_image(x[dst] - x[src], xmax - xmin, periodic_x);",
-                "XIJ[1] = fused_codegen_minimum_image(y[dst] - y[src], ymax - ymin, periodic_y);",
-                "XIJ[2] = fused_codegen_minimum_image(z[dst] - z[src], zmax - zmin, periodic_z);",
+                "XIJ[0] = fused_codegen_minimum_image(x[dst] - x[src], xtranslate, periodic_x);",
+                "XIJ[1] = fused_codegen_minimum_image(y[dst] - y[src], ytranslate, periodic_y);",
+                "XIJ[2] = fused_codegen_minimum_image(z[dst] - z[src], ztranslate, periodic_z);",
             )
         )
     if "R2IJ" in symbols:
@@ -824,9 +784,9 @@ def _quintic_spline_pair_lines(
     if "XIJ" in symbols:
         lines.extend(
             (
-                "XIJ[0] = fused_codegen_minimum_image(x[dst] - x[src], xmax - xmin, periodic_x);",
-                "XIJ[1] = fused_codegen_minimum_image(y[dst] - y[src], ymax - ymin, periodic_y);",
-                "XIJ[2] = fused_codegen_minimum_image(z[dst] - z[src], zmax - zmin, periodic_z);",
+                "XIJ[0] = fused_codegen_minimum_image(x[dst] - x[src], xtranslate, periodic_x);",
+                "XIJ[1] = fused_codegen_minimum_image(y[dst] - y[src], ytranslate, periodic_y);",
+                "XIJ[2] = fused_codegen_minimum_image(z[dst] - z[src], ztranslate, periodic_z);",
             )
         )
     if "R2IJ" in symbols:
@@ -880,97 +840,17 @@ def _quintic_spline_pair_lines(
     return tuple(lines)
 
 
-def launch_hbucket_pair_kernel_with_context(
-    module: object,
-    kernel_name: str,
-    context: object,
-    extra_args: tuple[object, ...],
-) -> PairLaunchConfig:
-    """Launch a generated h-bucket pair kernel."""
-    return _launch_hbucket_pair_kernel_with_context(
-        module, kernel_name, context, extra_args, "hbucket"
-    )
-
-
-def launch_snapshot_hbucket_pair_window_kernel_with_context(
-    module: object,
-    kernel_name: str,
-    context: object,
-    snapshot_args: tuple[object, ...],
-    extra_args: tuple[object, ...],
-) -> PairLaunchConfig:
-    """Launch a generated snapshot h-bucket pair-window kernel."""
-    return _launch_hbucket_pair_kernel_with_context(
-        module,
-        kernel_name,
-        context,
-        snapshot_args + extra_args,
-        "snapshot_hbucket",
-    )
-
-
-def _launch_hbucket_pair_kernel_with_context(
-    module: object,
-    kernel_name: str,
-    context: object,
-    extra_args: tuple[object, ...],
-    traversal: str,
-) -> PairLaunchConfig:
-    kernel = module.get_function(kernel_name)
-    block_size = _pair_block_size_for_count(context.destination_count)
-    grid_x = (context.destination_count + block_size - 1) // block_size
+def launch_cuda_kernel(kernel, n, stream, arguments, traversal, block_size):
+    """Launch a fused kernel with the configured number of threads per block."""
+    assert n > 0
+    grid_x = (n + block_size - 1) // block_size
     kernel(
-        _kernel_arg(context.x),
-        _kernel_arg(context.y),
-        _kernel_arg(context.z),
-        _kernel_arg(context.h),
-        np.int32(context.destination_count),
-        np.int32(context.n),
-        np.float32(context.lower[0]),
-        np.float32(context.upper[0]),
-        np.float32(context.lower[1]),
-        np.float32(context.upper[1]),
-        np.float32(context.lower[2]),
-        np.float32(context.upper[2]),
-        np.int32(context.periodic[0]),
-        np.int32(context.periodic[1]),
-        np.int32(context.periodic[2]),
-        context.radius_scale,
-        np.int32(context.bucket_count),
-        _kernel_arg(context.device_level_cell_counts),
-        _kernel_arg(context.device_level_cell_offsets),
-        _kernel_arg(context.device_level_cell_widths),
-        _kernel_arg(context.bucket_h_max_bits),
-        _kernel_arg(context.cell_bucket_h_max_bits),
-        _kernel_arg(context.cell_bucket_counts),
-        _kernel_arg(context.cell_bucket_starts),
-        _kernel_arg(context.sorted_ids),
-        *tuple(_kernel_arg(arg) for arg in extra_args),
+        *tuple(_kernel_arg(arg) for arg in arguments),
         block=(block_size, 1, 1),
         grid=(grid_x, 1, 1),
-        stream=context.stream,
+        stream=stream,
     )
-    return PairLaunchConfig(
-        traversal=traversal,
-        n=int(context.destination_count),
-        block_size=int(block_size),
-        grid_x=int(grid_x),
-    )
-
-
-def _pair_block_size_for_count(n: int) -> int:
-    full_block_size = 128
-    full_particle_blocks = (int(n) + full_block_size - 1) // full_block_size
-    if full_particle_blocks < _cuda_multiprocessor_count():
-        return 128
-    return full_block_size
-
-
-def _cuda_multiprocessor_count() -> int:
-    import pycuda.driver as cuda
-
-    device = cuda.Context.get_device()
-    return int(device.get_attribute(cuda.device_attribute.MULTIPROCESSOR_COUNT))
+    return CudaLaunchConfig(traversal, n, block_size, grid_x)
 
 
 def build_cuda_equation_struct_argument(equation, stream: object) -> object:
@@ -986,26 +866,7 @@ def build_cuda_equation_struct_argument(equation, stream: object) -> object:
     return gpuarray.to_gpu_async(host_array.astype(cuda_dtype), stream=stream)
 
 
-def launch_pointwise_kernel(
-    module: object,
-    kernel_name: str,
-    n: int,
-    stream: object,
-    extra_args: tuple[object, ...],
-) -> None:
-    """Launch a generated pointwise kernel."""
-    assert n > 0
-    kernel = module.get_function(kernel_name)
-    kernel(
-        np.int32(n),
-        *tuple(_kernel_arg(arg) for arg in extra_args),
-        block=(256, 1, 1),
-        grid=((n + 255) // 256, 1, 1),
-        stream=stream,
-    )
-
-
-def _hbucket_pair_segment_lines(
+def _csr_pair_segment_lines(
     stage: StageNode,
     calls: tuple[CudaEquationMethodCall, ...],
     precompute: CudaPairPrecompute,
@@ -1029,8 +890,8 @@ def _hbucket_pair_segment_lines(
         )
         lines.extend(_local_reduction_initialization_lines(reduced_fields))
         lines.extend(
-            _hbucket_pair_neighbor_traversal_lines(
-                _hbucket_pair_precompute_lines(precompute),
+            _csr_pair_neighbor_traversal_lines(
+                _csr_pair_precompute_lines(precompute),
                 precompute,
                 loop_method_lines,
             )
@@ -1043,7 +904,7 @@ def _hbucket_pair_segment_lines(
     return tuple(lines)
 
 
-def snapshot_hbucket_pair_window_stage(stages: tuple[StageNode, ...]) -> StageNode:
+def snapshot_csr_pair_window_stage(stages: tuple[StageNode, ...]) -> StageNode:
     """Return the synthetic single-traversal stage for a snapshot pair window."""
     assert len(stages) == 2
     left = stages[0]
@@ -1070,7 +931,7 @@ def snapshot_hbucket_pair_window_stage(stages: tuple[StageNode, ...]) -> StageNo
         dest=right.dest,
         sources=right.sources,
         methods=methods,
-        reason=f"snapshot hbucket pair window: {left.reason}; {right.reason}",
+        reason=f"snapshot csr pair window: {left.reason}; {right.reason}",
         convergence_policy=None,
         legacy_group_count=left.legacy_group_count + right.legacy_group_count,
         method_segments=(methods,),
@@ -1091,12 +952,6 @@ def _snapshot_hoisted_left_post_methods(
         else:
             remaining.append(method)
     return tuple(hoisted), tuple(remaining)
-
-
-def _stage_method_segments(stage: StageNode) -> tuple[tuple[object, ...], ...]:
-    if stage.method_segments:
-        return stage.method_segments
-    return (stage.methods,)
 
 
 def _pair_segment_methods(methods: tuple[object, ...]):
@@ -1125,105 +980,22 @@ def _pair_segment_methods(methods: tuple[object, ...]):
     return tuple(pre_methods), tuple(loop_methods), tuple(post_methods)
 
 
-def _hbucket_pair_neighbor_traversal_lines(
-    precompute_lines: tuple[str, ...],
-    precompute: CudaPairPrecompute,
-    loop_method_lines: tuple[str, ...],
-) -> tuple[str, ...]:
-    traversal_lines = (
-        "    float dst_x = x[dst];",
-        "    float dst_y = y[dst];",
-        "    float dst_z = z[dst];",
-        "    float dst_h = h[dst];",
-        "    float fused_length_x = xmax - xmin;",
-        "    float fused_length_y = ymax - ymin;",
-        "    float fused_length_z = zmax - zmin;",
-        "    for (int bucket = 0; bucket < bucket_count; ++bucket) {",
-        "        int descriptor = 3 * bucket;",
-        "        int level_nx = level_cell_counts[descriptor];",
-        "        int level_ny = level_cell_counts[descriptor + 1];",
-        "        int level_nz = level_cell_counts[descriptor + 2];",
-        "        float level_cell_width_x = level_cell_widths[descriptor];",
-        "        float level_cell_width_y = level_cell_widths[descriptor + 1];",
-        "        float level_cell_width_z = level_cell_widths[descriptor + 2];",
-        "        float bucket_h = __uint_as_float(bucket_h_max_bits[bucket]);",
-        "        if (bucket_h <= 0.0f) {",
-        "            continue;",
-        "        }",
-        "        int base_cx = fused_codegen_clamp_cell(dst_x, xmin, xmax, level_nx);",
-        "        int base_cy = fused_codegen_clamp_cell(dst_y, ymin, ymax, level_ny);",
-        "        int base_cz = fused_codegen_clamp_cell(dst_z, zmin, zmax, level_nz);",
-        "        float bucket_support = radius_scale * fmaxf(dst_h, bucket_h);",
-        "        int fused_ix_count = periodic_x ? (int)floorf(bucket_support / fused_length_x + 0.5f) : 0;",
-        "        int fused_iy_count = periodic_y ? (int)floorf(bucket_support / fused_length_y + 0.5f) : 0;",
-        "        int fused_iz_count = periodic_z ? (int)floorf(bucket_support / fused_length_z + 0.5f) : 0;",
-        "        int max_x = (int)ceilf(bucket_support / level_cell_width_x);",
-        "        int max_y = (int)ceilf(bucket_support / level_cell_width_y);",
-        "        int max_z = (int)ceilf(bucket_support / level_cell_width_z);",
-        "        int full_x = periodic_x && level_nx <= 2 * max_x + 1;",
-        "        int full_y = periodic_y && level_ny <= 2 * max_y + 1;",
-        "        int full_z = periodic_z && level_nz <= 2 * max_z + 1;",
-        "        int loops_x = full_x ? level_nx : 2 * max_x + 1;",
-        "        int loops_y = full_y ? level_ny : 2 * max_y + 1;",
-        "        int loops_z = full_z ? level_nz : 2 * max_z + 1;",
-        "        for (int iz = 0; iz < loops_z; ++iz) {",
-        "            int cz = iz;",
-        "            if (!full_z) {",
-        "                int offset = iz - max_z;",
-        "                if (!fused_codegen_neighbor_cell(base_cz, offset, level_nz, periodic_z, &cz)) {",
-        "                    continue;",
-        "                }",
-        "            }",
-        "            for (int iy = 0; iy < loops_y; ++iy) {",
-        "                int cy = iy;",
-        "                if (!full_y) {",
-        "                    int offset = iy - max_y;",
-        "                    if (!fused_codegen_neighbor_cell(base_cy, offset, level_ny, periodic_y, &cy)) {",
-        "                        continue;",
-        "                    }",
-        "                }",
-        "                for (int ix = 0; ix < loops_x; ++ix) {",
-        "                    int cx = ix;",
-        "                    if (!full_x) {",
-        "                        int offset = ix - max_x;",
-        "                        if (!fused_codegen_neighbor_cell(base_cx, offset, level_nx, periodic_x, &cx)) {",
-        "                            continue;",
-        "                        }",
-        "                    }",
-        "                    int cell = fused_codegen_linear_cell(cx, cy, cz, level_nx, level_ny);",
-        "                    int flat = level_cell_offsets[bucket] + cell;",
-        "                    float cell_bucket_h = __uint_as_float(cell_bucket_h_max_bits[flat]);",
-        "                    if (cell_bucket_h <= 0.0f) {",
-        "                        continue;",
-        "                    }",
-        "                    float cell_support = radius_scale * fmaxf(dst_h, cell_bucket_h);",
-        "                    float cell_support2 = cell_support * cell_support;",
-        "                    float cell_distance2 = fused_codegen_cell_distance2_to_particle(",
-        "                        cell, level_nx, level_ny, dst_x, dst_y, dst_z, xmin, xmax,",
-        "                        ymin, ymax, zmin, zmax, periodic_x, periodic_y,",
-        "                        periodic_z, level_cell_width_x, level_cell_width_y,",
-        "                        level_cell_width_z",
-        "                    );",
-        "                    if (cell_distance2 > cell_support2) {",
-        "                        continue;",
-        "                    }",
-        "                    int begin = cell_bucket_starts[flat];",
-        "                    int end = begin + cell_bucket_counts[flat];",
-        "                    for (int pos = begin; pos < end; ++pos) {",
-        "                        int src = sorted_ids[pos];",
-        *_hbucket_pair_lines(
-            precompute_lines,
-            loop_method_lines,
-            precompute,
-            "                        ",
-        ),
-        "                    }",
-        "                }",
-        "            }",
-        "        }",
+def _csr_pair_neighbor_traversal_lines(precompute_lines, precompute, loop_method_lines):
+    return (
+        "    {",
+        "    float dst_x = x[dst], dst_y = y[dst], dst_z = z[dst], dst_h = h[dst];",
+        "    unsigned int begin = start_idx[dst];",
+        "    unsigned int end = begin + nbr_length[dst];",
+        "    for (unsigned int pos = begin; pos < end; ++pos) {",
+        "        int src = neighbors[pos];",
+        "        float support = radius_scale * fmaxf(dst_h, h[src]);",
+        "        int fused_ix_count = periodic_x ? (int)floorf(support / xtranslate + 0.5f) : 0;",
+        "        int fused_iy_count = periodic_y ? (int)floorf(support / ytranslate + 0.5f) : 0;",
+        "        int fused_iz_count = periodic_z ? (int)floorf(support / ztranslate + 0.5f) : 0;",
+        *_csr_pair_lines(precompute_lines, loop_method_lines, precompute, "        "),
+        "    }",
         "    }",
     )
-    return ("    {", *tuple(f"    {line}" for line in traversal_lines), "    }")
 
 
 def _equation_call_lines(
@@ -1402,46 +1174,27 @@ def _method_identity(method: object) -> tuple[str, MethodKind]:
     return method.equation_name, method.method_kind
 
 
-def _precomputed_source_reads(symbols: frozenset[str]) -> frozenset[str]:
-    reads = set()
-    if "VIJ" in symbols:
-        reads.update(("u", "v", "w"))
-    if "RHOIJ" in symbols or "RHOIJ1" in symbols:
-        reads.add("rho")
-    if symbols.intersection(frozenset(("XIJ", "R2IJ", "RIJ"))):
-        reads.update(("x", "y", "z"))
-    if symbols.intersection(
-        frozenset(
-            ("HIJ", "WIJ", "WI", "WJ", "DWIJ", "DWI", "DWJ", "GHI", "GHJ", "GHIJ")
-        )
-    ):
-        reads.add("h")
-    return frozenset(reads)
-
-
-def _hbucket_pair_precompute_lines(
+def _csr_pair_precompute_lines(
     precompute: CudaPairPrecompute,
 ) -> tuple[str, ...]:
     lines = precompute.lines
-    if _hbucket_pair_reuses_support_distance(precompute):
+    if _csr_pair_reuses_support_distance(precompute):
         lines = tuple(
-            line
-            for line in lines
-            if not _hbucket_support_distance_precompute_line(line)
+            line for line in lines if not _csr_support_distance_precompute_line(line)
         )
-        lines = tuple(_hbucket_cached_h_precompute_line(line) for line in lines)
+        lines = tuple(_csr_cached_h_precompute_line(line) for line in lines)
     return tuple(f"                                        {line}" for line in lines)
 
 
-def _hbucket_pair_reuses_support_distance(precompute: CudaPairPrecompute) -> bool:
+def _csr_pair_reuses_support_distance(precompute: CudaPairPrecompute) -> bool:
     return "XIJ" in precompute.symbols
 
 
-def _hbucket_cached_h_precompute_line(line: str) -> str:
+def _csr_cached_h_precompute_line(line: str) -> str:
     return line.replace("h[dst]", "dst_h").replace("h[src]", "src_h")
 
 
-def _hbucket_support_distance_precompute_line(line: str) -> bool:
+def _csr_support_distance_precompute_line(line: str) -> bool:
     return (
         line in ("float XIJ[3];", "float R2IJ;")
         or line.startswith("XIJ[0] = fused_codegen_minimum_image(")
@@ -1451,14 +1204,14 @@ def _hbucket_support_distance_precompute_line(line: str) -> bool:
     )
 
 
-def _hbucket_pair_support_lines(
+def _csr_pair_support_lines(
     precompute: CudaPairPrecompute, indent: str
 ) -> tuple[str, ...]:
-    if not _hbucket_pair_reuses_support_distance(precompute):
+    if not _csr_pair_reuses_support_distance(precompute):
         return (
             f"{indent}if (fused_codegen_in_support_xyz_cached(",
-            f"{indent}    dst_x, dst_y, dst_z, dst_h, src, x, y, z, h, xmin, xmax, ymin, ymax,",
-            f"{indent}    zmin, zmax, periodic_x, periodic_y, periodic_z,",
+            f"{indent}    dst_x, dst_y, dst_z, dst_h, src, x, y, z, h,",
+            f"{indent}    periodic_x, periodic_y, periodic_z, xtranslate, ytranslate, ztranslate,",
             f"{indent}    radius_scale",
             f"{indent})) {{",
         )
@@ -1466,9 +1219,9 @@ def _hbucket_pair_support_lines(
         f"{indent}float src_h = h[src];",
         f"{indent}float fused_support = radius_scale * fmaxf(dst_h, src_h);",
         f"{indent}float fused_support2 = fused_support * fused_support;",
-        f"{indent}float fused_xij_x = fused_codegen_minimum_image(dst_x - x[src], fused_length_x, periodic_x);",
-        f"{indent}float fused_xij_y = fused_codegen_minimum_image(dst_y - y[src], fused_length_y, periodic_y);",
-        f"{indent}float fused_xij_z = fused_codegen_minimum_image(dst_z - z[src], fused_length_z, periodic_z);",
+        f"{indent}float fused_xij_x = fused_codegen_minimum_image(dst_x - x[src], xtranslate, periodic_x);",
+        f"{indent}float fused_xij_y = fused_codegen_minimum_image(dst_y - y[src], ytranslate, periodic_y);",
+        f"{indent}float fused_xij_z = fused_codegen_minimum_image(dst_z - z[src], ztranslate, periodic_z);",
         f"{indent}if (fused_ix_count == 0 && fused_iy_count == 0 && fused_iz_count == 0) {{",
         f"{indent}    float XIJ[3];",
         f"{indent}    XIJ[0] = fused_xij_x;",
@@ -1479,7 +1232,7 @@ def _hbucket_pair_support_lines(
     )
 
 
-def _hbucket_pair_image_support_lines(indent: str) -> tuple[str, ...]:
+def _csr_pair_image_support_lines(indent: str) -> tuple[str, ...]:
     return (
         f"{indent}    }}",
         f"{indent}}} else {{",
@@ -1487,34 +1240,34 @@ def _hbucket_pair_image_support_lines(indent: str) -> tuple[str, ...]:
         f"{indent}    for (int fused_iy = -fused_iy_count; fused_iy <= fused_iy_count; ++fused_iy) {{",
         f"{indent}        for (int fused_iz = -fused_iz_count; fused_iz <= fused_iz_count; ++fused_iz) {{",
         f"{indent}            float XIJ[3];",
-        f"{indent}            XIJ[0] = fused_xij_x + fused_ix * fused_length_x;",
-        f"{indent}            XIJ[1] = fused_xij_y + fused_iy * fused_length_y;",
-        f"{indent}            XIJ[2] = fused_xij_z + fused_iz * fused_length_z;",
+        f"{indent}            XIJ[0] = fused_xij_x + fused_ix * xtranslate;",
+        f"{indent}            XIJ[1] = fused_xij_y + fused_iy * ytranslate;",
+        f"{indent}            XIJ[2] = fused_xij_z + fused_iz * ztranslate;",
         f"{indent}            float R2IJ = XIJ[0] * XIJ[0] + XIJ[1] * XIJ[1] + XIJ[2] * XIJ[2];",
         f"{indent}            if (R2IJ <= fused_support2) {{",
     )
 
 
-def _hbucket_pair_lines(
+def _csr_pair_lines(
     precompute_lines: tuple[str, ...],
     loop_method_lines: tuple[str, ...],
     precompute: CudaPairPrecompute,
     indent: str,
 ) -> tuple[str, ...]:
     body_lines = (
-        *_hbucket_pair_body_lines(precompute_lines, precompute),
-        *_hbucket_pair_body_lines(loop_method_lines, precompute),
+        *_csr_pair_body_lines(precompute_lines, precompute),
+        *_csr_pair_body_lines(loop_method_lines, precompute),
     )
-    lines = (*_hbucket_pair_support_lines(precompute, indent), *body_lines)
-    if _hbucket_pair_reuses_support_distance(precompute):
-        lines = (*lines, *_hbucket_pair_image_support_lines(indent), *body_lines)
-    return (*lines, *_hbucket_pair_support_end_lines(precompute, indent))
+    lines = (*_csr_pair_support_lines(precompute, indent), *body_lines)
+    if _csr_pair_reuses_support_distance(precompute):
+        lines = (*lines, *_csr_pair_image_support_lines(indent), *body_lines)
+    return (*lines, *_csr_pair_support_end_lines(precompute, indent))
 
 
-def _hbucket_pair_body_lines(
+def _csr_pair_body_lines(
     lines: tuple[str, ...], precompute: CudaPairPrecompute
 ) -> tuple[str, ...]:
-    if _hbucket_pair_reuses_support_distance(precompute):
+    if _csr_pair_reuses_support_distance(precompute):
         return lines
     return tuple(
         line.replace(
@@ -1525,10 +1278,10 @@ def _hbucket_pair_body_lines(
     )
 
 
-def _hbucket_pair_support_end_lines(
+def _csr_pair_support_end_lines(
     precompute: CudaPairPrecompute, indent: str
 ) -> tuple[str, ...]:
-    if not _hbucket_pair_reuses_support_distance(precompute):
+    if not _csr_pair_reuses_support_distance(precompute):
         return (f"{indent}}}",)
     return (
         f"{indent}            }}",
@@ -1616,7 +1369,7 @@ def _local_reduction_wrapper_source(
     return "\n".join(lines)
 
 
-def _hbucket_pair_wrapper_source(wrapper_source: str, stage: StageNode) -> str:
+def _csr_pair_wrapper_source(wrapper_source: str, stage: StageNode) -> str:
     return _local_reduction_wrapper_source(
         _force_cuda_source_fp32(wrapper_source),
         _local_reduction_methods_for_stage(stage),
@@ -1894,34 +1647,24 @@ def _kernel_arg(arg):
     return arg
 
 
-def hbucket_context_argument_declarations() -> tuple[str, ...]:
-    """Return the CUDA argument ABI consumed by fused h-bucket pair loops."""
+def csr_context_argument_declarations() -> tuple[str, ...]:
+    """Cached neighbor arrays and geometry shared with native CUDA."""
     return (
         "const float *x",
         "const float *y",
         "const float *z",
         "const float *h",
         "int n",
-        "int source_count",
-        "float xmin",
-        "float xmax",
-        "float ymin",
-        "float ymax",
-        "float zmin",
-        "float zmax",
+        "const unsigned int *nbr_length",
+        "const unsigned int *start_idx",
+        "const unsigned int *neighbors",
         "int periodic_x",
         "int periodic_y",
         "int periodic_z",
+        "float xtranslate",
+        "float ytranslate",
+        "float ztranslate",
         "float radius_scale",
-        "int bucket_count",
-        "const int *level_cell_counts",
-        "const int *level_cell_offsets",
-        "const float *level_cell_widths",
-        "const unsigned int *bucket_h_max_bits",
-        "const unsigned int *cell_bucket_h_max_bits",
-        "const int *cell_bucket_counts",
-        "const int *cell_bucket_starts",
-        "const int *sorted_ids",
     )
 
 
@@ -1938,82 +1681,6 @@ def _is_array_name(name):
 
 
 _PAIR_TRAVERSAL_HELPERS = r"""
-__device__ int fused_codegen_clamp_cell(float value, float lower, float upper, int count)
-{
-    float span = upper - lower;
-    float rel = (value - lower) / span;
-    int cell = (int)floorf(rel * (float)count);
-    if (cell < 0) {
-        cell = 0;
-    }
-    if (cell >= count) {
-        cell = count - 1;
-    }
-    return cell;
-}
-
-__device__ int fused_codegen_linear_cell(int cx, int cy, int cz, int nx, int ny)
-{
-    return ((cz * ny) + cy) * nx + cx;
-}
-
-__device__ void fused_codegen_decode_cell(
-    int cell,
-    int nx,
-    int ny,
-    int *cx,
-    int *cy,
-    int *cz
-)
-{
-    *cx = cell % nx;
-    int tmp = cell / nx;
-    *cy = tmp % ny;
-    *cz = tmp / ny;
-}
-
-__device__ bool fused_codegen_valid_offset(int offset, int count)
-{
-    if (count == 1) {
-        return offset == 0;
-    }
-    if (count == 2) {
-        return offset <= 0;
-    }
-    return true;
-}
-
-__device__ int fused_codegen_wrapped_cell(int cell, int count)
-{
-    if (cell < 0) {
-        return cell + count;
-    }
-    if (cell >= count) {
-        return cell - count;
-    }
-    return cell;
-}
-
-__device__ bool fused_codegen_neighbor_cell(
-    int base,
-    int offset,
-    int count,
-    int periodic,
-    int *out
-)
-{
-    int cell = base + offset;
-    if (periodic) {
-        *out = fused_codegen_wrapped_cell(cell, count);
-        return true;
-    }
-    if (cell < 0 || cell >= count) {
-        return false;
-    }
-    *out = cell;
-    return true;
-}
-
 __device__ float fused_codegen_minimum_image(float delta, float length, int periodic)
 {
     if (periodic) {
@@ -2038,109 +1705,27 @@ __device__ bool fused_codegen_in_support_xyz_cached(
     const float *y,
     const float *z,
     const float *h,
-    float xmin,
-    float xmax,
-    float ymin,
-    float ymax,
-    float zmin,
-    float zmax,
     int periodic_x,
     int periodic_y,
     int periodic_z,
+    float xtranslate,
+    float ytranslate,
+    float ztranslate,
     float radius_scale
 )
 {
     float dx = x[src] - dst_x;
     float dy = y[src] - dst_y;
     float dz = z[src] - dst_z;
-    dx = fused_codegen_minimum_image(dx, xmax - xmin, periodic_x);
-    dy = fused_codegen_minimum_image(dy, ymax - ymin, periodic_y);
-    dz = fused_codegen_minimum_image(dz, zmax - zmin, periodic_z);
+    dx = fused_codegen_minimum_image(dx, xtranslate, periodic_x);
+    dy = fused_codegen_minimum_image(dy, ytranslate, periodic_y);
+    dz = fused_codegen_minimum_image(dz, ztranslate, periodic_z);
     float dist2 = dx * dx + dy * dy + dz * dz;
     float support = radius_scale * fmaxf(dst_h, h[src]);
     return dist2 < support * support;
 }
 
-__device__ bool fused_codegen_in_support_xyz(
-    int dst,
-    int src,
-    const float *x,
-    const float *y,
-    const float *z,
-    const float *h,
-    float xmin,
-    float xmax,
-    float ymin,
-    float ymax,
-    float zmin,
-    float zmax,
-    int periodic_x,
-    int periodic_y,
-    int periodic_z,
-    float radius_scale
-)
-{
-    return fused_codegen_in_support_xyz_cached(
-        x[dst], y[dst], z[dst], h[dst], src, x, y, z, h, xmin, xmax,
-        ymin, ymax, zmin, zmax, periodic_x, periodic_y, periodic_z,
-        radius_scale
-    );
-}
 
-__device__ float fused_codegen_axis_cell_distance(
-    float point,
-    int cell,
-    float lower,
-    float upper,
-    float width,
-    int periodic
-)
-{
-    float center = lower + ((float)cell + 0.5f) * width;
-    float delta = fused_codegen_minimum_image(center - point, upper - lower, periodic);
-    float distance = fabsf(delta) - 0.5f * width;
-    if (distance < 0.0f) {
-        distance = 0.0f;
-    }
-    return distance;
-}
-
-__device__ float fused_codegen_cell_distance2_to_particle(
-    int cell,
-    int nx,
-    int ny,
-    float px,
-    float py,
-    float pz,
-    float xmin,
-    float xmax,
-    float ymin,
-    float ymax,
-    float zmin,
-    float zmax,
-    int periodic_x,
-    int periodic_y,
-    int periodic_z,
-    float cell_width_x,
-    float cell_width_y,
-    float cell_width_z
-)
-{
-    int cx = cell % nx;
-    int tmp = cell / nx;
-    int cy = tmp % ny;
-    int cz = tmp / ny;
-    float dx = fused_codegen_axis_cell_distance(
-        px, cx, xmin, xmax, cell_width_x, periodic_x
-    );
-    float dy = fused_codegen_axis_cell_distance(
-        py, cy, ymin, ymax, cell_width_y, periodic_y
-    );
-    float dz = fused_codegen_axis_cell_distance(
-        pz, cz, zmin, zmax, cell_width_z, periodic_z
-    );
-    return dx * dx + dy * dy + dz * dz;
-}
 """
 
 

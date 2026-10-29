@@ -152,22 +152,6 @@ class Integrator(object):
             return None
         return c_eval.stage_backend
 
-    def _stage_backend_handles_outer_update_nnps(self, index):
-        backend = self._stage_backend_for_acceleration_eval(index)
-        if backend is None:
-            return False
-        if not hasattr(backend, "handle_outer_update_nnps"):
-            return False
-        return backend.handle_outer_update_nnps(self, index)
-
-    def _stage_backend_handles_update_domain(self):
-        backend = self._stage_backend_for_acceleration_eval(0)
-        if backend is None:
-            return False
-        if not hasattr(backend, "handle_update_domain"):
-            return False
-        return backend.handle_update_domain(self)
-
     def _stage_backend_compute_time_step(self, dt, cfl):
         backend = self._stage_backend_for_acceleration_eval(0)
         if backend is None:
@@ -311,11 +295,10 @@ class Integrator(object):
     def compute_accelerations(self, index=0, update_nnps=True):
         if update_nnps:
             # update NNPS since particles have moved
-            if not self._stage_backend_handles_outer_update_nnps(index):
-                if self.parallel_manager:
-                    self.parallel_manager.update()
-                with profile_ctx('nnps.update'):
-                    self.nnps.update()
+            if self.parallel_manager:
+                self.parallel_manager.update()
+            with profile_ctx('nnps.update'):
+                self.nnps.update()
 
         # Evaluate
         c_integrator = self.c_integrator
@@ -348,8 +331,7 @@ class Integrator(object):
         The integrator should explicitly call this when needed in the
         `one_timestep` method.
         """
-        if not self._stage_backend_handles_update_domain():
-            self.nnps.update_domain()
+        self.nnps.update_domain()
 
 
 ###############################################################################

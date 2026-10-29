@@ -72,64 +72,6 @@ class TestIntegrator(unittest.TestCase):
         # Then
         self.assertRaises(RuntimeError, comp.compile)
 
-    def test_stage_backend_can_handle_outer_update_nnps(self):
-        class Backend(object):
-            def __init__(self):
-                self.calls = []
-
-            def handle_outer_update_nnps(self, integrator, index):
-                self.calls.append((integrator, index))
-                return True
-
-        class NNPS(object):
-            def update(self):
-                raise AssertionError("nnps.update should be handled by backend")
-
-        class AccelerationEval(object):
-            def __init__(self, backend):
-                self.c_acceleration_eval = SimpleNamespace(stage_backend=backend)
-                self.calls = []
-
-            def compute(self, t, dt):
-                self.calls.append((t, dt))
-
-        backend = Backend()
-        a_eval = AccelerationEval(backend)
-        integrator = Integrator()
-        integrator.nnps = NNPS()
-        integrator.parallel_manager = None
-        integrator.acceleration_evals = [a_eval]
-        integrator.c_integrator = SimpleNamespace(t=1.0, dt=0.25)
-
-        integrator.compute_accelerations(index=0, update_nnps=True)
-
-        self.assertEqual(backend.calls, [(integrator, 0)])
-        self.assertEqual(a_eval.calls, [(1.0, 0.25)])
-
-    def test_stage_backend_can_handle_update_domain(self):
-        class Backend(object):
-            def __init__(self):
-                self.calls = []
-
-            def handle_update_domain(self, integrator):
-                self.calls.append(integrator)
-                return True
-
-        class NNPS(object):
-            def update_domain(self):
-                raise AssertionError("update_domain should be handled by backend")
-
-        backend = Backend()
-        integrator = Integrator()
-        integrator.nnps = NNPS()
-        integrator.acceleration_evals = [
-            SimpleNamespace(c_acceleration_eval=SimpleNamespace(stage_backend=backend))
-        ]
-
-        integrator.update_domain()
-
-        self.assertEqual(backend.calls, [integrator])
-
     def test_stage_backend_can_compute_time_step(self):
         class Backend(object):
             def __init__(self):
@@ -685,16 +627,12 @@ class TestLeapFrogIntegratorGPU(TestIntegratorBase):
 
 
 class TestLeapFrogIntegratorCUDA(TestLeapFrogIntegratorGPU):
-    @unittest.skip("BruteForceNNPS only supports the OpenCL backend")
-    def test_stepper_constants_can_be_used_on_gpu(self):
-        pass
-
     def _setup_integrator(self, equations, integrator):
         pytest.importorskip('pycuda')
         pytest.importorskip('pysph.base.gpu_nnps')
         kernel = CubicSpline(dim=1)
         arrays = [self.pa]
-        from pysph.base.gpu_nnps import BruteForceNNPS as GPUNNPS
+        from pysph.base.gpu_nnps import OctreeGPUNNPS as GPUNNPS
         a_eval = AccelerationEval(
              particle_arrays=arrays, equations=equations, kernel=kernel,
              backend='cuda'
