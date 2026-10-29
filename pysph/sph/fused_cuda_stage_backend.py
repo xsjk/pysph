@@ -36,6 +36,8 @@ from pysph.sph.fused_cuda_codegen import (
 from pysph.sph.fused_cuda_stage_plan import (
     MethodKind,
     StageKind,
+    _equation_method_access,
+    _has_overloaded_method,
 )
 
 
@@ -72,6 +74,28 @@ class FusedCudaStageBackend:
                 "supported in fused stages). Use '--cuda' or '--opencl' "
                 "instead of '--cuda --fused'."
             )
+        constants = {pa.name: set(pa.constants) for pa in helper.object.particle_arrays}
+        for equation in helper.object.all_group.equations:
+            arrays = {"d_" + name for name in constants[equation.dest]}
+            if equation.sources:
+                arrays.update(
+                    "s_" + name
+                    for name in set.intersection(
+                        *(constants[source] for source in equation.sources)
+                    )
+                )
+            for kind in MethodKind:
+                if not _has_overloaded_method(equation, kind.value):
+                    continue
+                _, access = _equation_method_access(equation, kind.value)
+                invalid = access.helper_arrays.difference(arrays)
+                if invalid:
+                    raise RuntimeError(
+                        "Fused CUDA helper array arguments must be particle "
+                        "constants: " + ", ".join(sorted(invalid))
+                    )
+                if access.dest_writes.intersection(constants[equation.dest]):
+                    raise RuntimeError("Fused CUDA cannot write particle constants")
         for stage in plan.stages:
             if stage.kind is StageKind.DEVICE_CONVERGENCE:
                 continue

@@ -611,3 +611,34 @@ def test_stage_planner_keeps_adjacent_pair_rates_when_next_precompute_reads_writ
         StageKind.PAIR_RATE,
         StageKind.PAIR_RATE,
     ]
+
+
+def test_readonly_table_helper_chain_records_dependencies():
+    from pysph.sph.tests.fused_cuda_codegen_equations import TableLookup
+
+    equation = TableLookup(dest="fluid", sources=None)
+    deps = analyze_equation_method(equation, "loop")
+    assert deps.dest_reads == frozenset({"table", "index"})
+    assert deps.dest_writes == frozenset({"u"})
+    assert deps.unsupported_reasons == ()
+    plan = plan_equation_groups([Group([equation])], True, ())
+    assert not plan.has_host_boundary
+
+
+def test_helper_writes_remain_unsupported():
+    from pysph.sph.tests.fused_cuda_codegen_equations import TableWrite
+
+    deps = analyze_equation_method(TableWrite(dest="fluid", sources=None), "loop")
+    assert deps.unsupported_reasons
+
+
+def test_readonly_proof_rejects_aliases_and_atomic_writes():
+    from pysph.sph.fused_cuda_stage_plan import _readonly_helper_parameters
+    from pysph.sph.tests.fused_cuda_codegen_equations import (
+        table_alias,
+        table_atomic,
+        table_write,
+    )
+
+    readonly = _readonly_helper_parameters([table_alias, table_atomic, table_write])
+    assert all(0 not in parameters for parameters in readonly.values())

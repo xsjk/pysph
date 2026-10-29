@@ -135,15 +135,9 @@ def _format_convergence_policy(policy):
 def analyze_equation_method(equation, method_name):
     """Return dependency metadata for one equation method."""
     assert _has_overloaded_method(equation, method_name)
-    method = getattr(equation, method_name)
     method_kind = MethodKind(method_name)
-    source = textwrap.dedent(inspect.getsource(method))
-    tree = ast.parse(source)
-    function = _first_function(tree)
-    args = inspect.getfullargspec(method).args
-    precomputed_symbols = _precomputed_symbols_from_args(args)
-    access = _AccessCollector(frozenset(precomputed_symbols))
-    access.visit_function_body(function)
+    function, access = _equation_method_access(equation, method_name)
+    precomputed_symbols = access.precomputed_symbols
     sources = equation.sources if equation.sources is not None else ()
     unsupported = tuple(sorted(access.unsupported_reasons))
     pair_reduction = _PairReductionCollector()
@@ -178,6 +172,23 @@ def analyze_equation_method(equation, method_name):
         dest_max_reduction_writes=dest_max_reduction_writes,
         dest_reduction_reads=dest_reduction_reads,
     )
+
+
+def _equation_method_access(equation, method_name):
+    method = getattr(equation, method_name)
+    source = textwrap.dedent(inspect.getsource(method))
+    tree = ast.parse(source)
+    function = _first_function(tree)
+    args = inspect.getfullargspec(method).args
+    precomputed_symbols = _precomputed_symbols_from_args(args)
+    helpers = equation._get_helpers_() if hasattr(equation, "_get_helpers_") else ()
+    access = _AccessCollector(
+        frozenset(precomputed_symbols),
+        _readonly_helper_parameters(helpers),
+        frozenset(name for name in args if _is_array_name(name)),
+    )
+    access.visit_function_body(function)
+    return function, access
 
 
 def method_deps_for_equation(equation):
@@ -752,10 +763,61 @@ def _field_from_array_name(name):
     return name[2:]
 
 
+def _readonly_helper_parameters(helpers):
+    """Prove pointer reads through helpers in their declaration order.
+
+    Aliases, pointer escapes and unknown pointer calls remain unsupported.
+    As in native CUDA codegen, callees must precede callers.
+    """
+    readonly = {}
+    for helper in helpers:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(helper)))
+        function = _first_function(tree)
+        parents = {
+            child: node
+            for node in ast.walk(function)
+            for child in ast.iter_child_nodes(node)
+        }
+        parameters = set()
+        for index, parameter in enumerate(function.args.args):
+            uses = [
+                node
+                for node in ast.walk(function)
+                if isinstance(node, ast.Name) and node.id == parameter.arg
+            ]
+            if all(_is_readonly_helper_use(node, parents, readonly) for node in uses):
+                parameters.add(index)
+        readonly[helper.__name__] = parameters
+    return readonly
+
+
+def _is_readonly_helper_use(node, parents, readonly):
+    parent = parents[node]
+    if (
+        isinstance(parent, ast.Subscript)
+        and parent.value is node
+        and isinstance(parent.ctx, ast.Load)
+    ):
+        caller = parents[parent]
+        return not (
+            isinstance(caller, ast.Call)
+            and isinstance(caller.func, ast.Name)
+            and caller.func.id in ("atomic_inc", "atomic_dec", "atomic_min")
+            and caller.args[0] is parent
+        )
+    return (
+        isinstance(parent, ast.Call)
+        and isinstance(parent.func, ast.Name)
+        and parent.func.id in readonly
+        and node in parent.args
+        and parent.args.index(node) in readonly[parent.func.id]
+    )
+
+
 class _AccessCollector(ast.NodeVisitor):
     """Collect destination/source array field accesses from a method AST."""
 
-    def __init__(self, precomputed_symbols):
+    def __init__(self, precomputed_symbols, readonly_helpers, array_parameters):
         self.dest_reads = set()
         self.source_reads = set()
         self.dest_writes = set()
@@ -763,6 +825,9 @@ class _AccessCollector(ast.NodeVisitor):
         self.precomputed_symbols = precomputed_symbols
         self.precomputed_writes = set()
         self.unsupported_reasons = []
+        self.helper_arrays = set()
+        self.readonly_helpers = readonly_helpers
+        self.array_parameters = array_parameters
 
     def visit_function_body(self, function):
         for statement in function.body:
@@ -783,21 +848,45 @@ class _AccessCollector(ast.NodeVisitor):
         self._record_target(node.target, False)
         self.visit(node.value)
 
+    def visit_Name(self, node):
+        if isinstance(node.ctx, ast.Load) and node.id in self.array_parameters:
+            self.unsupported_reasons.append(f"bare array reference {node.id}")
+
     def visit_Call(self, node):
         if isinstance(node.func, ast.Name) and node.func.id in (
-            "atomic_inc", "atomic_dec", "atomic_min"
+            "atomic_inc",
+            "atomic_dec",
+            "atomic_min",
         ):
             self._record_target(node.args[0], True)
-        for arg in node.args:
-            if isinstance(arg, ast.Name) and _is_array_name(arg.id):
-                self.unsupported_reasons.append(f"bare array argument {arg.id}")
+        for index, arg in enumerate(node.args):
+            if isinstance(arg, ast.Name) and arg.id in self.array_parameters:
+                if (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id in self.readonly_helpers
+                    and index in self.readonly_helpers[node.func.id]
+                ):
+                    self.helper_arrays.add(arg.id)
+                    self._record_array(arg.id, False)
+                else:
+                    self.unsupported_reasons.append(f"bare array argument {arg.id}")
+                continue
             self.visit(arg)
         for keyword in node.keywords:
+            if (
+                isinstance(keyword.value, ast.Name)
+                and keyword.value.id in self.array_parameters
+            ):
+                self.unsupported_reasons.append(
+                    f"bare array argument {keyword.value.id}"
+                )
             self.visit(keyword.value)
 
     def visit_Subscript(self, node):
         self._record_subscript(node, isinstance(node.ctx, ast.Store))
-        self.generic_visit(node)
+        if not isinstance(node.value, ast.Name):
+            self.visit(node.value)
+        self.visit(node.slice)
 
     def _record_target(self, node, is_write):
         if isinstance(node, ast.Subscript):
@@ -810,6 +899,9 @@ class _AccessCollector(ast.NodeVisitor):
         if not isinstance(node.value, ast.Name):
             return
         name = node.value.id
+        self._record_array(name, is_write)
+
+    def _record_array(self, name, is_write):
         if name in self.precomputed_symbols and is_write:
             self.precomputed_writes.add(name)
         if name.startswith("d_"):
@@ -828,7 +920,7 @@ class _AccessCollector(ast.NodeVisitor):
 
 
 def _is_array_name(name):
-    return name.startswith("d_") or name.startswith("s_")
+    return name not in ("d_idx", "s_idx") and name.startswith(("d_", "s_"))
 
 
 class _PairReductionCollector(ast.NodeVisitor):

@@ -1,5 +1,9 @@
 """Small equation classes used by fused CUDA codegen tests."""
 
+from compyle.api import declare
+from compyle.low_level import atomic_min
+from compyle.types import annotate
+
 from pysph.sph.equation import Equation
 
 
@@ -121,3 +125,67 @@ class PressureAcceleration(Equation):
             )
             * DWIJ[0]
         )
+
+
+@annotate(table="gdoublep", index="int", return_="double")
+def table_element(table, index):
+    return table[index]
+
+
+@annotate(table="gdoublep", index="int", return_="double")
+def table_lookup(table, index):
+    return 2.0 * table_element(table, index)
+
+
+@annotate(table="gdoublep", index="int")
+def table_write(table, index):
+    table[index] = 0.0
+
+
+def table_alias(table, index):
+    alias = table
+    return alias[index]
+
+
+def table_atomic(table, index):
+    return atomic_min(table[index], 0)
+
+
+class TableLookup(Equation):
+    def _get_helpers_(self):
+        return [table_element, table_element, table_lookup]
+
+    def loop(self, d_idx, d_u, d_table, d_index):
+        d_value = table_lookup(d_table, d_index[d_idx])
+        d_u[d_idx] = d_value
+
+
+class TableWrite(Equation):
+    def _get_helpers_(self):
+        return [table_write]
+
+    def loop(self, d_idx, d_table):
+        table_write(d_table, d_idx)
+
+
+class AliasedTableWrite(Equation):
+    def _get_helpers_(self):
+        return [table_write]
+
+    def loop(self, d_idx, d_table):
+        alias = declare("GLOBAL_MEM double*")
+        alias = d_table
+        table_write(alias, 0)
+
+
+class DirectTableWrite(Equation):
+    def loop(self, d_idx, d_table):
+        d_table[0] = 0.0
+
+
+class SourceTableLookup(Equation):
+    def _get_helpers_(self):
+        return [table_element, table_element, table_lookup]
+
+    def loop(self, d_idx, s_idx, d_u, s_table, s_index):
+        d_u[d_idx] += table_lookup(s_table, s_index[s_idx])

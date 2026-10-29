@@ -6,6 +6,7 @@ from copy import copy
 from dataclasses import dataclass
 
 import numpy as np
+from compyle.translator import CUDAConverter
 
 from pysph.sph.equation import CUDAGroup, KnownType
 from pysph.sph.fused_cuda_stage_plan import (
@@ -116,8 +117,7 @@ def generate_hbucket_pair_stage_outline_from_equations(
         stage, equations, precompute.symbols, array_known_types
     )
     wrapped_equations = _equations_with_python_scalars(equations)
-    group = CUDAGroup(list(wrapped_equations))
-    wrapper_source = group.get_equation_wrappers(known_types)
+    wrapper_source = _equation_wrapper_source(wrapped_equations, known_types)
     calls = _cuda_equation_calls_for_stage(
         stage, wrapped_equations, known_types, precompute.symbols
     )
@@ -143,8 +143,7 @@ def generate_snapshot_hbucket_pair_window_outline_from_equations(
         stage, equations, precompute.symbols, array_known_types
     )
     wrapped_equations = _equations_with_python_scalars(equations)
-    group = CUDAGroup(list(wrapped_equations))
-    wrapper_source = group.get_equation_wrappers(known_types)
+    wrapper_source = _equation_wrapper_source(wrapped_equations, known_types)
     calls = _cuda_equation_calls_for_snapshot_window(
         stage,
         stages[0],
@@ -170,12 +169,25 @@ def generate_pointwise_stage_outline_from_equations(
         stage, equations, frozenset(), array_known_types
     )
     wrapped_equations = _equations_with_python_scalars(equations)
-    group = CUDAGroup(list(wrapped_equations))
-    wrapper_source = group.get_equation_wrappers(known_types)
+    wrapper_source = _equation_wrapper_source(wrapped_equations, known_types)
     calls = _cuda_equation_calls_for_stage(stage, wrapped_equations, known_types, frozenset())
     return generate_pointwise_kernel_outline_with_equation_calls(
         plan_id, stage, wrapper_source, calls
     )
+
+
+def _equation_wrapper_source(equations, known_types):
+    """Emit registered helpers once before the equation wrappers."""
+    helpers = []
+    for equation in equations:
+        if hasattr(equation, "_get_helpers_"):
+            for helper in equation._get_helpers_():
+                if helper not in helpers:
+                    helpers.append(helper)
+    converter = CUDAConverter(known_types=known_types)
+    source = [converter.parse_function(helper) for helper in helpers]
+    source.append(CUDAGroup(list(equations)).get_equation_wrappers(known_types))
+    return "\n".join(source)
 
 
 def _stage_can_use_pointwise_kernel(stage: StageNode) -> bool:
