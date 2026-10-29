@@ -47,6 +47,7 @@ cdef class GPUNeighborCache:
     cdef public object _start_idx_gpu
 
     cdef object _get_start_indices
+    cdef object _total_neighbors_gpu
 
     cdef public np.ndarray _neighbors_cpu
     cdef public np.ndarray _nbr_lengths

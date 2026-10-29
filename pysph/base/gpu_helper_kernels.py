@@ -20,13 +20,15 @@ def get_scan(inp_f, out_f, dtype, backend):
 
 
 @annotate
-def exclusive_input(i, ary):
-    return ary[i]
+def neighbor_count_input(i, lengths):
+    return lengths[i]
 
 
 @annotate
-def exclusive_output(i, prev_item, ary):
-    ary[i] = prev_item
+def neighbor_count_output(i, N, item, prev_item, starts, total):
+    starts[i] = prev_item
+    if i == N - 1:
+        total[0] = item
 
 
 @annotate

@@ -33,7 +33,6 @@ from compyle.config import get_config
 from compyle.array import get_backend, Array
 from compyle.parallel import Elementwise, Scan
 from compyle.types import annotate
-import compyle.array as array
 
 # Particle Tag information
 from cyarray.carray cimport BaseArray, aligned_malloc, aligned_free
@@ -41,8 +40,8 @@ from .utils import ParticleTAGS
 
 from .nnps_base cimport *
 
-from pysph.base.gpu_helper_kernels import (exclusive_input, exclusive_output,
-                                           get_scan)
+from pysph.base.gpu_helper_kernels import (neighbor_count_input,
+                                           neighbor_count_output, get_scan)
 
 
 cdef class GPUNeighborCache:
@@ -67,6 +66,8 @@ cdef class GPUNeighborCache:
                                     backend=self.backend)
         self._start_idx_gpu = Array(np.uint32, n=n_p,
                                     backend=self.backend)
+        self._total_neighbors_gpu = Array(np.uint32, n=1,
+                                          backend=self.backend)
 
     #### Public protocol ################################################
 
@@ -85,29 +86,21 @@ cdef class GPUNeighborCache:
     #### Private protocol ################################################
 
     cdef void _find_neighbors(self):
+        self._start_idx_gpu.resize(self._nbr_lengths_gpu.length)
+        if self._nbr_lengths_gpu.length == 0:
+            self._neighbors_gpu.resize(0)
+            self._cached = True
+            return
 
         self._nnps.find_neighbor_lengths(self._nbr_lengths_gpu)
-        # FIXME:
-        # - Store sum kernel
-        # - don't allocate neighbors_gpu each time.
-        # - Don't allocate _nbr_lengths and start_idx.
-
-        total_size_gpu = array.sum(self._nbr_lengths_gpu)
-
-        cdef unsigned long total_size = <unsigned long>(total_size_gpu)
-
-        # Allocate _neighbors_cpu and neighbors_gpu
-        self._neighbors_gpu.resize(total_size)
-
-        self._start_idx_gpu.resize(self._nbr_lengths_gpu.length)
-        self._start_idx_gpu.dev[:] = self._nbr_lengths_gpu.dev
-
-        # Do prefix sum on self._neighbor_lengths for the self._start_idx
         if self._get_start_indices is None:
-            self._get_start_indices = get_scan(exclusive_input, exclusive_output,
+            self._get_start_indices = get_scan(neighbor_count_input,
+                    neighbor_count_output,
                     dtype=np.uint32, backend=self.backend)
 
-        self._get_start_indices(ary=self._start_idx_gpu)
+        self._get_start_indices(lengths=self._nbr_lengths_gpu,
+                starts=self._start_idx_gpu, total=self._total_neighbors_gpu)
+        self._neighbors_gpu.resize(int(self._total_neighbors_gpu[0]))
 
         self._nnps.find_nearest_neighbors_gpu(self._neighbors_gpu,
                 self._start_idx_gpu)
@@ -123,7 +116,6 @@ cdef class GPUNeighborCache:
         self._start_idx_ptr = <unsigned int*> self._start_idx.data
 
     cpdef update(self):
-        # FIXME: Don't allocate here unless needed.
         self._cached = False
         self._copied_to_cpu = False
         cdef long n_p = self._particles[self._dst_index].get_number_of_particles()
