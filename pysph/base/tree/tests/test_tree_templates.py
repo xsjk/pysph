@@ -1,6 +1,6 @@
 import unittest
 
-from pysph.base.tree.tree import LEAF_DFS_TEMPLATE, POINT_DFS_TEMPLATE
+from pysph.base.tree.tree import DFS_TEMPLATE
 
 
 class DepthFirstTraversalTemplateTests(unittest.TestCase):
@@ -14,9 +14,9 @@ class DepthFirstTraversalTemplateTests(unittest.TestCase):
             "max_depth": 21,
             "k": 8,
         }
-        for template in (LEAF_DFS_TEMPLATE, POINT_DFS_TEMPLATE):
-            with self.subTest(template=template[:20]):
-                operation = template % values
+        for destination in ("unique_cids[i]", "cids[i]"):
+            with self.subTest(destination=destination):
+                operation = DFS_TEMPLATE % dict(values, destination=destination)
                 self.assertIn(
                     "while (idx >= 0 && child_stack[idx] >= 8-1)",
                     operation,

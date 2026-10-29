@@ -27,13 +27,13 @@ if (child_offset == -1) {
 %(output_expr)s;
 """
 
-LEAF_DFS_TEMPLATE = r"""
+DFS_TEMPLATE = r"""
     /*
      * Owner of properties -
      * dst tree: cids, unique_cids
      * src tree: offsets
      */
-   int cid_dst = unique_cids[i];
+   int cid_dst = %(destination)s;
 
     /*
      * Assuming max depth of 21
@@ -47,68 +47,6 @@ LEAF_DFS_TEMPLATE = r"""
     char idx = 0;
     child_stack[0] = 0;
     cid_stack[0] = 1;
-    char flag;
-    int cid_src;
-    int child_offset;
-
-    %(setup)s;
-    while (idx >= 0) {
-
-        // Recurse to find either leaf node or invalid node
-        cid_src = cid_stack[idx];
-
-        child_offset = offsets[cid_src];
-        %(common_operation)s;
-
-        while (child_offset != -1) {
-            %(node_operation)s;
-
-            idx++;
-            cid_src = child_offset;
-            cid_stack[idx] = cid_src;
-            child_stack[idx] = 0;
-            child_offset = offsets[cid_src];
-        }
-
-        if (child_offset == -1) {
-            %(leaf_operation)s;
-        }
-
-        // Recurse back to find node with a valid neighbor
-        while (idx >= 0 && child_stack[idx] >= %(k)s-1)
-            idx--;
-
-        // Iterate to next neighbor
-        if (idx >= 0) {
-            cid_stack[idx]++;
-            child_stack[idx]++;
-        }
-    }
-
-    %(output_expr)s;
-"""
-
-POINT_DFS_TEMPLATE = r"""
-    /*
-     * Owner of properties -
-     * dst tree: cids, unique_cids
-     * src tree: offsets
-     */
-   int cid_dst = cids[i];
-
-    /*
-     * Assuming max depth of 21
-     * stack_idx is also equal to current layer of tree
-     * child_idx = number of children iterated through
-     * idx_stack = current node
-     */
-    char child_stack[%(max_depth)s];
-    int cid_stack[%(max_depth)s];
-
-    char idx = 0;
-    child_stack[0] = 0;
-    cid_stack[0] = 1;
-    char flag;
     int cid_src;
     int child_offset;
 
@@ -360,7 +298,8 @@ def leaf_tree_traverse(ctx, k, args, setup, node_operation, leaf_operation,
                        output_expr, common_operation, preamble="",
                        backend='opencl'):
     # FIXME: variable max_depth
-    operation = LEAF_DFS_TEMPLATE % dict(
+    operation = DFS_TEMPLATE % dict(
+        destination="unique_cids[i]",
         setup=setup,
         leaf_operation=leaf_operation,
         node_operation=node_operation,
@@ -391,7 +330,8 @@ def point_tree_traverse(ctx, k, args, setup, node_operation, leaf_operation,
                         output_expr, common_operation, preamble="",
                         backend='opencl'):
     # FIXME: variable max_depth
-    operation = POINT_DFS_TEMPLATE % dict(
+    operation = DFS_TEMPLATE % dict(
+        destination="cids[i]",
         setup=setup,
         leaf_operation=leaf_operation,
         node_operation=node_operation,
@@ -429,7 +369,6 @@ class Tree(object):
             os.path.join('tree', 'tree.mako'), None, self.backend
         )
 
-        self.initialized = False
         self.preamble = ""
         self.leaf_size = leaf_size
         self.k = k
@@ -446,6 +385,24 @@ class Tree(object):
 
         self.set_index_function_info()
 
+        self._temp_vars = {}
+        for var, dtype in [('pids', np.uint32), ('cids', np.uint32)] + list(zip(
+                self.index_function_args, self.index_function_arg_dtypes)):
+            setattr(self, var, Array(dtype, backend=self.backend))
+            self._temp_vars[var] = Array(dtype, backend=self.backend)
+        self._child_count_prefix_sum = Array(
+            get_vector_dtype('uint', self.k, self.backend), backend=self.backend
+        )
+        self._seg_flag = Array(get_char_dtype(self.backend), backend=self.backend)
+        self._count_gpu = Array(np.uint32, n=1, backend=self.backend)
+        bounds_dtype = get_vector_dtype('uint', 2, self.backend)
+        self.offsets = Array(np.int32, backend=self.backend)
+        self.pbounds = Array(bounds_dtype, backend=self.backend)
+        self._offsets_temp = [Array(np.int32, n=1, backend=self.backend)]
+        self._pbounds_temp = [Array(bounds_dtype, n=1, backend=self.backend)]
+        self.unique_cids = Array(np.uint32, backend=self.backend)
+        self.unique_cids_map = Array(np.uint32, backend=self.backend)
+
     def set_index_function_info(self):
         raise NotImplementedError
 
@@ -455,42 +412,16 @@ class Tree(object):
     def get_index_constants(self, depth):
         raise NotImplementedError
 
-    def _initialize_data(self):
-        self.sorted = False
-        num_particles = self.n
-        self.pids = Array(np.uint32, n=num_particles, backend=self.backend)
-        self.cids = Array(np.uint32, n=num_particles, backend=self.backend)
-        self.cids.fill(0)
-
-        for var, dtype in zip(self.index_function_args,
-                              self.index_function_arg_dtypes):
-            setattr(self, var, Array(dtype, n=num_particles,
-                                     backend=self.backend))
-
-        # Filled after tree built
-        self.pbounds = None
-        self.offsets = None
-        self.initialized = True
-
-    def _reinitialize_data(self):
-        self.sorted = False
-        num_particles = self.n
-        self.pids.resize(num_particles)
-        self.cids.resize(num_particles)
-        self.cids.fill(0)
-
-        for var in self.index_function_args:
-            getattr(self, var).resize(num_particles)
-
-        # Filled after tree built
-        self.pbounds = None
-        self.offsets = None
-
     def _setup_build(self):
-        if not self.initialized:
-            self._initialize_data()
-        else:
-            self._reinitialize_data()
+        self.sorted = False
+        for var, workspace in self._temp_vars.items():
+            getattr(self, var).resize(self.n)
+            workspace.resize(self.n)
+        self.cids.fill(0)
+        self._child_count_prefix_sum.resize(self.n)
+        self._seg_flag.resize(self.n)
+        self.unique_cids.resize(self.n)
+        self.unique_cids_map.resize(self.n)
 
     def _build(self, fixed_depth=None):
         self._build_tree(fixed_depth)
@@ -499,37 +430,8 @@ class Tree(object):
     # Core construction algorithm and helper functions
     ###########################################################################
 
-    # A little bit of manual book-keeping for temporary variables.
-    # More specifically, these temporary variables would otherwise be thrown
-    # away after building each layer of the tree.
-    # We could instead just allocate new arrays after building each layer and
-    # and let the GC take care of stuff but I'm guessing this is a
-    # a better approach to save on memory
-    def _create_temp_vars(self, temp_vars):
-        n = self.n
-        temp_vars['pids'] = Array(np.uint32, n=n, backend=self.backend)
-        for var, dtype in zip(self.index_function_args,
-                              self.index_function_arg_dtypes):
-            temp_vars[var] = Array(dtype, n=n, backend=self.backend)
-        temp_vars['cids'] = Array(np.uint32, n=n, backend=self.backend)
-
-    def _exchange_temp_vars(self, temp_vars):
-        for k in temp_vars.keys():
-            t = temp_vars[k]
-            temp_vars[k] = getattr(self, k)
-            setattr(self, k, t)
-
-    def _clean_temp_vars(self, temp_vars):
-        for k in list(temp_vars.keys()):
-            del temp_vars[k]
-
-    def _get_temp_data_args(self, temp_vars):
-        result = [temp_vars[v] for v in self.index_function_args]
-        return result
-
-    def _reorder_particles(self, depth, child_count_prefix_sum, offsets_parent,
-                           pbounds_parent,
-                           seg_flag, csum_nodes_prev, temp_vars):
+    def _reorder_particles(self, depth, offsets_parent, pbounds_parent,
+                           csum_nodes_prev):
         # Scan
 
         args = [('__global ' + ctype + ' *' + v) for v, ctype in
@@ -542,7 +444,7 @@ class Tree(object):
         particle_kernel = _get_particle_kernel(
             self.ctx, self.k, args, self.index_code, self.backend
         )
-        args = [seg_flag.dev, child_count_prefix_sum.dev]
+        args = [self._seg_flag.dev, self._child_count_prefix_sum.dev]
         args += [x.dev for x in self.get_data_args()]
         args += self.get_index_constants(depth)
         particle_kernel(*args)
@@ -558,28 +460,25 @@ class Tree(object):
         )
 
         args = [self.pids.dev, self.cids.dev,
-                seg_flag.dev,
+                self._seg_flag.dev,
                 pbounds_parent.dev, offsets_parent.dev,
-                child_count_prefix_sum.dev,
-                temp_vars['pids'].dev, temp_vars['cids'].dev]
+                self._child_count_prefix_sum.dev,
+                self._temp_vars['pids'].dev, self._temp_vars['cids'].dev]
         args += [x.dev for x in self.get_data_args()]
-        args += [x.dev for x in self._get_temp_data_args(temp_vars)]
+        args += [self._temp_vars[v].dev for v in self.index_function_args]
         args += self.get_index_constants(depth)
         args += [np.uint32(csum_nodes_prev)]
 
         reorder_particles(*args)
-        self._exchange_temp_vars(temp_vars)
+        for var, workspace in self._temp_vars.items():
+            self._temp_vars[var] = getattr(self, var)
+            setattr(self, var, workspace)
 
     def _merge_layers(self, offsets_temp, pbounds_temp):
         curr_offset = 0
-        total_nodes = 0
-
-        for i in range(self.depth + 1):
-            total_nodes += self.num_nodes[i]
-
-        self.offsets = Array(np.int32, n=total_nodes, backend=self.backend)
-        self.pbounds = Array(get_vector_dtype('uint', 2, self.backend),
-                             n=total_nodes, backend=self.backend)
+        total_nodes = sum(self.num_nodes)
+        self.offsets.resize(total_nodes)
+        self.pbounds.resize(total_nodes)
 
         append_layer = self.main_helper.get_kernel('append_layer')
 
@@ -593,26 +492,24 @@ class Tree(object):
             curr_offset += self.num_nodes[i]
 
     def _update_node_data(self, offsets_prev, pbounds_prev, offsets, pbounds,
-                          seg_flag, child_count_prefix_sum, csum_nodes,
-                          csum_nodes_next, n):
+                          csum_nodes, csum_nodes_next):
         """Update node data and return number of children which are leaves."""
 
         # Update particle-related data of children
         set_node_data = self.main_helper.get_kernel("set_node_data", k=self.k)
         set_node_data(offsets_prev.dev, pbounds_prev.dev,
                       offsets.dev, pbounds.dev,
-                      seg_flag.dev, child_count_prefix_sum.dev,
+                      self._seg_flag.dev, self._child_count_prefix_sum.dev,
                       np.uint32(csum_nodes),
-                      np.uint32(n))
+                      np.uint32(self.n))
 
         # Set children offsets
-        leaf_count = Array(np.uint32, n=1, backend=self.backend)
         set_offsets = _get_set_offset_kernel(
             self.ctx, self.k, self.leaf_size, self.backend
         )
-        set_offsets(pbounds.dev, offsets.dev, leaf_count.dev,
+        set_offsets(pbounds.dev, offsets.dev, self._count_gpu.dev,
                     np.uint32(csum_nodes_next))
-        return leaf_count.dev[0].get()
+        return self._count_gpu.dev[0].get()
 
     def _build_tree(self, fixed_depth=None):
         # We build the tree one layer at a time. We stop building new
@@ -645,7 +542,6 @@ class Tree(object):
 
         num_leaves_here = 0
         n = self.n
-        temp_vars = {}
 
         self.depth = 0
         self.num_nodes = [1]
@@ -654,25 +550,12 @@ class Tree(object):
         csum_nodes_prev = 0
         csum_nodes = 1
 
-        # Initialize temporary data (but persistent across layers)
-        self._create_temp_vars(temp_vars)
-
-        child_count_prefix_sum = Array(
-            get_vector_dtype('uint', self.k, self.backend),
-            n=n, backend=self.backend
-        )
-
-        seg_flag = Array(get_char_dtype(self.backend), n=n,
-                         backend=self.backend)
-        seg_flag.fill(0)
-        seg_flag.dev[0] = 1
-
-        offsets_temp = [Array(np.int32, n=1, backend=self.backend)]
-        offsets_temp[-1].fill(1)
-
-        pbounds_temp = [Array(get_vector_dtype('uint', 2, self.backend),
-                              n=1, backend=self.backend)]
-        set_uint2(pbounds_temp[-1], 0, n, self.backend)
+        self._seg_flag.fill(0)
+        self._seg_flag.dev[0] = 1
+        offsets_temp = self._offsets_temp
+        pbounds_temp = self._pbounds_temp
+        offsets_temp[0].fill(1)
+        set_uint2(pbounds_temp[0], 0, n, self.backend)
 
         # FIXME: Depths above 20 possible and feasible for binary / quad trees
         loop_lim = min(fixed_depth, 20)
@@ -685,47 +568,39 @@ class Tree(object):
                 self.depth += 1
             self.num_nodes.append(num_nodes)
 
-            # Allocate new layer
-            offsets_temp.append(Array(np.int32, n=self.num_nodes[-1],
-                                      backend=self.backend))
-            pbounds_temp.append(Array(
-                get_vector_dtype('uint', 2, self.backend),
-                n=self.num_nodes[-1], backend=self.backend
-            ))
+            if depth == len(offsets_temp):
+                offsets_temp.append(Array(np.int32, backend=self.backend))
+                pbounds_temp.append(Array(
+                    get_vector_dtype('uint', 2, self.backend),
+                    backend=self.backend
+                ))
+            offsets_temp[depth].resize(num_nodes)
+            pbounds_temp[depth].resize(num_nodes)
 
             # Generate particle index and reorder the particles
-            self._reorder_particles(depth, child_count_prefix_sum,
-                                    offsets_temp[-2],
-                                    pbounds_temp[-2], seg_flag,
-                                    csum_nodes_prev,
-                                    temp_vars)
+            self._reorder_particles(depth, offsets_temp[depth - 1],
+                                    pbounds_temp[depth - 1], csum_nodes_prev)
 
             num_leaves_here = self._update_node_data(
-                offsets_temp[-2], pbounds_temp[-2],
-                offsets_temp[-1], pbounds_temp[-1],
-                seg_flag, child_count_prefix_sum,
-                csum_nodes, csum_nodes + self.num_nodes[-1], n
+                offsets_temp[depth - 1], pbounds_temp[depth - 1],
+                offsets_temp[depth], pbounds_temp[depth],
+                csum_nodes, csum_nodes + num_nodes
             )
 
             csum_nodes_prev = csum_nodes
             csum_nodes += self.num_nodes[-1]
 
         self._merge_layers(offsets_temp, pbounds_temp)
-        self._clean_temp_vars(temp_vars)
 
     ###########################################################################
     # Misc
     ###########################################################################
 
     def _get_unique_cids_and_count(self):
-        n = self.n
-        self.unique_cids = Array(np.uint32, n=n, backend=self.backend)
-        self.unique_cids_map = Array(np.uint32, n=n, backend=self.backend)
-        uniq_count = Array(np.uint32, n=1, backend=self.backend)
         unique_cids_kernel = _get_unique_cids_kernel(self.ctx, self.backend)
         unique_cids_kernel(self.cids.dev, self.unique_cids_map.dev,
-                           self.unique_cids.dev, uniq_count.dev)
-        self.unique_cid_count = uniq_count.dev[0].get()
+                           self.unique_cids.dev, self._count_gpu.dev)
+        self.unique_cid_count = self._count_gpu.dev[0].get()
 
     def get_leaves(self):
         leaves = Array(np.uint32, n=self.offsets.dev.shape[0],

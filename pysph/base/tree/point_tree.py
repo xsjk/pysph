@@ -3,7 +3,7 @@ from pysph.base.tree.helpers import ParticleArrayWrapper, get_helper, \
     make_vec, ctype_to_dtype, get_vector_dtype
 from compyle.array import get_backend
 from compyle.profile import profile_kernel
-from pysph.base.gpu_nnps_helper import get_queue, make_scan_kernel
+from pysph.base.gpu_nnps_helper import make_scan_kernel
 from compyle.array import Array
 from pytools import memoize
 
@@ -232,7 +232,6 @@ def _get_leaf_neighbor_kernel_parameters(data_t, dim, args, setup, operation,
                             periodic_in_x, periodic_in_y, periodic_in_z,
                             xtranslate, ytranslate, ztranslate) &&
                 !contains(node_xmin2, node_xmax2, node_xmin1, node_xmax1)) {
-                flag = 0;
                 break;
             }
             """).render(data_t=data_t),
@@ -319,6 +318,11 @@ class PointTree(Tree):
         self.xmax = None
         self.hmin = None
         self._neighbor_cid_buffers = {}
+        self.node_xmin = Array(get_vector_dtype(c_type, dim, backend),
+                               backend=backend)
+        self.node_xmax = Array(get_vector_dtype(c_type, dim, backend),
+                               backend=backend)
+        self.node_hmax = Array(ctype_to_dtype(c_type), backend=backend)
         self.make_vec = lambda *values: make_vec(
             backend, c_type, self.dim, *values
         )
@@ -420,12 +424,9 @@ class PointTree(Tree):
     # General algorithms
     ###########################################################################
     def set_node_bounds(self):
-        vector_data_t = get_vector_dtype(self.c_type, self.dim, self.backend)
-        dtype = ctype_to_dtype(self.c_type)
-
-        self.node_xmin = self.allocate_node_prop(vector_data_t)
-        self.node_xmax = self.allocate_node_prop(vector_data_t)
-        self.node_hmax = self.allocate_node_prop(dtype)
+        self.node_xmin.resize(self.total_nodes)
+        self.node_xmax.resize(self.total_nodes)
+        self.node_hmax.resize(self.total_nodes)
 
         params = _get_node_bound_kernel_parameters(self.dim, self.c_type,
                                                    self.xvars)
@@ -518,9 +519,7 @@ class PointTree(Tree):
         )
         neighbor_psum(neighbor_cid_count.dev)
 
-        neighbor_cid_capacity = (
-            int(self.unique_cid_count) * int(tree_src.unique_cid_count)
-        )
+        neighbor_cid_capacity = int(neighbor_cid_count[-1])
         if "neighbor_cids" in buffers:
             neighbor_cids = buffers["neighbor_cids"]
             if neighbor_cids.alloc < neighbor_cid_capacity:
@@ -607,12 +606,16 @@ class PointTree(Tree):
         # Max work group size can only be found by building the
         # kernel.
         def build_kernels():
-            find_neighbor_counts = self.helper.get_kernel(
-                'find_neighbor_counts', sorted=self.sorted, wgs=self.leaf_size
+            self.helper.get_kernel(
+                'find_neighbor_counts', sorted=self.sorted,
+                wgs=min(self.leaf_size, 256), dim=self.dim,
+                leaf_size=self.leaf_size
             )
 
-            find_neighbor = self.helper.get_kernel(
-                'find_neighbors', sorted=self.sorted, wgs=self.leaf_size
+            self.helper.get_kernel(
+                'find_neighbors', sorted=self.sorted,
+                wgs=min(self.leaf_size, 256), dim=self.dim,
+                leaf_size=self.leaf_size
             )
 
         if self.backend == 'opencl':
@@ -636,14 +639,19 @@ class PointTree(Tree):
         dtype = ctype_to_dtype(self.c_type)
 
         def find_neighbor_counts_for_partition(partition_cids, partition_size,
-                                               partition_wgs, q=None):
+                                               partition_wgs):
+            block_size = min(partition_wgs, 256)
+            blocks_per_leaf = (partition_wgs + block_size - 1) // block_size
             find_neighbor_counts = self.helper.get_kernel(
-                'find_neighbor_counts', sorted=self.sorted, wgs=wgs
+                'find_neighbor_counts', sorted=self.sorted,
+                wgs=block_size, dim=self.dim, leaf_size=partition_wgs
             )
             find_neighbor_counts(partition_cids.dev, tree_src.pids.dev,
                                  self.pids.dev,
                                  self.cids.dev,
                                  tree_src.pbounds.dev, self.pbounds.dev,
+                                 tree_src.node_xmin.dev, tree_src.node_xmax.dev,
+                                 tree_src.node_hmax.dev,
                                  pa_gpu_src.x.dev, pa_gpu_src.y.dev,
                                  pa_gpu_src.z.dev,
                                  pa_gpu_src.h.dev,
@@ -655,9 +663,9 @@ class PointTree(Tree):
                                  neighbor_cid_count.dev,
                                  neighbor_cids.dev,
                                  neighbor_count.dev,
-                                 gs=(partition_wgs * partition_size,),
-                                 ls=(partition_wgs,),
-                                 queue=(get_queue(self.backend) if q is None else q))
+                                 gs=(block_size * blocks_per_leaf * partition_size,),
+                                 ls=(block_size,),
+                                 queue=self.queue)
 
         if use_partitions and wgs > 32:
             if wgs < 128:
@@ -685,14 +693,19 @@ class PointTree(Tree):
         dtype = ctype_to_dtype(self.c_type)
 
         def find_neighbors_for_partition(partition_cids, partition_size,
-                                         partition_wgs, q=None):
+                                         partition_wgs):
+            block_size = min(partition_wgs, 256)
+            blocks_per_leaf = (partition_wgs + block_size - 1) // block_size
             find_neighbors = self.helper.get_kernel('find_neighbors',
                                                     sorted=self.sorted,
-                                                    wgs=wgs)
+                                                    wgs=block_size, dim=self.dim,
+                                                    leaf_size=partition_wgs)
             find_neighbors(partition_cids.dev, tree_src.pids.dev,
                            self.pids.dev,
                            self.cids.dev,
                            tree_src.pbounds.dev, self.pbounds.dev,
+                           tree_src.node_xmin.dev, tree_src.node_xmax.dev,
+                           tree_src.node_hmax.dev,
                            pa_gpu_src.x.dev, pa_gpu_src.y.dev, pa_gpu_src.z.dev,
                            pa_gpu_src.h.dev,
                            pa_gpu_dst.x.dev, pa_gpu_dst.y.dev, pa_gpu_dst.z.dev,
@@ -703,9 +716,9 @@ class PointTree(Tree):
                            neighbor_cids.dev,
                            start_indices.dev,
                            neighbors.dev,
-                           gs=(partition_wgs * partition_size,),
-                           ls=(partition_wgs,),
-                           queue=(get_queue(self.backend) if q is None else q))
+                           gs=(block_size * blocks_per_leaf * partition_size,),
+                           ls=(block_size,),
+                           queue=self.queue)
 
         if use_partitions and wgs > 32:
             if wgs < 128:

@@ -47,7 +47,8 @@
 </%def>
 
 
-<%def name="find_neighbors_template(data_t, sorted, wgs)" cached="False">
+<%def name="find_neighbors_template(data_t, sorted, wgs, dim, leaf_size)" cached="False">
+    <% blocks_per_leaf = (leaf_size + wgs - 1) // wgs %>
     /*
      * Property owners
      * tree_dst: cids, unique_cids
@@ -56,18 +57,22 @@
                      xdst, ydst, zdst, hdst,
                      pbounds_src, pbounds_dst,
      */
-    int idx = i / ${wgs};
+    int block = i / ${wgs};
+    int idx = block / ${blocks_per_leaf};
+    int dst_start = block % ${blocks_per_leaf} * ${wgs};
     // Fetch dst particles
     ${data_t} xd, yd, zd, hd;
     int cid_dst = unique_cids[idx];
     uint2 pbound_here = pbounds_dst[cid_dst];
-    char svalid = (pbound_here.s0 + lid < pbound_here.s1);
+    // Entirely empty destination tiles leave before any block barriers.
+    if (pbound_here.s0 + dst_start >= pbound_here.s1) return;
+    char svalid = (pbound_here.s0 + dst_start + lid < pbound_here.s1);
     int pid_dst;
     if (svalid) {
         % if sorted:
-            pid_dst = pbound_here.s0 + lid;
+            pid_dst = pbound_here.s0 + dst_start + lid;
         % else:
-            pid_dst = pids_dst[pbound_here.s0 + lid];
+            pid_dst = pids_dst[pbound_here.s0 + dst_start + lid];
         % endif
         xd = xdst[pid_dst];
         yd = ydst[pid_dst];
@@ -84,12 +89,29 @@
     local ${data_t} ys[${wgs}];
     local ${data_t} zs[${wgs}];
     local ${data_t} hs[${wgs}];
+    local int source_ids[${wgs}];
     ${data_t} r2, dx, dy, dz;
     ${caller.pre_loop()}
     while (offset_src < offset_lim) {
         cid_src = neighbor_cids[offset_src];
         pbound_here2 = pbounds_src[cid_src];
         offset_src++;
+        char leaf_intersects = svalid;
+        if (svalid) {
+            ${data_t} reach = MAX(hd * radius_scale, node_hmax_src[cid_src]);
+            ${data_t}${dim} lower = node_xmin_src[cid_src];
+            ${data_t}${dim} upper = node_xmax_src[cid_src];
+            // Periodic axes use a conservative zero box distance.
+            dx = dy = dz = 0;
+            % for d, axis in enumerate(('x', 'y', 'z')[:dim]):
+            d${axis} = periodic_in_${axis} ? 0 :
+                MAX(0, MAX(lower.s${d} - ${axis}d, ${axis}d - upper.s${d}));
+            % endfor
+            leaf_intersects = NORM2(dx, dy, dz) <= reach * reach;
+        }
+        #ifdef __CUDA_ARCH__
+        if (!__syncthreads_or(leaf_intersects)) continue;
+        #endif
         while (pbound_here2.s0 < pbound_here2.s1) {
             // Copy src data
             if (pbound_here2.s0 + lid < pbound_here2.s1) {
@@ -98,6 +120,7 @@
                 % else:
                     pid_src = pids_src[pbound_here2.s0 + lid];
                 %endif
+                source_ids[lid] = pid_src;
                 xs[lid] = xsrc[pid_src];
                 ys[lid] = ysrc[pid_src];
                 zs[lid] = zsrc[pid_src];
@@ -107,13 +130,9 @@
             barrier(CLK_LOCAL_MEM_FENCE);
             // Everything this point forward is done independently
             // by each thread.
-            if (svalid) {
+            if (leaf_intersects) {
                 for (int j=0; j < m; j++) {
-                    % if sorted:
-                        pid_src= pbound_here2.s0 + j;
-                    % else:
-                        pid_src = pids_src[pbound_here2.s0 + j];
-                    % endif
+                    pid_src = source_ids[j];
                     dx = MINIMUM_IMAGE(xs[j] - xd, periodic_in_x,
                                        xtranslate);
                     dy = MINIMUM_IMAGE(ys[j] - yd, periodic_in_y,
@@ -135,9 +154,11 @@
     ${caller.post_loop()}
 </%def>
 
-<%def name="find_neighbor_counts_args(data_t, sorted, wgs)" cached="False">
+<%def name="find_neighbor_counts_args(data_t, sorted, wgs, dim, leaf_size)" cached="False">
     int *unique_cids, int *pids_src, int *pids_dst, int *cids,
     uint2 *pbounds_src, uint2 *pbounds_dst,
+    ${data_t}${dim} *node_xmin_src, ${data_t}${dim} *node_xmax_src,
+    ${data_t} *node_hmax_src,
     ${data_t} *xsrc, ${data_t} *ysrc, ${data_t} *zsrc, ${data_t} *hsrc,
     ${data_t} *xdst, ${data_t} *ydst, ${data_t} *zdst, ${data_t} *hdst,
     ${data_t} radius_scale,
@@ -146,8 +167,8 @@
     int *neighbor_cid_offset, int *neighbor_cids,
     int *neighbor_counts
 </%def>
-<%def name="find_neighbor_counts_src(data_t, sorted, wgs)" cached="False">
-     <%self:find_neighbors_template data_t="${data_t}" sorted="${sorted}" wgs="${wgs}">
+<%def name="find_neighbor_counts_src(data_t, sorted, wgs, dim, leaf_size)" cached="False">
+     <%self:find_neighbors_template data_t="${data_t}" sorted="${sorted}" wgs="${wgs}" dim="${dim}" leaf_size="${leaf_size}">
         <%def name="pre_loop()">
             int count = 0;
         </%def>
@@ -161,9 +182,11 @@
     </%self:find_neighbors_template>
 </%def>
 
-<%def name="find_neighbors_args(data_t, sorted, wgs)" cached="False">
+<%def name="find_neighbors_args(data_t, sorted, wgs, dim, leaf_size)" cached="False">
     int *unique_cids, int *pids_src, int *pids_dst, int *cids,
     uint2 *pbounds_src, uint2 *pbounds_dst,
+    ${data_t}${dim} *node_xmin_src, ${data_t}${dim} *node_xmax_src,
+    ${data_t} *node_hmax_src,
     ${data_t} *xsrc, ${data_t} *ysrc, ${data_t} *zsrc, ${data_t} *hsrc,
     ${data_t} *xdst, ${data_t} *ydst, ${data_t} *zdst, ${data_t} *hdst,
     ${data_t} radius_scale,
@@ -172,8 +195,8 @@
     int *neighbor_cid_offset, int *neighbor_cids,
     int *neighbor_counts, int *neighbors
 </%def>
-<%def name="find_neighbors_src(data_t, sorted, wgs)" cached="False">
-     <%self:find_neighbors_template data_t="${data_t}" sorted="${sorted}" wgs="${wgs}">
+<%def name="find_neighbors_src(data_t, sorted, wgs, dim, leaf_size)" cached="False">
+     <%self:find_neighbors_template data_t="${data_t}" sorted="${sorted}" wgs="${wgs}" dim="${dim}" leaf_size="${leaf_size}">
         <%def name="pre_loop()">
             int offset;
             if (svalid)

@@ -122,7 +122,7 @@ def _test_tree_structure(tree, k):
 
 
 class PointTreeNeighborCIDAllocationTestCase(unittest.TestCase):
-    def test_find_neighbor_cids_uses_leaf_pair_capacity_without_host_total(self):
+    def test_find_neighbor_cids_allocates_actual_leaf_adjacency(self):
         class DeviceScalar:
             def get(self):
                 raise AssertionError("neighbor cid total should stay on device")
@@ -142,6 +142,10 @@ class PointTreeNeighborCIDAllocationTestCase(unittest.TestCase):
                 self.dev = DeviceArray()
                 self.resize_calls = []
                 FakeArray.created.append(self)
+
+            def __getitem__(self, key):
+                assert key == -1
+                return 7
 
             def resize(self, size):
                 self.length = size
@@ -195,7 +199,7 @@ class PointTreeNeighborCIDAllocationTestCase(unittest.TestCase):
             )
 
         assert neighbor_cid_count.length == 4
-        assert neighbor_cids.length == 15
+        assert neighbor_cids.length == 7
         assert neighbor_cid_count2 is neighbor_cid_count
         assert neighbor_cids2 is neighbor_cids
         assert len(FakeArray.created) == 2
