@@ -161,7 +161,7 @@
     ${data_t}* s_z, ${data_t}* s_h,
     ${data_t}3 min, uint num_particles, ulong* keys,
     uint* pids_dst, uint* pids_src, 
-    uint* start_indices, uint* nbrs,
+    ulong* start_indices, uint* nbrs,
     ${data_t} radius_scale,
     ${data_t} hmin, ${data_t} interval_size, uint* start_idx_levels,
     int max_num_bits, int num_levels, uint* num_particles_levels

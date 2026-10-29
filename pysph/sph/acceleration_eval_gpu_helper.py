@@ -1164,16 +1164,20 @@ class AccelerationEvalGPUHelper(object):
             and self._precomputed_has_r2ij(eq_group)
         )
         code = self._declare_precomp_vars(context)
+        offset_type = (
+            'unsigned long long' if self.backend == 'cuda' else 'unsigned long'
+        )
         code.extend([
             'unsigned int d_idx = GID_0 * LDIM_0 + LID_0 + OFFSET_IDX;',
             '/* Guard for padded threads. */',
             'if (d_idx > NP_MAX) {return;};',
-            'unsigned int s_idx, i;',
+            'unsigned int s_idx;',
+            f'{offset_type} i;',
             'GLOBAL_MEM %s* SPH_KERNEL = kern;' % sph_k_name,
-            'unsigned int start = start_idx[d_idx];',
+            f'{offset_type} start = start_idx[d_idx];',
             'GLOBAL_MEM unsigned int* NBRS = &(neighbors[start]);',
             'int N_NBRS = nbr_length[d_idx];',
-            'unsigned int end = start + N_NBRS;'
+            f'{offset_type} end = start + N_NBRS;'
         ])
         if eq_group.has_loop_all():
             _all_args, _py_args, _calls = self._get_equation_method_calls(
@@ -1252,7 +1256,7 @@ class AccelerationEvalGPUHelper(object):
         all_args.extend(
             ['GLOBAL_MEM {kernel}* kern'.format(kernel=sph_k_name),
              'GLOBAL_MEM unsigned int *nbr_length',
-             'GLOBAL_MEM unsigned int *start_idx',
+             f'GLOBAL_MEM {offset_type} *start_idx',
              'GLOBAL_MEM unsigned int *neighbors',
              *periodic_kernel_args('double' if self._use_double else 'float'),
              'double t', 'double dt', 'unsigned int NP_MAX',

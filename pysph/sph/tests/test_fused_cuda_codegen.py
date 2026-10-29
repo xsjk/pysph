@@ -136,7 +136,7 @@ def test_csr_pair_outline_keeps_variable_h_bucket_traversal():
     for declaration in csr_context_argument_declarations():
         assert declaration in outline.source
     assert "int dst = fused_dst_linear;" in outline.source
-    assert "unsigned int begin = start_idx[dst];" in outline.source
+    assert "unsigned long long begin = start_idx[dst];" in outline.source
     assert "int src = neighbors[pos];" in outline.source
     assert "bucket_count" not in outline.source
     assert "float fused_acc_d_au = 0.0f;" in outline.source

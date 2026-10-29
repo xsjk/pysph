@@ -3,6 +3,7 @@ import os
 import re
 
 from compyle.profile import profile_kernel
+from compyle.types import dtype_to_ctype
 
 
 CUDA_UINT8_PREAMBLE = r"""
@@ -44,6 +45,8 @@ def convert_code_for_backend(src, backend):
         return src
     elif backend == "cuda":
         result = _convert_vector_fields(src)
+        # Preserve OpenCL's 64-bit ulong width on CUDA hosts.
+        result = re.sub(r"\bulong\b", dtype_to_ctype('uint64'), result)
         result = result.replace("__global ", "")
         result = result.replace("global ", "")
         result = result.replace("local ", "__shared__ ")
@@ -77,9 +80,7 @@ def convert_arguments_for_backend(args, backend):
     elif backend == "cuda":
         result = convert_code_for_backend(args, backend)
         result = result.replace("uint *", "unsigned int *")
-        result = result.replace("ulong *", "unsigned long *")
         result = result.replace("uint ", "unsigned int ")
-        result = result.replace("ulong ", "unsigned long ")
         return result
     else:
         raise RuntimeError("Unsupported GPU backend %s" % backend)

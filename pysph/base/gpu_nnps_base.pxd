@@ -55,7 +55,7 @@ cdef class GPUNeighborCache:
 
     cdef unsigned int* _neighbors_cpu_ptr
     cdef unsigned int* _nbr_lengths_ptr
-    cdef unsigned int* _start_idx_ptr
+    cdef np.uint64_t* _start_idx_ptr
 
     cdef void copy_to_cpu(self)
     cdef void get_neighbors_raw(self, size_t d_idx, UIntArray nbrs)

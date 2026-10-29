@@ -64,9 +64,9 @@ cdef class GPUNeighborCache:
 
         self._neighbors_gpu = Array(np.uint32,
                                     backend=self.backend)
-        self._start_idx_gpu = Array(np.uint32, n=n_p,
+        self._start_idx_gpu = Array(np.uint64, n=n_p,
                                     backend=self.backend)
-        self._total_neighbors_gpu = Array(np.uint32, n=1,
+        self._total_neighbors_gpu = Array(np.uint64, n=1,
                                           backend=self.backend)
 
     #### Public protocol ################################################
@@ -96,7 +96,7 @@ cdef class GPUNeighborCache:
         if self._get_start_indices is None:
             self._get_start_indices = get_scan(neighbor_count_input,
                     neighbor_count_output,
-                    dtype=np.uint32, backend=self.backend)
+                    dtype=np.uint64, backend=self.backend)
 
         self._get_start_indices(lengths=self._nbr_lengths_gpu,
                 starts=self._start_idx_gpu, total=self._total_neighbors_gpu)
@@ -113,7 +113,7 @@ cdef class GPUNeighborCache:
         self._nbr_lengths = self._nbr_lengths_gpu.get()
         self._nbr_lengths_ptr = <unsigned int*> self._nbr_lengths.data
         self._start_idx = self._start_idx_gpu.get()
-        self._start_idx_ptr = <unsigned int*> self._start_idx.data
+        self._start_idx_ptr = <np.uint64_t*> self._start_idx.data
 
     cpdef update(self):
         self._cached = False
@@ -409,7 +409,7 @@ cdef class BruteForceNNPS(GPUNNPS):
                 """%(data_t)s* d_x, %(data_t)s* d_y, %(data_t)s* d_z,
                 %(data_t)s* d_h, %(data_t)s* s_x, %(data_t)s* s_y,
                 %(data_t)s* s_z, %(data_t)s* s_h, unsigned int num_particles,
-                unsigned int* start_indices, unsigned int* nbrs,
+                unsigned long* start_indices, unsigned int* nbrs,
                 %(data_t)s radius_scale2
                 """ % {"data_t" : ("double" if self.use_double else "float")}
 
@@ -418,7 +418,7 @@ cdef class BruteForceNNPS(GPUNNPS):
                 %(data_t)s dist;
                 %(data_t)s h_i = radius_scale2*d_h[i]*d_h[i];
                 %(data_t)s h_j;
-                unsigned int idx = start_indices[i];
+                unsigned long idx = start_indices[i];
                 for(j=0; j<num_particles; j++)
                 {
                     h_j = radius_scale2*s_h[j]*s_h[j];

@@ -193,12 +193,12 @@
     int periodic_in_x, int periodic_in_y, int periodic_in_z,
     ${data_t} xtranslate, ${data_t} ytranslate, ${data_t} ztranslate,
     int *neighbor_cid_offset, int *neighbor_cids,
-    int *neighbor_counts, int *neighbors
+    ulong *neighbor_counts, int *neighbors
 </%def>
 <%def name="find_neighbors_src(data_t, sorted, wgs, dim, leaf_size)" cached="False">
      <%self:find_neighbors_template data_t="${data_t}" sorted="${sorted}" wgs="${wgs}" dim="${dim}" leaf_size="${leaf_size}">
         <%def name="pre_loop()">
-            int offset;
+            ulong offset;
             if (svalid)
                 offset = neighbor_counts[pid_dst];
         </%def>
@@ -312,12 +312,12 @@
     int periodic_in_x, int periodic_in_y, int periodic_in_z,
     ${data_t} xtranslate, ${data_t} ytranslate, ${data_t} ztranslate,
     int *neighbor_cid_offset, int *neighbor_cids,
-    int *neighbor_counts, int *neighbors
+    ulong *neighbor_counts, int *neighbors
 </%def>
 <%def name="find_neighbors_elementwise_src(data_t, sorted)" cached="False">
      <%self:find_neighbors_elementwise_template data_t="${data_t}" sorted="${sorted}">
         <%def name="pre_loop()">
-            int offset = neighbor_counts[pid_dst];
+            ulong offset = neighbor_counts[pid_dst];
         </%def>
         <%def name="query()">
             neighbors[offset++] = pid_src;
